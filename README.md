@@ -93,7 +93,7 @@ Format (tab or space separated):
 ```
 **Tree view(`-tr`);**
 ```
-192.168.86.1
+192.168.1.1
 ├─ Host: _gateway
 ├─ Up: yes
 ├─ MAC: 48:5A:3F:12:34:56
