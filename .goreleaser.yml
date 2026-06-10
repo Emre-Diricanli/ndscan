@@ -1,0 +1,81 @@
+# .goreleaser.yml
+# https://goreleaser.com/customization/
+
+project_name: ndscan
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/ndscan
+    binary: ndscan
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+      # - windows   # uncomment when you want Windows builds
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    # We only want the binary inside the archive
+    files:
+      - none
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+
+# Release configuration
+release:
+  github:
+    owner: Emre-Diricanli
+    name: ndscan
+  draft: false
+  replace_existing_draft: true
+  mode: replace
+  header: |
+    ## ndscan {{ .Tag }}
+
+    ### Installation
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.sh | bash
+    ```
+
+# Optional: you can also produce Homebrew formula later
+# brews:
+#   - name: ndscan
+#     homepage: "https://github.com/Emre-Diricanli/ndscan"
+#     description: "Fast CLI + TUI for network discovery (nmap wrapper)"
+#     license: "MIT"
+#     tap:
+#       owner: Emre-Diricanli
+#       name: homebrew-tap
+#     url_template: "https://github.com/Emre-Diricanli/ndscan/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+#     install: |
+#       bin.install "ndscan"
+#     test: |
+#       system "#{bin}/ndscan", "--version"

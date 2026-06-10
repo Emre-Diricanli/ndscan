@@ -1,2 +1,12 @@
 # build output
 /ndscan
+/dist/
+
+# goreleaser
+/goreleaser
+
+# common editor / os files
+.DS_Store
+*.swp
+.idea/
+.vscode/

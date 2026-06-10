@@ -1,88 +1,258 @@
 # ndscan
 
-A modern **CLI wrapper around nmap** that makes daily network discovery faster and more intuitive.  
+![ndscan](assets/ndscan-gopher-blue.png)
 
-Features:
-- **Table view** (`-tb`) → clean list of hosts and open ports.
-- **Tree view** (`-tr`) → hierarchical breakdown of hosts, status, MAC, vendor, and ports.
-- **MAC address & vendor lookup** (`--show-mac --show-vendors`).
-- **Run locally or remotely** → `user@host` syntax will SSH into a jump host and run scans from there.
-- **JSON export** for automation pipelines.
-- Modular Go code with Cobra CLI and pretty output.
+A fast, modern **CLI + interactive TUI** for network discovery. A friendly wrapper around `nmap` that makes everyday scanning quicker and more pleasant — with beautiful output, rich reports, and the ability to run scans locally or through an SSH jump host.
+
+**Install globally with one command:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.sh | bash
+```
 
 ---
 
-## Install
+## Features
 
-Clone and build:
+## Features
+
+- **Interactive TUI** (`ndscan` or `ndscan tui`) — form-driven scanning, live progress, table/tree views, filtering, sorting, detail inspection, and one-key exports.
+- **Powerful CLI** (`ndscan scan`) — scriptable and great for CI/automation.
+- **Table view** (`--tb` / `--view table`) — clean, compact list of hosts and open ports.
+- **Tree view** (`--tr` / `--view tree`) — full hierarchical breakdown including hostnames, MACs, vendors, and services.
+- **MAC + vendor lookup** (`--show-mac --show-vendors`).
+- **Remote scanning** — `user@host` syntax runs the scan on a remote machine over SSH.
+- **Rich reports** — `--report results.md` or `--report report.html` with exposure/risk findings.
+- **Multiple export formats** — JSON, CSV, Markdown, HTML (from both CLI and TUI).
+- **Built-in risk intelligence** — surfaces potentially dangerous open services.
+- **Flexible presets** — `quick`, `default`, `udp`, `deep` (or specify custom ports).
+- **Sudo / privileged mode** support for better ARP and SYN scan results.
+
+---
+
+## Demo
+
+![ndscan in action](assets/ndscan-gopher-blue-2.png)
+
+---
+
+## Installation
+
+### One-line install (recommended)
+
+The fastest way to install ndscan globally:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.sh | bash
+```
+
+This will:
+- Detect your OS and architecture (macOS/Linux + amd64/arm64)
+- Download the latest pre-built binary from GitHub Releases
+- Install it to `/usr/local/bin` (using `sudo` if needed)
+
+After installation, `ndscan` will be available globally.
+
+You can also pin a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.sh | VERSION=v0.2.0 bash
+```
+
+Or install to a user-writable location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.sh | INSTALL_DIR=$HOME/.local/bin bash
+```
+
+> **Note:** The one-line installer requires at least one published GitHub Release with pre-built binaries (created via GoReleaser). Until the first release is published, use the "From source" method below.
+
+### From source
+
 ```bash
 git clone https://github.com/Emre-Diricanli/ndscan.git
 cd ndscan
-go mod tidy
-go build -o ndscan ./cmd/ndscan
-```
-
-Optionally move it into your $PATH:
-
-```bash
+make build
 sudo mv ndscan /usr/local/bin/
 ```
-Or install directly with Go:
+
+Or install via Go (this puts it in your Go bin directory):
 
 ```bash
 go install github.com/Emre-Diricanli/ndscan/cmd/ndscan@latest
 ```
 
-## Usage
+Make sure `$(go env GOPATH)/bin` (or `$GOBIN`) is in your `PATH`.
+
+### Requirements
+
+- `nmap` installed on any machine you want to scan **from** (local or the SSH jump host)
+  - macOS: `brew install nmap`
+  - Linux: `sudo apt install nmap` / `sudo dnf install nmap` etc.
+- For best ARP/MAC/SYN scan results on local scans: use the `--sudo` flag (or run as root)
+
+### For maintainers: cutting a new release
+
+Once you have [goreleaser](https://goreleaser.com/install/) installed:
+
 ```bash
-ndscan scan [user@remote] <targets> [flags]
+make release VERSION=v0.2.0
 ```
-## Examples: 
-**Quick local scan in table view**
+
+This will tag the repo, build binaries for macOS + Linux (amd64 + arm64), and publish them as a GitHub Release. The `install.sh` script will then be able to install that version for everyone.
+
+---
+
+## Quick Start
+
+Launch the beautiful interactive TUI:
+
 ```bash
-./ndscan scan 192.168.1.0/24 -tb
+ndscan
+# or
+ndscan tui
 ```
-**Tree view with MAC + vendor**
+
+Run a quick scan from the command line:
+
+```bash
+ndscan scan 192.168.1.0/24 --tb
 ```
-./ndscan scan 192.168.1.0/24 -tr --show-mac --show-vendors
+
+Scan with MAC addresses and vendors, and save a nice HTML report:
+
+```bash
+ndscan scan 192.168.1.0/24 --show-mac --show-vendors --report scan-report.html
 ```
-**Remote scan through SSH jump host**
+
+Scan through a jump host:
+
+```bash
+ndscan scan user@203.0.113.10 192.168.10.0/24 -tb --show-mac
 ```
-./ndscan scan emre@203.0.113.10 192.168.0.0/24 -tb
+
+---
+
+## Interactive TUI
+
+Running `ndscan` with no arguments opens a full-screen terminal UI powered by Bubble Tea:
+
+- Enter targets and tweak options in a friendly form
+- Watch live host discovery and port scanning progress
+- Toggle between table and tree views on the fly
+- Filter, sort, and drill into individual hosts
+- Export results instantly with single keys:
+  - `e` → JSON
+  - `c` → CSV
+  - `m` → Markdown report
+  - `h` → HTML report
+- Save and load scan profiles
+
+The TUI is the fastest way to explore a network interactively.
+
+---
+
+## CLI Usage
+
+```bash
+ndscan scan [user@remote] <targets...> [flags]
 ```
-**Export resutls as JSON**
+
+### Common Examples
+
+**Quick local scan (table view)**
+
+```bash
+ndscan scan 192.168.1.0/24 -tb
 ```
-./ndscan scan 192.168.1.0/24 -tr --json results.json
+
+**Detailed tree view with MACs + vendors**
+
+```bash
+ndscan scan 192.168.1.0/24 -tr --show-mac --show-vendors
 ```
+
+**Custom ports + deep preset + HTML report**
+
+```bash
+ndscan scan 10.0.0.0/24 -P deep -p 1-10000 --report results.html
+```
+
+**Remote scan via SSH + JSON output**
+
+```bash
+ndscan scan admin@scanner.internal 192.168.50.0/24 --json results.json
+```
+
+**Privileged scan (SYN + ARP)**
+
+```bash
+ndscan scan 192.168.1.0/24 --sudo --show-mac --show-vendors
+```
+
+---
+
+## Reports
+
+ndscan can generate polished, shareable reports:
+
+```bash
+ndscan scan 192.168.1.0/24 --show-mac --show-vendors --report report.html
+ndscan scan 10.0.0.0/24 --report findings.md
+```
+
+- `.html` → full standalone HTML document
+- `.md`  → clean GitHub-flavored Markdown
+
+Reports include:
+- Scan metadata and summary stats
+- Full host/port table with services
+- **Exposure section** highlighting risky open ports (high / warn severity) with reasons
+
+---
+
 ## Flags
-| Flag             | Description                                                 |
-| ---------------- | ----------------------------------------------------------- |
-| `-tb`            | Shortcut: table view                                        |
-| `-tr`            | Shortcut: tree view                                         |
-| `--preset`       | Scan preset: `quick` (default), `default`, `udp`, `deep`    |
-| `-p, --ports`    | Custom ports (e.g., `22,80,443` or `1-1024`)                |
-| `--show-mac`     | Include MAC addresses (only works on same L2 segment)       |
-| `--show-vendors` | Include vendor names (requires `--show-mac`)                |
-| `--root-scan`    | Use SYN scan (`-sS`) instead of TCP connect (requires root) |
-| `--json`         | Save results to JSON file                                   |
-| `--concurrency`  | Max parallel host scans (default 32)                        |
-| `--host-timeout` | Timeout per host in seconds (default 20)                    |
-| `--view`         | Force view type: `table` or `tree`                          |
+
+| Flag                | Description                                                      |
+|---------------------|------------------------------------------------------------------|
+| `-tb`               | Shortcut for `--view table`                                      |
+| `-tr`               | Shortcut for `--view tree`                                       |
+| `-P, --preset`      | Scan preset: `quick` (default), `default`, `udp`, `deep`         |
+| `-p, --ports`       | Custom ports (e.g. `22,80,443` or `1-1024`)                      |
+| `--view`            | Force view: `table` or `tree`                                    |
+| `--show-mac`        | Include MAC addresses (L2 only)                                  |
+| `--show-vendors`    | Include vendor names (requires `--show-mac`)                     |
+| `--sudo`            | Run local nmap via sudo (better ARP, SYN scans, MAC discovery)   |
+| `--root-scan`       | Use SYN scan (`-sS`) — requires root on the scanning machine     |
+| `-j, --json`        | Write results to a JSON file                                     |
+| `--report`          | Write Markdown or HTML report (format from file extension)       |
+| `--concurrency`     | Max parallel host scans (default 32)                             |
+| `--host-timeout`    | Per-host timeout in seconds (default 20)                         |
+
+---
 
 ## Vendor Lookup
-By default, ndscan ships with a small built-in OUI sample.
-For more accurate vendor results, drop your own OUI file at:
+
+ndscan includes a small built-in OUI database. For better vendor names, place your own file at:
+
 ```
 ~/.ndscan/oui.txt
 ```
+
 Format (tab or space separated):
+
 ```
 00:11:22   AcmeCorp
 3C:5A:B4   TP-Link
 48:5A:3F   Cisco
 ```
-# Views
-**Table view(`-tb`);**
+
+---
+
+## Example Output
+
+**Table view (`-tb`)**
+
 ```
 +----------------+----------------+-----+----------------------+
 | IP             | HOST           | UP  | OPEN PORTS           |
@@ -91,7 +261,9 @@ Format (tab or space separated):
 | 192.168.1.200  |                | yes | 22                   |
 +----------------+----------------+-----+----------------------+
 ```
-**Tree view(`-tr`);**
+
+**Tree view (`-tr`)**
+
 ```
 192.168.1.1
 ├─ Host: _gateway
@@ -103,11 +275,35 @@ Format (tab or space separated):
    ├─ 80/tcp http
    └─ 8443/tcp https-alt
 ```
-# Roadmap
-- --ssh-sudo flag for automatic sudo nmap on jump hosts.
 
-- Lightweight built-in port scanner for ultra-fast /24 sweeps.
+---
 
-- Banner grabbing (SSH/HTTP service info).
+## Roadmap
 
-- History of past scans (ndscan history list).
+- `--ssh-sudo` flag for automatic sudo on jump hosts
+- Lightweight built-in port scanner for ultra-fast sweeps (no nmap dependency)
+- Service banner grabbing (SSH/HTTP)
+- Scan history and comparison
+- More export templates and theming for HTML reports
+
+---
+
+## Contributing
+
+Contributions are welcome! Feel free to open issues or pull requests.
+
+Some areas that would be especially helpful:
+- Additional scan presets or smarter defaults
+- Improved risk rules
+- Better remote/SSH UX
+- Documentation and examples
+
+---
+
+## License
+
+This project is currently unlicensed. A license will be added in a future release.
+
+---
+
+**Made with Go and the official Go Gopher.**
