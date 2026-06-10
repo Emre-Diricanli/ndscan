@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,37 @@ func resultsModel(t *testing.T) Model {
 	m.summary = "3 host(s) up"
 	m.rebuildTable()
 	return m
+}
+
+func TestTreeViewScrolls(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := New("test")
+	m.width, m.height = 100, 16 // short window so content overflows
+	m.screen = screenResults
+	// many hosts -> tree taller than the viewport
+	for i := 0; i < 40; i++ {
+		m.rows = append(m.rows, ui.Row{
+			IP: "10.0.0." + strconv.Itoa(i), Up: true,
+			Ports: []string{"22/tcp ssh"},
+		})
+	}
+	m.summary = "40 host(s) up"
+	m.rebuildTable()
+
+	var tm tea.Model = m
+	tm, _ = tm.Update(keyRunes("t")) // switch to tree view
+	if tm.(Model).view != viewTree {
+		t.Fatal("t should switch to tree view")
+	}
+	before := tm.(Model).treeVP.YOffset
+
+	// keyboard down + mouse wheel down should both advance the viewport
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyDown})
+	tm, _ = tm.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	after := tm.(Model).treeVP.YOffset
+	if after <= before {
+		t.Fatalf("tree viewport should scroll down: offset %d -> %d", before, after)
+	}
 }
 
 func TestFilterNarrowsRows(t *testing.T) {

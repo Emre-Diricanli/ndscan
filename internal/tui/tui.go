@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -137,6 +138,8 @@ type Model struct {
 	visible  []rowView // rows after filter/sort, aligned with table cursor
 	view     resultView
 	tbl      table.Model
+	treeVP   viewport.Model // scrollable container for the tree view
+	treeRdy  bool           // treeVP has been sized at least once
 	summary  string
 	failed   int
 	filterIn textinput.Model
@@ -241,7 +244,7 @@ func (m Model) Init() tea.Cmd {
 
 // Run starts the TUI program.
 func Run(version string) error {
-	p := tea.NewProgram(New(version), tea.WithAltScreen())
+	p := tea.NewProgram(New(version), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -274,6 +277,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenResults:
 			return m.updateResults(msg)
 		}
+
+	case tea.MouseMsg:
+		// Mouse-wheel scrolls the active results view. The table scrolls
+		// itself; the tree scrolls its viewport.
+		if m.mode == modeNone && m.screen == screenResults {
+			if m.view == viewTree {
+				var cmd tea.Cmd
+				m.treeVP, cmd = m.treeVP.Update(msg)
+				return m, cmd
+			}
+			var cmd tea.Cmd
+			m.tbl, cmd = m.tbl.Update(msg)
+			return m, cmd
+		}
+		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -746,7 +764,11 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.tbl, cmd = m.tbl.Update(msg)
 		return m, cmd
 	}
-	return m, nil
+	// Tree view: forward navigation keys (↑↓, j/k, PgUp/PgDn, g/G) to the
+	// scrollable viewport.
+	var cmd tea.Cmd
+	m.treeVP, cmd = m.treeVP.Update(msg)
+	return m, cmd
 }
 
 // selectedRow returns the rowView under the table cursor, if any.
@@ -927,6 +949,36 @@ func (m *Model) rebuildTable() {
 		t.SetCursor(cursor)
 	}
 	m.tbl = t
+
+	m.refreshTree()
+}
+
+// treeViewportHeight returns the visible row budget for the scrollable tree,
+// matching the table's height reservation so both views fill the same space.
+func (m Model) treeViewportHeight() int {
+	h := m.height - 12
+	if h < 5 {
+		h = 5
+	}
+	return h
+}
+
+// refreshTree re-renders the tree content into the scrollable viewport and
+// sizes it to the current window, preserving the scroll position.
+func (m *Model) refreshTree() {
+	w := m.width
+	if w == 0 {
+		w = 100
+	}
+	h := m.treeViewportHeight()
+	if !m.treeRdy {
+		m.treeVP = viewport.New(w, h)
+		m.treeRdy = true
+	} else {
+		m.treeVP.Width = w
+		m.treeVP.Height = h
+	}
+	m.treeVP.SetContent(m.treeView())
 }
 
 func dash(s string) string {

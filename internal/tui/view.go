@@ -76,7 +76,9 @@ func (m Model) helpPanel() string {
 		"  esc or q        cancel (keeps partial results)",
 		"",
 		accentText.Render("Results"),
-		"  ↑↓              move selection",
+		"  ↑↓              move selection (table) / scroll (tree)",
+		"  mouse wheel      scroll the list",
+		"  pgup/pgdn g G   page / jump (tree)",
 		"  enter           host details",
 		"  t               table ⇄ tree view",
 		"  /               filter rows (esc clears)",
@@ -347,7 +349,7 @@ func (m Model) viewResults() string {
 			body = warnStyle.Render("  No live hosts found.")
 		}
 	} else if m.view == viewTree {
-		body = m.treeView()
+		body = m.treeVP.View()
 	} else {
 		body = m.tbl.View()
 	}
@@ -370,6 +372,10 @@ func (m Model) viewResults() string {
 		status = append(status, hintStyle.Render("filter: ")+accentText.Render(m.filterIn.Value()))
 	}
 	status = append(status, hintStyle.Render("sort: ")+accentText.Render(m.sortBy.String()))
+	// Scroll indicator for the tree view when content overflows the viewport.
+	if m.view == viewTree && len(m.visible) > 0 && (m.treeVP.TotalLineCount() > m.treeVP.Height) {
+		status = append(status, hintStyle.Render("scroll: ")+accentText.Render(fmt.Sprintf("%3.0f%%", m.treeVP.ScrollPercent()*100)))
+	}
 	if m.watch {
 		bell := "🔔"
 		if !m.notify {
