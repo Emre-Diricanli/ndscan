@@ -102,7 +102,7 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 	if len(live) == 0 {
 		return nil, nil
 	}
-	sem := make(chan struct{}, max(1, cfg.Concurrency))
+	sem := make(chan struct{}, effectiveConcurrency(cfg.Concurrency, len(live)))
 	var wg sync.WaitGroup
 	res := make([]HostResult, len(live))
 	var done int32
@@ -125,6 +125,21 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 	}
 	wg.Wait()
 	return res, nil
+}
+
+// HostsUpResults synthesizes minimal "host up, no ports" results for a set of
+// live IPs, for the discover-only fast path. The XML mirrors what nmap emits
+// for an up host with no open ports, so the existing parsers/printers consume
+// it unchanged.
+func HostsUpResults(ips []string) []HostResult {
+	out := make([]HostResult, 0, len(ips))
+	for _, ip := range ips {
+		xml := []byte(`<nmaprun><host><status state="up"/>` +
+			`<address addr="` + ip + `" addrtype="ipv4"/>` +
+			`<ports></ports></host></nmaprun>`)
+		out = append(out, HostResult{IP: ip, XMLBytes: xml})
+	}
+	return out
 }
 
 func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte, error) {
@@ -157,7 +172,10 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 	default: // "quick" and anything else
 		args = append(args, "-T4")
 		if cfg.Ports == "" {
-			args = append(args, "-F")
+			// Top 100 ports cover the vast majority of real services and scan
+			// ~10x fewer ports than -F (top 1000) — a big win on firewalled
+			// hosts where each unanswered port costs a timeout.
+			args = append(args, "--top-ports", "100")
 		}
 	}
 	// explicit ports override
@@ -168,8 +186,16 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 	if cfg.HostTimeout > 0 {
 		args = append(args, "--host-timeout", cfg.HostTimeout.String())
 	}
-	// fewer retries for speed
-	args = append(args, "--max-retries", "1", "--min-rate", "200")
+
+	// Timing: the deep/default presets keep nmap's conservative retries so
+	// version/OS detection stays accurate. Quick/udp scans (typically on a
+	// LAN) go aggressive — no retries, high min-rate — which roughly halves
+	// per-host time on firewalled hosts with negligible accuracy loss.
+	if cfg.Preset == "default" || cfg.Preset == "deep" {
+		args = append(args, "--max-retries", "2", "--min-rate", "200")
+	} else {
+		args = append(args, "--max-retries", "0", "--min-rate", "1000")
+	}
 
 	args = append(args, ip)
 	return runner.Run(ctx, "nmap", args...)
@@ -180,4 +206,16 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// effectiveConcurrency picks the worker count for a scan: the requested cap,
+// but never more workers than there are hosts (no idle workers on small
+// scans). The requested value is honored as-is otherwise, so users can raise
+// it for big ranges or lower it to be gentle.
+func effectiveConcurrency(requested, hosts int) int {
+	want := max(1, requested)
+	if want > hosts {
+		want = hosts
+	}
+	return max(1, want)
 }

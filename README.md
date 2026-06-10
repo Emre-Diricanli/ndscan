@@ -220,6 +220,7 @@ Reports include:
 | `-tb`               | Shortcut for `--view table`                                      |
 | `-tr`               | Shortcut for `--view tree`                                       |
 | `-P, --preset`      | Scan preset: `quick` (default), `default`, `udp`, `deep`         |
+| `--discover`        | Only list live hosts (skip the port scan) — fastest             |
 | `-p, --ports`       | Custom ports (e.g. `22,80,443` or `1-1024`)                      |
 | `--view`            | Force view: `table` or `tree`                                    |
 | `--show-mac`        | Include MAC addresses (L2 only)                                  |
@@ -229,7 +230,7 @@ Reports include:
 | `-j, --json`        | Write results to a JSON file                                     |
 | `--report`          | Write Markdown or HTML report (format from file extension)       |
 | `--no-open`         | Don't open HTML reports in the browser                           |
-| `--concurrency`     | Max parallel host scans (default 32)                             |
+| `--concurrency`     | Max parallel host scans (default 64; auto-capped to host count) |
 | `--host-timeout`    | Per-host timeout in seconds (default 20)                         |
 
 ---

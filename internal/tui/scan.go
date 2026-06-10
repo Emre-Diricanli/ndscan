@@ -129,10 +129,15 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			return
 		}
 
-		// Seed the MAC map from ARP, then let a privileged nmap pass (if any)
-		// override with its own results.
+		// Build the MAC map. The ARP cache already covers every L2 neighbor
+		// for free, so we only run the extra nmap -sn MAC sweep when it can do
+		// better: as root locally (a real ARP scan), or over SSH (the remote
+		// host's privileges/cache, which we can't introspect from here).
+		// A local unprivileged nmap pass just duplicates the ARP data at the
+		// cost of a whole extra sweep, so we skip it.
 		macMap := map[string]string{}
-		if p.showMac {
+		nmapMACWorthwhile := p.sshTarget != "" || p.sudo || scan.IsRoot()
+		if p.showMac && nmapMACWorthwhile {
 			ch <- phaseMsg{phase: "mac"}
 			if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
 				for ip, mac := range nmapMACs {

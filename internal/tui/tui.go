@@ -181,7 +181,7 @@ func New(version string) Model {
 		focus:         fTargets,
 		targetsIn:     t,
 		portsIn:       mkInput("e.g. 22,80,443 or 1-1024 (optional)", "", 48),
-		concurIn:      mkInput("32", "32", 8),
+		concurIn:      mkInput("64", "64", 8),
 		timeoutIn:     mkInput("20", "20", 8),
 		profileNameIn: mkInput("profile name", "", 32),
 		presetIdx:     0,

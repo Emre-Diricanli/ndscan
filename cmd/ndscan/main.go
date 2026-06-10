@@ -51,6 +51,7 @@ func main() {
 		jsonOut        string
 		reportOut      string
 		noOpen         bool
+		discoverOnly   bool
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
@@ -171,14 +172,19 @@ Otherwise, nmap runs locally.`,
 			}
 			sp.Success(fmt.Sprintf("Found %d live host(s)", len(live)))
 
-			// 1b) optional: collect MACs (nmap when privileged, plus ARP cache)
+			// 1b) optional: collect MACs. The ARP cache covers every L2
+			// neighbor for free; only run the extra nmap -sn MAC sweep when it
+			// can do better (root locally, or over SSH where we can't tell).
 			var macMap map[string]string
 			if showMac {
 				sp = ui.StartSpinner("Collecting MAC addresses…")
 				macMap = map[string]string{}
-				if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
-					for ip, mac := range nmapMACs {
-						macMap[ip] = mac
+				nmapMACWorthwhile := sshTarget != "" || useSudo || scan.IsRoot()
+				if nmapMACWorthwhile {
+					if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
+						for ip, mac := range nmapMACs {
+							macMap[ip] = mac
+						}
 					}
 				}
 				for ip, mac := range arpMap {
@@ -189,19 +195,27 @@ Otherwise, nmap runs locally.`,
 				sp.Success(fmt.Sprintf("Collected %d MAC address(es)", len(macMap)))
 			}
 
-			// 2) parallel per-host scans (remote or local depending on runner)
-			sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", len(live), preset, len(live)))
-			cfg.Progress = func(done, total int) {
-				sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", total, preset, done, total))
-			}
-			results, err := scan.ScanHosts(ctx, live, cfg, runner)
-			if err != nil {
-				sp.Fail("Port scan failed")
-				return err
-			}
-			sp.Success("Port scan complete")
-			if failed := countFailed(results); failed > 0 {
-				ui.Warnf("%d host(s) failed to scan (first error: %v)", failed, firstError(results))
+			// 2) parallel per-host scans (remote or local depending on runner).
+			// --discover skips the port scan entirely for a fast "who's up" view.
+			var results []scan.HostResult
+			if discoverOnly {
+				ui.Infof("Discover-only mode: skipping port scan")
+				results = scan.HostsUpResults(live)
+			} else {
+				sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", len(live), preset, len(live)))
+				cfg.Progress = func(done, total int) {
+					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", total, preset, done, total))
+				}
+				var err error
+				results, err = scan.ScanHosts(ctx, live, cfg, runner)
+				if err != nil {
+					sp.Fail("Port scan failed")
+					return err
+				}
+				sp.Success("Port scan complete")
+				if failed := countFailed(results); failed > 0 {
+					ui.Warnf("%d host(s) failed to scan (first error: %v)", failed, firstError(results))
+				}
 			}
 
 			// 3) vendor DB (only if needed)
@@ -263,11 +277,12 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
 	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
 	scanCmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open HTML reports in the browser")
+	scanCmd.Flags().BoolVar(&discoverOnly, "discover", false, "only list live hosts (skip the port scan) — fastest")
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")
 	scanCmd.Flags().BoolVar(&showVendors, "show-vendors", false, "include vendor names (requires --show-mac)")
 	scanCmd.Flags().BoolVar(&rootScan, "root-scan", false, "use SYN scan (-sS), requires root on the machine running nmap")
 	scanCmd.Flags().BoolVar(&useSudo, "sudo", false, "run local nmap via sudo for full ARP discovery, SYN scans, and MACs")
-	scanCmd.Flags().IntVar(&concurrency, "concurrency", 32, "max parallel host scans")
+	scanCmd.Flags().IntVar(&concurrency, "concurrency", 64, "max parallel host scans")
 	scanCmd.Flags().IntVar(&hostTimeoutSec, "host-timeout", 20, "per-host timeout seconds (nmap)")
 	scanCmd.Flags().StringVar(&view, "view", "table", "output view: table | tree")
 
