@@ -264,11 +264,7 @@ func TestWatchRescanFiresNotifyCmd(t *testing.T) {
 func TestExportJSONAndCSV(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	dir := t.TempDir()
-	old, _ := os.Getwd()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(old)
+	t.Setenv("NDSCAN_EXPORT_DIR", dir)
 
 	m := resultsModel(t)
 	notice := m.export("json")
@@ -286,7 +282,8 @@ func TestExportJSONAndCSV(t *testing.T) {
 		t.Fatalf("html export notice: %s", notice)
 	}
 
-	files, _ := filepath.Glob(filepath.Join(dir, "ndscan-*"))
+	// Exports land in a dated subfolder under the export dir.
+	files, _ := filepath.Glob(filepath.Join(dir, "*", "ndscan-*"))
 	if len(files) != 4 {
 		t.Fatalf("expected 4 export files, got %v", files)
 	}

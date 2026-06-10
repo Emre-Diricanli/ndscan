@@ -14,7 +14,8 @@ import (
 )
 
 // export writes the currently visible rows (excluding synthetic GONE entries)
-// to a timestamped file in the working directory and returns a notice string.
+// to a timestamped file under ~/Downloads/ndscan/<date>/ and returns a notice
+// string with the full path.
 func (m Model) export(format string) string {
 	rows := make([]ui.Row, 0, len(m.visible))
 	for _, rv := range m.visible {
@@ -23,12 +24,14 @@ func (m Model) export(format string) string {
 		}
 	}
 	now := time.Now()
-	name := fmt.Sprintf("ndscan-%s.%s", now.Format("20060102-150405"), format)
+	path, err := report.ExportPath(now, format)
+	if err != nil {
+		return "export failed: " + err.Error()
+	}
 
-	var err error
 	switch format {
 	case "csv":
-		err = writeCSV(name, rows)
+		err = writeCSV(path, rows)
 	case "md", "html":
 		rep := report.Report{
 			Targets:   strings.Join(m.params.targets, ", "),
@@ -40,14 +43,14 @@ func (m Model) export(format string) string {
 		if format == "html" {
 			content = rep.HTML()
 		}
-		err = os.WriteFile(name, []byte(content), 0o644)
+		err = os.WriteFile(path, []byte(content), 0o644)
 	default:
-		err = writeJSON(name, rows)
+		err = writeJSON(path, rows)
 	}
 	if err != nil {
 		return "export failed: " + err.Error()
 	}
-	return fmt.Sprintf("wrote %d row(s) to %s", len(rows), name)
+	return fmt.Sprintf("wrote %d row(s) to %s", len(rows), path)
 }
 
 func writeJSON(path string, rows []ui.Row) error {

@@ -85,6 +85,7 @@ func (m Model) helpPanel() string {
 		"  s               cycle sort: ip · host · ports · up",
 		"  e / c           export JSON / CSV",
 		"  m / h           export Markdown / HTML report",
+		"  " + hintStyle.Render("                 → ~/Downloads/ndscan/<date>/"),
 		"  w               toggle watch mode (auto-rescan)",
 		"  b               toggle desktop notifications on change",
 		"  + / -           watch interval ±15s",
