@@ -127,6 +127,32 @@ func TestSortCyclesAndIPOrder(t *testing.T) {
 	}
 }
 
+func TestDetailPaneShowsFingerprint(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	m.rows = []ui.Row{{
+		IP: "10.0.0.5", Host: "router", Up: true,
+		OS: "Linux 5.X", OSAccuracy: 92, OSCPE: "cpe:/o:linux:linux_kernel:5",
+		RTT: "1.2ms",
+		PortDetails: []ui.PortInfo{{
+			Port: 8443, Proto: "tcp", Service: "http", Product: "nginx", Version: "1.25",
+			ExtraInfo: "Ubuntu", CPE: "cpe:/a:igor_sysoev:nginx:1.25", TLS: true,
+			HTTPTitle: "Admin Console", Cert: "Acme — exp 2027-01-02",
+			Severity: "info", Risk: "admin panel",
+		}},
+	}}
+	m.rebuildTable()
+
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	v := tm.View()
+	for _, want := range []string{"92%", "cpe:/o:linux", "tls", "Admin Console", "Acme — exp 2027-01-02", "Ubuntu"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("detail view missing %q", want)
+		}
+	}
+}
+
 func TestDetailAndHelpOverlays(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	m := resultsModel(t)

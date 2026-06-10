@@ -17,14 +17,16 @@ import (
 )
 
 type Row struct {
-	IP     string   `json:"ip"`
-	MAC    string   `json:"mac,omitempty"`
-	Vendor string   `json:"vendor,omitempty"`
-	Host   string   `json:"hostname,omitempty"`
-	OS     string   `json:"os,omitempty"`  // best OS-detection guess (needs -A presets)
-	RTT    string   `json:"rtt,omitempty"` // smoothed round-trip time, e.g. "2.1ms"
-	Up     bool     `json:"up"`
-	Ports  []string `json:"ports,omitempty"` // labels like "22/tcp ssh"
+	IP         string   `json:"ip"`
+	MAC        string   `json:"mac,omitempty"`
+	Vendor     string   `json:"vendor,omitempty"`
+	Host       string   `json:"hostname,omitempty"`
+	OS         string   `json:"os,omitempty"`          // best OS-detection guess (needs -A presets)
+	OSAccuracy int      `json:"os_accuracy,omitempty"` // confidence 0-100
+	OSCPE      string   `json:"os_cpe,omitempty"`      // first OS CPE
+	RTT        string   `json:"rtt,omitempty"`         // smoothed round-trip time, e.g. "2.1ms"
+	Up         bool     `json:"up"`
+	Ports      []string `json:"ports,omitempty"` // labels like "22/tcp ssh"
 	// PortDetails carries the structured per-port view (number, service,
 	// version, risk) for detail panes and reports. It mirrors Ports.
 	PortDetails []PortInfo `json:"port_details,omitempty"`
@@ -32,13 +34,18 @@ type Row struct {
 
 // PortInfo is the structured form of one open port.
 type PortInfo struct {
-	Port     int    `json:"port"`
-	Proto    string `json:"proto"`
-	Service  string `json:"service,omitempty"`
-	Product  string `json:"product,omitempty"`
-	Version  string `json:"version,omitempty"`
-	Severity string `json:"severity,omitempty"` // "", "info", "warn", "high"
-	Risk     string `json:"risk,omitempty"`     // human-readable reason
+	Port      int    `json:"port"`
+	Proto     string `json:"proto"`
+	Service   string `json:"service,omitempty"`
+	Product   string `json:"product,omitempty"`
+	Version   string `json:"version,omitempty"`
+	ExtraInfo string `json:"extra_info,omitempty"` // e.g. "Python 3.14.3"
+	CPE       string `json:"cpe,omitempty"`        // e.g. "cpe:/a:python:python:3.14"
+	TLS       bool   `json:"tls,omitempty"`        // service runs over an SSL/TLS tunnel
+	HTTPTitle string `json:"http_title,omitempty"` // page title (http-title script)
+	Cert      string `json:"cert,omitempty"`       // TLS cert summary (ssl-cert script)
+	Severity  string `json:"severity,omitempty"`   // "", "info", "warn", "high"
+	Risk      string `json:"risk,omitempty"`       // human-readable reason
 }
 
 // VersionLabel renders product + version, e.g. "OpenSSH 9.6", or "".
@@ -77,7 +84,11 @@ func flatten(res []scan.HostResult) []Row {
 			if len(h.Hostnames.Names) > 0 {
 				row.Host = h.Hostnames.Names[0].Name
 			}
-			row.OS = h.BestOSGuess()
+			if osd := h.BestOSDetail(); osd != nil {
+				row.OS = osd.Name
+				row.OSAccuracy = osd.Accuracy
+				row.OSCPE = osd.CPE
+			}
 			if rtt := h.RTT(); rtt > 0 {
 				row.RTT = formatRTT(rtt)
 			}
@@ -93,15 +104,23 @@ func flatten(res []scan.HostResult) []Row {
 					row.Ports = append(row.Ports, label)
 
 					risk := scan.ClassifyPort(p.PortID, p.Service.Name)
-					row.PortDetails = append(row.PortDetails, PortInfo{
-						Port:     p.PortID,
-						Proto:    p.Protocol,
-						Service:  p.Service.Name,
-						Product:  p.Service.Product,
-						Version:  p.Service.Version,
-						Severity: risk.Severity.String(),
-						Risk:     risk.Reason,
-					})
+					pi := PortInfo{
+						Port:      p.PortID,
+						Proto:     p.Protocol,
+						Service:   p.Service.Name,
+						Product:   p.Service.Product,
+						Version:   p.Service.Version,
+						ExtraInfo: p.Service.ExtraInfo,
+						CPE:       p.Service.CPE(),
+						TLS:       p.Service.Tunnel == "ssl",
+						HTTPTitle: p.HTTPTitle(),
+						Severity:  risk.Severity.String(),
+						Risk:      risk.Reason,
+					}
+					if cert := p.TLSCert(); cert != nil {
+						pi.Cert = cert.Summary()
+					}
+					row.PortDetails = append(row.PortDetails, pi)
 				}
 			}
 			out = append(out, row)

@@ -126,7 +126,19 @@ func (m Model) detailPanel() string {
 	}
 	line("MAC", r.MAC)
 	line("Vendor", r.Vendor)
-	line("OS", r.OS)
+	// OS with confidence and CPE when available.
+	if r.OS != "" {
+		os := r.OS
+		if r.OSAccuracy > 0 {
+			os += hintStyle.Render(fmt.Sprintf("  (%d%%)", r.OSAccuracy))
+		}
+		b.WriteString(labelStyle.Width(9).Render("OS") + " " + valueStyle.Render(os) + "\n")
+		if r.OSCPE != "" {
+			b.WriteString(strings.Repeat(" ", 10) + hintStyle.Render(r.OSCPE) + "\n")
+		}
+	} else {
+		line("OS", "")
+	}
 	line("RTT", r.RTT)
 	if rv.diff.Changed() && !rv.gone {
 		b.WriteString(labelStyle.Width(9).Render("Changes") + " " + warnStyle.Render(diffBadge(rv.diff)) + "\n")
@@ -144,10 +156,28 @@ func (m Model) detailPanel() string {
 			if p.Service != "" {
 				head += "  " + valueStyle.Render(p.Service)
 			}
+			if p.TLS {
+				head += "  " + okStyle.Render("🔒 tls")
+			}
 			if vl := p.VersionLabel(); vl != "" {
 				head += "  " + hintStyle.Render(vl)
 			}
 			b.WriteString("  " + head + "\n")
+			detail := func(k, v string) {
+				b.WriteString("      " + hintStyle.Render(k+": ") + valueStyle.Render(v) + "\n")
+			}
+			if p.ExtraInfo != "" {
+				detail("info", p.ExtraInfo)
+			}
+			if p.HTTPTitle != "" {
+				detail("title", p.HTTPTitle)
+			}
+			if p.Cert != "" {
+				detail("cert", p.Cert)
+			}
+			if p.CPE != "" {
+				b.WriteString("      " + hintStyle.Render(p.CPE) + "\n")
+			}
 			if p.Risk != "" {
 				b.WriteString("      " + sevStyle(p.Severity).Render("⚠ "+p.Risk) + "\n")
 			}
