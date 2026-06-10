@@ -263,6 +263,7 @@ func TestWatchRescanFiresNotifyCmd(t *testing.T) {
 
 func TestExportJSONAndCSV(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("NDSCAN_NO_OPEN", "1") // don't spawn a browser in tests
 	dir := t.TempDir()
 	t.Setenv("NDSCAN_EXPORT_DIR", dir)
 

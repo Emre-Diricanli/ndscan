@@ -50,7 +50,13 @@ func (m Model) export(format string) string {
 	if err != nil {
 		return "export failed: " + err.Error()
 	}
-	return fmt.Sprintf("wrote %d row(s) to %s", len(rows), path)
+	notice := fmt.Sprintf("wrote %d row(s) to %s", len(rows), path)
+	// Open HTML reports in the browser so the user sees them immediately.
+	if format == "html" && report.CanOpen() {
+		_ = report.Open(path)
+		notice += " (opened in browser)"
+	}
+	return notice
 }
 
 func writeJSON(path string, rows []ui.Row) error {

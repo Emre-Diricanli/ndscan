@@ -50,6 +50,7 @@ func main() {
 		ports          string
 		jsonOut        string
 		reportOut      string
+		noOpen         bool
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
@@ -219,14 +220,21 @@ Otherwise, nmap runs locally.`,
 					Generated: start.Format("2006-01-02 15:04:05"),
 					Rows:      rows,
 				}
+				isHTML := strings.HasSuffix(strings.ToLower(reportOut), ".html")
 				content := rep.Markdown()
-				if strings.HasSuffix(strings.ToLower(reportOut), ".html") {
+				if isHTML {
 					content = rep.HTML()
 				}
 				if err := os.WriteFile(reportOut, []byte(content), 0o644); err != nil {
 					return err
 				}
 				ui.Infof("Wrote report to %s", reportOut)
+				// Open HTML reports in the browser unless suppressed.
+				if isHTML && !noOpen && report.CanOpen() {
+					if err := report.Open(reportOut); err == nil {
+						ui.Infof("Opened %s in your browser", reportOut)
+					}
+				}
 				return nil
 			}
 			if jsonOut != "" {
@@ -254,6 +262,7 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().StringVarP(&ports, "ports", "p", "", "ports (e.g., 1-1024 or 22,80,443)")
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
 	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
+	scanCmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open HTML reports in the browser")
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")
 	scanCmd.Flags().BoolVar(&showVendors, "show-vendors", false, "include vendor names (requires --show-mac)")
 	scanCmd.Flags().BoolVar(&rootScan, "root-scan", false, "use SYN scan (-sS), requires root on the machine running nmap")

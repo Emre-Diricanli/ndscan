@@ -145,8 +145,10 @@ Running `ndscan` with no arguments opens a full-screen terminal UI powered by Bu
   - `e` → JSON
   - `c` → CSV
   - `m` → Markdown report
-  - `h` → HTML report
+  - `h` → HTML report (opens automatically in your browser)
 - Save and load scan profiles
+
+Exports are saved to `~/Downloads/ndscan/<date>/`.
 
 The TUI is the fastest way to explore a network interactively.
 
@@ -201,7 +203,7 @@ ndscan scan 192.168.1.0/24 --show-mac --show-vendors --report report.html
 ndscan scan 10.0.0.0/24 --report findings.md
 ```
 
-- `.html` → full standalone HTML document
+- `.html` → full standalone HTML document (opens in your browser automatically; pass `--no-open` to skip)
 - `.md`  → clean GitHub-flavored Markdown
 
 Reports include:
@@ -226,6 +228,7 @@ Reports include:
 | `--root-scan`       | Use SYN scan (`-sS`) — requires root on the scanning machine     |
 | `-j, --json`        | Write results to a JSON file                                     |
 | `--report`          | Write Markdown or HTML report (format from file extension)       |
+| `--no-open`         | Don't open HTML reports in the browser                           |
 | `--concurrency`     | Max parallel host scans (default 32)                             |
 | `--host-timeout`    | Per-host timeout in seconds (default 20)                         |
 
