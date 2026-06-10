@@ -766,8 +766,13 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.view == viewTable {
+		before := m.tbl.Cursor()
 		var cmd tea.Cmd
 		m.tbl, cmd = m.tbl.Update(msg)
+		// Keep the "discover →" affordance on the now-selected row.
+		if m.tbl.Cursor() != before {
+			m.tbl.SetRows(m.tableRows(m.tbl.Cursor()))
+		}
 		return m, cmd
 	}
 	// Tree view: forward navigation keys (↑↓, j/k, PgUp/PgDn, g/G) to the
@@ -891,36 +896,20 @@ func (m *Model) rebuildTable() {
 		add("Vendor", 14)
 	}
 	add("Up", 5)
+	add("Latency", 9)
+	add("Speed", 10)
 	if hasDiff {
 		add("Δ", 10)
 	}
+	add("Discover", 12)
 
-	rows := make([]table.Row, 0, len(m.visible))
-	for _, rv := range m.visible {
-		r := rv.row
-		up := "✗"
-		if r.Up {
-			up = "✓"
-		}
-		if rv.gone {
-			up = "✗"
-		}
-		cells := []string{r.IP}
-		if m.params.showMac {
-			cells = append(cells, dash(r.MAC), dash(r.Vendor))
-		}
-		cells = append(cells, up)
-		if hasDiff {
-			cells = append(cells, rv.badge)
-		}
-		rows = append(rows, table.Row(cells))
-	}
+	cursor := m.tbl.Cursor()
+	rows := m.tableRows(cursor)
 
 	h := m.height - 12
 	if h < 5 {
 		h = 5
 	}
-	cursor := m.tbl.Cursor()
 	t := table.New(
 		table.WithColumns(cols),
 		table.WithRows(rows),
@@ -938,6 +927,71 @@ func (m *Model) rebuildTable() {
 	m.tbl = t
 
 	m.refreshTree()
+}
+
+// tableRows builds the table cell rows. The Discover column shows an arrow only
+// on the row at `cursor`, so the affordance follows the selection; pass -1 for
+// none. Column set must stay in sync with rebuildTable.
+func (m Model) tableRows(cursor int) []table.Row {
+	hasDiff := len(m.diff) > 0
+	rows := make([]table.Row, 0, len(m.visible))
+	for i, rv := range m.visible {
+		r := rv.row
+		up := "✗"
+		if r.Up {
+			up = "✓"
+		}
+		if rv.gone {
+			up = "✗"
+		}
+		cells := []string{r.IP}
+		if m.params.showMac {
+			cells = append(cells, dash(r.MAC), dash(r.Vendor))
+		}
+		cells = append(cells, up, dash(r.RTT), speedTier(r.RTT))
+		if hasDiff {
+			cells = append(cells, rv.badge)
+		}
+		discover := ""
+		if i == cursor && !rv.gone {
+			discover = "discover →"
+		}
+		cells = append(cells, discover)
+		rows = append(rows, table.Row(cells))
+	}
+	return rows
+}
+
+// speedTier maps an RTT label ("2.1ms", "48ms", "1.50s") to a qualitative,
+// glyph-tagged tier. Returns "" when there's no latency reading.
+func speedTier(rtt string) string {
+	ms, ok := rttMillis(rtt)
+	if !ok {
+		return ""
+	}
+	switch {
+	case ms < 10:
+		return "⚡ fast"
+	case ms < 80:
+		return "~ medium"
+	default:
+		return "🐌 slow"
+	}
+}
+
+// rttMillis parses an RTT label back into milliseconds. Mirrors the formats
+// produced by ui.formatRTT ("0.4ms", "48ms", "1.50s").
+func rttMillis(rtt string) (float64, bool) {
+	switch {
+	case strings.HasSuffix(rtt, "ms"):
+		v, err := strconv.ParseFloat(strings.TrimSuffix(rtt, "ms"), 64)
+		return v, err == nil
+	case strings.HasSuffix(rtt, "s"):
+		v, err := strconv.ParseFloat(strings.TrimSuffix(rtt, "s"), 64)
+		return v * 1000, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // treeViewportHeight returns the visible row budget for the scrollable tree,

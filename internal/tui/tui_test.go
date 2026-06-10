@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
@@ -92,6 +93,55 @@ func TestFilterNarrowsRows(t *testing.T) {
 	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if n := len(tm.(Model).visible); n != 4 { // 3 rows + 1 GONE
 		t.Fatalf("esc should clear filter, got %d visible", n)
+	}
+}
+
+func TestSpeedTier(t *testing.T) {
+	cases := map[string]string{
+		"":        "",
+		"2.1ms":   "⚡ fast",
+		"9.9ms":   "⚡ fast",
+		"10ms":    "~ medium",
+		"48ms":    "~ medium",
+		"80ms":    "🐌 slow",
+		"210ms":   "🐌 slow",
+		"1.50s":   "🐌 slow",
+		"0.4ms":   "⚡ fast",
+		"garbage": "",
+	}
+	for in, want := range cases {
+		if got := speedTier(in); got != want {
+			t.Errorf("speedTier(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDiscoverArrowFollowsCursor(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t) // 3 live rows + 1 gone
+	m.rebuildTable()
+
+	discoverIdx := func(rows []table.Row) int {
+		for i, r := range rows {
+			if r[len(r)-1] != "" { // Discover is the last column
+				return i
+			}
+		}
+		return -1
+	}
+
+	if got := discoverIdx(m.tableRows(0)); got != 0 {
+		t.Fatalf("discover arrow should be on row 0, got %d", got)
+	}
+
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyDown})
+	mm := tm.(Model)
+	if got := discoverIdx(mm.tableRows(mm.tbl.Cursor())); got != mm.tbl.Cursor() {
+		t.Fatalf("discover arrow should follow cursor to %d, got %d", mm.tbl.Cursor(), got)
+	}
+	if mm.tbl.Cursor() == 0 {
+		t.Fatal("cursor should have moved off row 0")
 	}
 }
 
