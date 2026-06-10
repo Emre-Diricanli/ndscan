@@ -6,9 +6,11 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
 
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
@@ -19,6 +21,7 @@ type Row struct {
 	MAC    string   `json:"mac,omitempty"`
 	Vendor string   `json:"vendor,omitempty"`
 	Host   string   `json:"hostname,omitempty"`
+	OS     string   `json:"os,omitempty"` // best OS-detection guess (needs -A presets)
 	Up     bool     `json:"up"`
 	Ports  []string `json:"ports,omitempty"` // labels like "22/tcp ssh"
 }
@@ -47,11 +50,15 @@ func flatten(res []scan.HostResult) []Row {
 			if len(h.Hostnames.Names) > 0 {
 				row.Host = h.Hostnames.Names[0].Name
 			}
+			row.OS = h.BestOSGuess()
 			for _, p := range h.Ports.List {
 				if p.State.State == "open" {
 					label := fmt.Sprintf("%d/%s %s", p.PortID, p.Protocol, p.Service.Name)
 					if p.Service.Product != "" {
 						label += " " + p.Service.Product
+					}
+					if p.Service.Version != "" {
+						label += " " + p.Service.Version
 					}
 					row.Ports = append(row.Ports, label)
 				}
@@ -61,6 +68,31 @@ func flatten(res []scan.HostResult) []Row {
 	}
 	return mergePorts(out)
 }
+
+// BuildRows flattens raw scan results into display rows, fills any missing MACs
+// from macMap, and resolves vendor names when requested. The TUI and the
+// non-interactive printers share this so the data is identical across views.
+func BuildRows(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, macMap map[string]string) []Row {
+	rows := flatten(res)
+	if showMac && macMap != nil {
+		for i := range rows {
+			if rows[i].MAC == "" {
+				if mac, ok := macMap[rows[i].IP]; ok {
+					rows[i].MAC = mac
+				}
+			}
+		}
+	}
+	if showMac && showVendors {
+		for i := range rows {
+			rows[i].Vendor = vendor.Lookup(db, rows[i].MAC, "")
+		}
+	}
+	return rows
+}
+
+// PortNumber exposes the "22/tcp ssh" -> "22" reduction for table-style views.
+func PortNumber(label string) string { return extractPortNumber(label) }
 
 func mergePorts(rows []Row) []Row {
 	key := func(r Row) string { return r.IP + "|" + r.MAC + "|" + r.Host }
@@ -115,6 +147,9 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 
 	t := table.NewWriter()
 	t.SetOutputMirror(os.Stdout)
+	t.SetStyle(table.StyleRounded)
+	t.Style().Format.Header = text.FormatDefault
+	t.Style().Color.Header = cTitle
 	if showMac {
 		t.AppendHeader(table.Row{"IP", "MAC", "Vendor", "Host", "Up", "Open Ports"})
 	} else {
@@ -122,9 +157,9 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 	}
 
 	for _, r := range rows {
-		up := "no"
+		up := cErr.Sprint("✖ no")
 		if r.Up {
-			up = "yes"
+			up = cOK.Sprint("✔ yes")
 		}
 		vend := ""
 		if showMac && showVendors {
@@ -138,15 +173,46 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 				justNums = append(justNums, n)
 			}
 		}
-		ports := strings.Join(justNums, ", ")
+		ports := cAccent.Sprint(strings.Join(justNums, ", "))
 
+		host := r.Host
+		if host == "" {
+			host = cDim.Sprint("-")
+		}
+		ip := cBold.Sprint(r.IP)
 		if showMac {
-			t.AppendRow(table.Row{r.IP, r.MAC, vend, r.Host, up, ports})
+			mac := r.MAC
+			if mac == "" {
+				mac = cDim.Sprint("-")
+			}
+			t.AppendRow(table.Row{ip, mac, vend, host, up, ports})
 		} else {
-			t.AppendRow(table.Row{r.IP, r.Host, up, ports})
+			t.AppendRow(table.Row{ip, host, up, ports})
 		}
 	}
 	t.Render()
+}
+
+// Summarize returns the number of hosts that are up and the total count of
+// open ports across all results, for the post-scan summary line.
+func Summarize(res []scan.HostResult) (hostsUp, openPorts int) {
+	for _, r := range flatten(res) {
+		if r.Up {
+			hostsUp++
+		}
+		openPorts += len(r.Ports)
+	}
+	return
+}
+
+// PrintSummary prints the closing stats line to stderr.
+func PrintSummary(hostsUp, openPorts int, elapsed time.Duration) {
+	fmt.Fprintf(os.Stderr, "\n%s %s up · %s open · %s\n",
+		cOK.Sprint("●"),
+		cBold.Sprintf("%d host(s)", hostsUp),
+		cBold.Sprintf("%d port(s)", openPorts),
+		cDim.Sprintf("done in %s", elapsed.Round(time.Millisecond*10)),
+	)
 }
 
 func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showMac, showVendors bool, macMap map[string]string) error {
@@ -210,44 +276,45 @@ func PrintTreeWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVendo
 	// stable order
 	sort.Strings(order)
 
+	branch := cDim.Sprint("├─")
+	leaf := cDim.Sprint("└─")
 	for _, ip := range order {
 		n := byIP[ip]
-		fmt.Println(n.IP)
+		fmt.Println(cTitle.Sprint(n.IP))
 		host := n.Host
 		if host == "" {
 			host = "-"
 		}
-		fmt.Printf("├─ Host: %s\n", host)
-		up := "no"
+		fmt.Printf("%s Host: %s\n", branch, host)
+		up := cErr.Sprint("no")
 		if n.Up {
-			up = "yes"
+			up = cOK.Sprint("yes")
 		}
-		fmt.Printf("├─ Up: %s\n", up)
+		fmt.Printf("%s Up: %s\n", branch, up)
 		if showMac {
 			mac := n.MAC
 			if mac == "" {
 				mac = "-"
 			}
-			fmt.Printf("├─ MAC: %s\n", mac)
+			fmt.Printf("%s MAC: %s\n", branch, mac)
 		}
 		if showMac && showVendors {
 			vend := n.Vendor
 			if vend == "" {
 				vend = "-"
 			}
-			fmt.Printf("├─ Vendor: %s\n", vend)
+			fmt.Printf("%s Vendor: %s\n", branch, vend)
 		}
 		if len(n.Ports) == 0 {
-			fmt.Println("└─ Ports: -")
+			fmt.Printf("%s Ports: -\n", leaf)
 		} else {
-			fmt.Println("└─ Ports:")
+			fmt.Printf("%s Ports:\n", leaf)
 			for i, p := range n.Ports {
-				isLast := i == len(n.Ports)-1
-				prefix := "   ├─ "
-				if isLast {
-					prefix = "   └─ "
+				prefix := "   " + branch + " "
+				if i == len(n.Ports)-1 {
+					prefix = "   " + leaf + " "
 				}
-				fmt.Println(prefix + p)
+				fmt.Println(prefix + cAccent.Sprint(p))
 			}
 		}
 		fmt.Println()

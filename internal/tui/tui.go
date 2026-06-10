@@ -1,0 +1,850 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/ui"
+)
+
+type screen int
+
+const (
+	screenForm screen = iota
+	screenRunning
+	screenResults
+)
+
+type resultView int
+
+const (
+	viewTable resultView = iota
+	viewTree
+)
+
+// mode is a modal overlay layered on top of the current screen.
+type mode int
+
+const (
+	modeNone mode = iota
+	modeHelp
+	modeDetail
+	modeFilter
+	modeProfileName
+	modeProfilePicker
+)
+
+type sortKey int
+
+const (
+	sortIP sortKey = iota
+	sortHost
+	sortPorts
+	sortUp
+	sortKeyCount
+)
+
+func (s sortKey) String() string {
+	return [...]string{"ip", "host", "ports", "up"}[s]
+}
+
+var presets = []string{"quick", "default", "udp", "deep"}
+
+// form field indices
+const (
+	fTargets = iota
+	fPreset
+	fPorts
+	fShowMac
+	fShowVendors
+	fRootScan
+	fConcurrency
+	fHostTimeout
+	fStart
+	fieldCount
+)
+
+// rowView pairs a result row with its change badge for display.
+type rowView struct {
+	row   ui.Row
+	diff  config.HostDiff
+	gone  bool
+	badge string
+}
+
+type watchTickMsg struct{ gen int }
+
+// Model is the root Bubble Tea model for the ndscan TUI.
+type Model struct {
+	version string
+	width   int
+	height  int
+
+	screen screen
+	mode   mode
+	focus  int // active form field
+	err    error
+	notice string // transient feedback (exports, profile saves)
+
+	// form inputs
+	targetsIn textinput.Model
+	portsIn   textinput.Model
+	concurIn  textinput.Model
+	timeoutIn textinput.Model
+	presetIdx int
+	showMac   bool
+	showVend  bool
+	rootScan  bool
+
+	// profiles
+	profiles      []config.Profile
+	profileIdx    int
+	profileNameIn textinput.Model
+
+	// running state
+	spin       spinner.Model
+	phase      string
+	phaseDone  int
+	phaseTotal int
+	events     <-chan tea.Msg
+	cancel     context.CancelFunc
+	params     scanParams
+
+	// results
+	rows     []ui.Row // authoritative rows (streamed during run, final on done)
+	diff     map[string]config.HostDiff
+	visible  []rowView // rows after filter/sort, aligned with table cursor
+	view     resultView
+	tbl      table.Model
+	summary  string
+	failed   int
+	filterIn textinput.Model
+	sortBy   sortKey
+
+	// watch mode
+	watch      bool
+	watchEvery time.Duration
+	watchLeft  int
+	watchGen   int
+}
+
+// New constructs the initial model, restoring saved settings when present.
+func New(version string) Model {
+	mkInput := func(placeholder, val string, width int) textinput.Model {
+		ti := textinput.New()
+		ti.Placeholder = placeholder
+		ti.SetValue(val)
+		ti.CharLimit = 256
+		ti.Width = width
+		ti.Prompt = ""
+		return ti
+	}
+
+	t := mkInput("192.168.1.0/24  (or  user@host 192.168.1.0/24)", "", 48)
+	t.Focus()
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(accent)
+
+	fl := mkInput("filter…", "", 32)
+
+	m := Model{
+		version:       version,
+		screen:        screenForm,
+		focus:         fTargets,
+		targetsIn:     t,
+		portsIn:       mkInput("e.g. 22,80,443 or 1-1024 (optional)", "", 48),
+		concurIn:      mkInput("32", "32", 8),
+		timeoutIn:     mkInput("20", "20", 8),
+		profileNameIn: mkInput("profile name", "", 32),
+		presetIdx:     0,
+		spin:          sp,
+		view:          viewTable,
+		filterIn:      fl,
+		watchEvery:    60 * time.Second,
+	}
+
+	cf := config.Load()
+	m.profiles = cf.Profiles
+	if cf.Last != nil {
+		m.applySettings(*cf.Last)
+	} else if cidr := localCIDR(); cidr != "" {
+		m.targetsIn.SetValue(cidr)
+	}
+	return m
+}
+
+// currentSettings snapshots the form into a persistable Settings.
+func (m Model) currentSettings() config.Settings {
+	return config.Settings{
+		Targets:     m.targetsIn.Value(),
+		Preset:      presets[m.presetIdx],
+		Ports:       m.portsIn.Value(),
+		ShowMac:     m.showMac,
+		ShowVendors: m.showVend,
+		RootScan:    m.rootScan,
+		Concurrency: m.concurIn.Value(),
+		HostTimeout: m.timeoutIn.Value(),
+	}
+}
+
+// applySettings restores the form from a saved Settings.
+func (m *Model) applySettings(s config.Settings) {
+	m.targetsIn.SetValue(s.Targets)
+	m.portsIn.SetValue(s.Ports)
+	if s.Concurrency != "" {
+		m.concurIn.SetValue(s.Concurrency)
+	}
+	if s.HostTimeout != "" {
+		m.timeoutIn.SetValue(s.HostTimeout)
+	}
+	m.showMac = s.ShowMac
+	m.showVend = s.ShowVendors
+	m.rootScan = s.RootScan
+	for i, p := range presets {
+		if p == s.Preset {
+			m.presetIdx = i
+		}
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	return textinput.Blink
+}
+
+// Run starts the TUI program.
+func Run(version string) error {
+	p := tea.NewProgram(New(version), tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		if m.screen == screenResults || m.screen == screenRunning {
+			m.rebuildTable()
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC {
+			if m.cancel != nil {
+				m.cancel()
+			}
+			return m, tea.Quit
+		}
+		// modal overlays grab keys first
+		if m.mode != modeNone {
+			return m.updateMode(msg)
+		}
+		switch m.screen {
+		case screenForm:
+			return m.updateForm(msg)
+		case screenRunning:
+			return m.updateRunning(msg)
+		case screenResults:
+			return m.updateResults(msg)
+		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		return m, cmd
+
+	case phaseMsg:
+		m.phase = msg.phase
+		m.phaseDone = msg.done
+		m.phaseTotal = msg.total
+		return m, listen(m.events)
+
+	case hostRowMsg:
+		m.rows = append(m.rows, msg.rows...)
+		m.rebuildTable()
+		return m, listen(m.events)
+
+	case doneMsg:
+		m.screen = screenResults
+		m.cancel = nil
+		m.rows = msg.rows
+		m.diff = msg.diff
+		m.failed = msg.failed
+		hostsUp, openPorts := 0, 0
+		for _, r := range msg.rows {
+			if r.Up {
+				hostsUp++
+			}
+			openPorts += len(r.Ports)
+		}
+		m.summary = fmt.Sprintf("%d host(s) up · %d port(s) open · %s in %s",
+			hostsUp, openPorts, map[bool]string{true: "cancelled", false: "done"}[msg.cancelled],
+			msg.elapsed.Round(10*time.Millisecond))
+		m.rebuildTable()
+		var cmd tea.Cmd
+		if m.watch {
+			m.watchLeft = int(m.watchEvery.Seconds())
+			cmd = m.watchTick()
+		}
+		return m, cmd
+
+	case errMsg:
+		m.err = msg.err
+		m.screen = screenForm
+		m.cancel = nil
+		m.watch = false
+		return m, nil
+
+	case watchTickMsg:
+		if msg.gen != m.watchGen || !m.watch || m.screen != screenResults {
+			return m, nil
+		}
+		m.watchLeft--
+		if m.watchLeft <= 0 {
+			return m.startWithParams(m.params)
+		}
+		return m, m.watchTick()
+	}
+
+	return m, nil
+}
+
+func (m *Model) watchTick() tea.Cmd {
+	gen := m.watchGen
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return watchTickMsg{gen: gen} })
+}
+
+// ----- MODAL OVERLAYS -----
+
+func (m Model) updateMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.mode {
+	case modeHelp:
+		m.mode = modeNone
+		return m, nil
+
+	case modeDetail:
+		switch msg.String() {
+		case "esc", "enter", "q":
+			m.mode = modeNone
+		}
+		return m, nil
+
+	case modeFilter:
+		switch msg.String() {
+		case "enter":
+			m.mode = modeNone
+			return m, nil
+		case "esc":
+			m.filterIn.SetValue("")
+			m.mode = modeNone
+			m.rebuildTable()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.filterIn, cmd = m.filterIn.Update(msg)
+		m.rebuildTable()
+		return m, cmd
+
+	case modeProfileName:
+		switch msg.String() {
+		case "enter":
+			name := strings.TrimSpace(m.profileNameIn.Value())
+			if name == "" {
+				return m, nil
+			}
+			if err := config.UpsertProfile(name, m.currentSettings()); err != nil {
+				m.err = err
+			} else {
+				m.notice = fmt.Sprintf("saved profile %q", name)
+				m.profiles = config.Load().Profiles
+			}
+			m.mode = modeNone
+			return m, nil
+		case "esc":
+			m.mode = modeNone
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.profileNameIn, cmd = m.profileNameIn.Update(msg)
+		return m, cmd
+
+	case modeProfilePicker:
+		switch msg.String() {
+		case "esc", "q":
+			m.mode = modeNone
+		case "up", "k":
+			if m.profileIdx > 0 {
+				m.profileIdx--
+			}
+		case "down", "j":
+			if m.profileIdx < len(m.profiles)-1 {
+				m.profileIdx++
+			}
+		case "d":
+			if len(m.profiles) > 0 {
+				name := m.profiles[m.profileIdx].Name
+				_ = config.DeleteProfile(name)
+				m.profiles = config.Load().Profiles
+				if m.profileIdx >= len(m.profiles) && m.profileIdx > 0 {
+					m.profileIdx--
+				}
+				m.notice = fmt.Sprintf("deleted profile %q", name)
+			}
+		case "enter":
+			if len(m.profiles) > 0 {
+				m.applySettings(m.profiles[m.profileIdx].Settings)
+				m.notice = fmt.Sprintf("loaded profile %q", m.profiles[m.profileIdx].Name)
+			}
+			m.mode = modeNone
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// ----- FORM -----
+
+func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		return m, tea.Quit
+	case "ctrl+s":
+		m.profileNameIn.SetValue("")
+		m.profileNameIn.Focus()
+		m.mode = modeProfileName
+		return m, textinput.Blink
+	case "ctrl+p":
+		m.profiles = config.Load().Profiles
+		m.profileIdx = 0
+		m.mode = modeProfilePicker
+		return m, nil
+	case "tab", "down":
+		m.focus = (m.focus + 1) % fieldCount
+		return m.syncFocus()
+	case "shift+tab", "up":
+		m.focus = (m.focus - 1 + fieldCount) % fieldCount
+		return m.syncFocus()
+	case "left", "right":
+		if m.focus == fPreset {
+			if msg.String() == "right" {
+				m.presetIdx = (m.presetIdx + 1) % len(presets)
+			} else {
+				m.presetIdx = (m.presetIdx - 1 + len(presets)) % len(presets)
+			}
+			return m, nil
+		}
+	case "?":
+		// only when not typing in a text field
+		if !m.focusIsTextField() {
+			m.mode = modeHelp
+			return m, nil
+		}
+	case " ":
+		switch m.focus {
+		case fShowMac:
+			m.showMac = !m.showMac
+			return m, nil
+		case fShowVendors:
+			m.showVend = !m.showVend
+			return m, nil
+		case fRootScan:
+			m.rootScan = !m.rootScan
+			return m, nil
+		}
+	case "enter":
+		switch m.focus {
+		case fPreset:
+			m.presetIdx = (m.presetIdx + 1) % len(presets)
+			return m, nil
+		case fShowMac:
+			m.showMac = !m.showMac
+			return m, nil
+		case fShowVendors:
+			m.showVend = !m.showVend
+			return m, nil
+		case fRootScan:
+			m.rootScan = !m.rootScan
+			return m, nil
+		case fStart:
+			return m.startScan()
+		default:
+			m.focus = (m.focus + 1) % fieldCount
+			return m.syncFocus()
+		}
+	}
+
+	var cmd tea.Cmd
+	switch m.focus {
+	case fTargets:
+		m.targetsIn, cmd = m.targetsIn.Update(msg)
+	case fPorts:
+		m.portsIn, cmd = m.portsIn.Update(msg)
+	case fConcurrency:
+		m.concurIn, cmd = m.concurIn.Update(msg)
+	case fHostTimeout:
+		m.timeoutIn, cmd = m.timeoutIn.Update(msg)
+	}
+	return m, cmd
+}
+
+func (m Model) focusIsTextField() bool {
+	switch m.focus {
+	case fTargets, fPorts, fConcurrency, fHostTimeout:
+		return true
+	}
+	return false
+}
+
+// syncFocus blurs every input then focuses the one matching m.focus.
+func (m Model) syncFocus() (tea.Model, tea.Cmd) {
+	m.targetsIn.Blur()
+	m.portsIn.Blur()
+	m.concurIn.Blur()
+	m.timeoutIn.Blur()
+	var cmd tea.Cmd
+	switch m.focus {
+	case fTargets:
+		cmd = m.targetsIn.Focus()
+	case fPorts:
+		cmd = m.portsIn.Focus()
+	case fConcurrency:
+		cmd = m.concurIn.Focus()
+	case fHostTimeout:
+		cmd = m.timeoutIn.Focus()
+	}
+	return m, cmd
+}
+
+func (m Model) startScan() (tea.Model, tea.Cmd) {
+	ssh, targets := parseTargets(m.targetsIn.Value())
+	if len(targets) == 0 {
+		m.err = fmt.Errorf("enter at least one target (IP or CIDR)")
+		return m, nil
+	}
+	if !nmapAvailable(ssh) {
+		m.err = fmt.Errorf("nmap not found — install it with: brew install nmap")
+		return m, nil
+	}
+	m.err = nil
+	m.notice = ""
+
+	concur, err := strconv.Atoi(strings.TrimSpace(m.concurIn.Value()))
+	if err != nil || concur < 1 {
+		concur = 32
+	}
+	tmo, err := strconv.Atoi(strings.TrimSpace(m.timeoutIn.Value()))
+	if err != nil || tmo < 1 {
+		tmo = 20
+	}
+
+	_ = config.SaveLast(m.currentSettings()) // best-effort persistence
+
+	return m.startWithParams(scanParams{
+		sshTarget:   ssh,
+		targets:     targets,
+		preset:      presets[m.presetIdx],
+		ports:       strings.TrimSpace(m.portsIn.Value()),
+		showMac:     m.showMac,
+		showVendors: m.showVend,
+		rootScan:    m.rootScan,
+		concurrency: concur,
+		hostTimeout: time.Duration(tmo) * time.Second,
+	})
+}
+
+// startWithParams kicks off a scan; used by Start and watch-mode rescans.
+func (m Model) startWithParams(p scanParams) (tea.Model, tea.Cmd) {
+	m.params = p
+	m.rows = nil
+	m.diff = nil
+	m.failed = 0
+	m.events, m.cancel = runScan(p)
+	m.screen = screenRunning
+	m.phase = "discover"
+	m.phaseDone, m.phaseTotal = 0, 0
+	m.rebuildTable()
+	return m, tea.Batch(m.spin.Tick, listen(m.events))
+}
+
+// ----- RUNNING -----
+
+func (m Model) updateRunning(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		// cancel the scan; the goroutine flushes a cancelled doneMsg
+		if m.cancel != nil {
+			m.cancel()
+		}
+		return m, nil
+	case "?":
+		m.mode = modeHelp
+		return m, nil
+	}
+	return m, nil
+}
+
+// ----- RESULTS -----
+
+func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		return m, tea.Quit
+	case "?":
+		m.mode = modeHelp
+		return m, nil
+	case "n", "r":
+		m.watch = false
+		m.screen = screenForm
+		m.err = nil
+		m.notice = ""
+		return m.syncFocus()
+	case "t":
+		if m.view == viewTable {
+			m.view = viewTree
+		} else {
+			m.view = viewTable
+		}
+		return m, nil
+	case "/":
+		m.filterIn.Focus()
+		m.mode = modeFilter
+		return m, textinput.Blink
+	case "s":
+		m.sortBy = (m.sortBy + 1) % sortKeyCount
+		m.rebuildTable()
+		return m, nil
+	case "enter":
+		if m.view == viewTable && len(m.visible) > 0 {
+			m.mode = modeDetail
+		}
+		return m, nil
+	case "e":
+		m.notice = m.export("json")
+		return m, nil
+	case "c":
+		m.notice = m.export("csv")
+		return m, nil
+	case "w":
+		m.watch = !m.watch
+		m.watchGen++
+		if m.watch {
+			m.watchLeft = int(m.watchEvery.Seconds())
+			return m, m.watchTick()
+		}
+		return m, nil
+	case "+", "=":
+		m.watchEvery += 15 * time.Second
+		m.watchLeft = int(m.watchEvery.Seconds())
+		return m, nil
+	case "-":
+		if m.watchEvery > 15*time.Second {
+			m.watchEvery -= 15 * time.Second
+		}
+		m.watchLeft = int(m.watchEvery.Seconds())
+		return m, nil
+	}
+	if m.view == viewTable {
+		var cmd tea.Cmd
+		m.tbl, cmd = m.tbl.Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+// selectedRow returns the rowView under the table cursor, if any.
+func (m Model) selectedRow() *rowView {
+	i := m.tbl.Cursor()
+	if i < 0 || i >= len(m.visible) {
+		return nil
+	}
+	return &m.visible[i]
+}
+
+// ----- VISIBLE ROWS (filter + sort + diff badges) -----
+
+func (m *Model) buildVisible() {
+	filter := strings.ToLower(strings.TrimSpace(m.filterIn.Value()))
+	match := func(r ui.Row) bool {
+		if filter == "" {
+			return true
+		}
+		hay := strings.ToLower(strings.Join(append([]string{r.IP, r.Host, r.MAC, r.Vendor, r.OS}, r.Ports...), " "))
+		return strings.Contains(hay, filter)
+	}
+
+	vis := make([]rowView, 0, len(m.rows)+4)
+	for _, r := range m.rows {
+		if !match(r) {
+			continue
+		}
+		rv := rowView{row: r}
+		if d, ok := m.diff[r.IP]; ok {
+			rv.diff = d
+			rv.badge = diffBadge(d)
+		}
+		vis = append(vis, rv)
+	}
+	// hosts that disappeared since the previous scan
+	for ip, d := range m.diff {
+		if d.Gone && (filter == "" || strings.Contains(ip, filter)) {
+			vis = append(vis, rowView{row: ui.Row{IP: ip}, diff: d, gone: true, badge: "GONE"})
+		}
+	}
+
+	less := func(a, b rowView) bool { return ipLess(a.row.IP, b.row.IP) }
+	switch m.sortBy {
+	case sortHost:
+		less = func(a, b rowView) bool {
+			if a.row.Host != b.row.Host {
+				return a.row.Host < b.row.Host
+			}
+			return ipLess(a.row.IP, b.row.IP)
+		}
+	case sortPorts:
+		less = func(a, b rowView) bool {
+			if len(a.row.Ports) != len(b.row.Ports) {
+				return len(a.row.Ports) > len(b.row.Ports) // most ports first
+			}
+			return ipLess(a.row.IP, b.row.IP)
+		}
+	case sortUp:
+		less = func(a, b rowView) bool {
+			if a.row.Up != b.row.Up {
+				return a.row.Up
+			}
+			return ipLess(a.row.IP, b.row.IP)
+		}
+	}
+	sort.SliceStable(vis, func(i, j int) bool { return less(vis[i], vis[j]) })
+	m.visible = vis
+}
+
+func diffBadge(d config.HostDiff) string {
+	if d.New {
+		return "NEW"
+	}
+	if d.Gone {
+		return "GONE"
+	}
+	var parts []string
+	for _, p := range d.PortsOpened {
+		parts = append(parts, "+"+p)
+	}
+	for _, p := range d.PortsClosed {
+		parts = append(parts, "-"+p)
+	}
+	return strings.Join(parts, " ")
+}
+
+// ipLess orders IPv4/IPv6 numerically, falling back to string compare.
+func ipLess(a, b string) bool {
+	ia, ib := net.ParseIP(a), net.ParseIP(b)
+	if ia == nil || ib == nil {
+		return a < b
+	}
+	ia, ib = ia.To16(), ib.To16()
+	for i := range ia {
+		if ia[i] != ib[i] {
+			return ia[i] < ib[i]
+		}
+	}
+	return false
+}
+
+func (m *Model) rebuildTable() {
+	m.buildVisible()
+
+	width := m.width
+	if width == 0 {
+		width = 100
+	}
+	hasDiff := len(m.diff) > 0
+	var cols []table.Column
+	used := 0
+	add := func(title string, w int) {
+		cols = append(cols, table.Column{Title: title, Width: w})
+		used += w + 2
+	}
+	add("IP", 16)
+	if m.params.showMac {
+		add("MAC", 18)
+		add("Vendor", 14)
+	}
+	add("Host", 18)
+	add("Up", 5)
+	if hasDiff {
+		add("Δ", 10)
+	}
+	rest := width - used - 6
+	if rest < 12 {
+		rest = 12
+	}
+	add("Open Ports", rest)
+
+	rows := make([]table.Row, 0, len(m.visible))
+	for _, rv := range m.visible {
+		r := rv.row
+		up := "✗"
+		if r.Up {
+			up = "✓"
+		}
+		if rv.gone {
+			up = "✗"
+		}
+		var nums []string
+		for _, lbl := range r.Ports {
+			nums = append(nums, ui.PortNumber(lbl))
+		}
+		cells := []string{r.IP}
+		if m.params.showMac {
+			cells = append(cells, dash(r.MAC), dash(r.Vendor))
+		}
+		cells = append(cells, dash(r.Host), up)
+		if hasDiff {
+			cells = append(cells, rv.badge)
+		}
+		cells = append(cells, strings.Join(nums, ", "))
+		rows = append(rows, table.Row(cells))
+	}
+
+	h := m.height - 12
+	if h < 5 {
+		h = 5
+	}
+	cursor := m.tbl.Cursor()
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithRows(rows),
+		table.WithFocused(true),
+		table.WithHeight(h),
+	)
+	st := table.DefaultStyles()
+	st.Header = st.Header.BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(accent).BorderBottom(true).Bold(true).Foreground(accentText.GetForeground())
+	st.Selected = st.Selected.Foreground(lipgloss.Color("#0b1120")).Background(accent).Bold(true)
+	t.SetStyles(st)
+	if cursor > 0 && cursor < len(rows) {
+		t.SetCursor(cursor)
+	}
+	m.tbl = t
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}

@@ -10,9 +10,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
+	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
+
+// version is the app version, overridable at build time via
+// -ldflags "-X main.version=v1.2.3".
+var version = "0.1.0"
 
 // normalizeArgs turns "-tb"/"-tr" into "--tb"/"--tr" so Cobra can parse them as bool flags.
 func normalizeArgs() {
@@ -54,8 +59,21 @@ func main() {
 	)
 
 	root := &cobra.Command{
-		Use:   "ndscan",
-		Short: "ndscan — fast, modular network scan CLI (local or over SSH)",
+		Use:     "ndscan",
+		Short:   "ndscan — fast, modular network scan CLI/TUI (local or over SSH)",
+		Version: version,
+		// Bare `ndscan` launches the interactive TUI.
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tui.Run(version)
+		},
+	}
+
+	tuiCmd := &cobra.Command{
+		Use:   "tui",
+		Short: "Launch the interactive terminal UI",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tui.Run(version)
+		},
 	}
 
 	scanCmd := &cobra.Command{
@@ -79,7 +97,7 @@ Otherwise, nmap runs locally.`,
 			}
 			// guard vendor flag when mac is off
 			if showVendors && !showMac {
-				fmt.Fprintln(os.Stderr, "Warning: --show-vendors requires --show-mac. Vendors will be skipped.")
+				ui.Warnf("--show-vendors requires --show-mac. Vendors will be skipped.")
 			}
 			return nil
 		},
@@ -95,8 +113,15 @@ Otherwise, nmap runs locally.`,
 				targets = argv[1:]
 			}
 
+			ui.Banner(version)
+			start := time.Now()
+
 			// Choose runner (local or ssh)
 			runner := scan.NewRunner(sshTarget)
+			where := "locally"
+			if sshTarget != "" {
+				where = "via " + sshTarget
+			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
@@ -112,25 +137,39 @@ Otherwise, nmap runs locally.`,
 			}
 
 			// 1) host discovery first (runs where runner points)
+			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
 			live, err := scan.HostDiscovery(ctx, targets, runner)
 			if err != nil {
+				sp.Fail("Host discovery failed")
 				return err
 			}
 			if len(live) == 0 {
-				fmt.Println("No live hosts found.")
+				sp.Fail("No live hosts found.")
 				return nil
 			}
+			sp.Success(fmt.Sprintf("Found %d live host(s)", len(live)))
 
 			// 1b) optional: collect MACs with a separate ARP/ND discovery pass
 			var macMap map[string]string
 			if showMac {
+				sp = ui.StartSpinner("Collecting MAC addresses…")
 				macMap, _ = scan.DiscoverMACs(ctx, live, runner) // best-effort; empty off-L2 or if perms missing
+				sp.Success(fmt.Sprintf("Collected %d MAC address(es)", len(macMap)))
 			}
 
 			// 2) parallel per-host scans (remote or local depending on runner)
+			sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", len(live), preset, len(live)))
+			cfg.Progress = func(done, total int) {
+				sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", total, preset, done, total))
+			}
 			results, err := scan.ScanHosts(ctx, live, cfg, runner)
 			if err != nil {
+				sp.Fail("Port scan failed")
 				return err
+			}
+			sp.Success("Port scan complete")
+			if failed := countFailed(results); failed > 0 {
+				ui.Warnf("%d host(s) failed to scan (first error: %v)", failed, firstError(results))
 			}
 
 			// 3) vendor DB (only if needed)
@@ -141,14 +180,21 @@ Otherwise, nmap runs locally.`,
 
 			// 4) output
 			if jsonOut != "" {
-				return ui.WriteJSONWithMACMap(results, oui, jsonOut, showMac, showVendors, macMap)
+				if err := ui.WriteJSONWithMACMap(results, oui, jsonOut, showMac, showVendors, macMap); err != nil {
+					return err
+				}
+				ui.Infof("Wrote JSON results to %s", jsonOut)
+				return nil
 			}
+			fmt.Println()
 			switch view {
 			case "tree":
 				ui.PrintTreeWithMACMap(results, oui, showMac, showVendors, macMap)
 			default:
 				ui.PrintTableWithMACMap(results, oui, showMac, showVendors, macMap)
 			}
+			hostsUp, openPorts := ui.Summarize(results)
+			ui.PrintSummary(hostsUp, openPorts, time.Since(start))
 			return nil
 		},
 	}
@@ -169,10 +215,31 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().BoolVar(&flagTR, "tr", false, "alias: same as --view tree (use as -tr)")
 
 	root.AddCommand(scanCmd)
+	root.AddCommand(tuiCmd)
 
 	if err := root.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func countFailed(results []scan.HostResult) int {
+	n := 0
+	for _, r := range results {
+		if r.Err != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func firstError(results []scan.HostResult) error {
+	for _, r := range results {
+		if r.Err != nil {
+			return r.Err
+		}
+	}
+	return nil
 }
 
 // treat "user@host" as SSH target if it contains '@' and no '/' (CIDR)

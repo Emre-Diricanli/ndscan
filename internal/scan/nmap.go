@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +19,13 @@ type Config struct {
 	HostTimeout    time.Duration
 	DisableVendors bool
 	NeedMAC        bool
+	// Progress, if set, is called after each host finishes scanning.
+	// It may be invoked from multiple goroutines.
+	Progress func(done, total int)
+	// OnResult, if set, is called with each host's result as soon as it
+	// completes, enabling streaming consumers. May be invoked from
+	// multiple goroutines.
+	OnResult func(HostResult)
 }
 
 type HostResult struct {
@@ -97,6 +105,7 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 	sem := make(chan struct{}, max(1, cfg.Concurrency))
 	var wg sync.WaitGroup
 	res := make([]HostResult, len(live))
+	var done int32
 
 	for i, ip := range live {
 		wg.Add(1)
@@ -106,6 +115,12 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 			defer func() { <-sem }()
 			xml, err := scanOne(ctx, host, cfg, runner)
 			res[i] = HostResult{IP: host, XMLBytes: xml, Err: err}
+			if cfg.OnResult != nil {
+				cfg.OnResult(res[i])
+			}
+			if cfg.Progress != nil {
+				cfg.Progress(int(atomic.AddInt32(&done, 1)), len(live))
+			}
 		}(i, ip)
 	}
 	wg.Wait()
@@ -127,18 +142,23 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 	} else {
 		args = append(args, "-sT")
 	}
-	// preset
+	// preset (explicit --ports overrides the preset's port selection,
+	// since nmap rejects -F/-p combined with a second -p)
 	switch cfg.Preset {
-	case "quick":
-		args = append(args, "-T4", "-F")
 	case "default":
 		args = append(args, "-T4", "-A")
 	case "udp":
 		args = append(args, "-sU", "-T4")
 	case "deep":
-		args = append(args, "-T4", "-p", "1-65535", "-A")
-	default:
-		args = append(args, "-T4", "-F")
+		args = append(args, "-T4", "-A")
+		if cfg.Ports == "" {
+			args = append(args, "-p", "1-65535")
+		}
+	default: // "quick" and anything else
+		args = append(args, "-T4")
+		if cfg.Ports == "" {
+			args = append(args, "-F")
+		}
 	}
 	// explicit ports override
 	if cfg.Ports != "" {

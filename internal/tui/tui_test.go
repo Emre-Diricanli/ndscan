@@ -1,0 +1,385 @@
+package tui
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/ui"
+)
+
+func keyRunes(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+
+func typeString(m tea.Model, s string) tea.Model {
+	for _, r := range s {
+		m, _ = m.Update(keyRunes(string(r)))
+	}
+	return m
+}
+
+// resultsModel fabricates a model sitting on the results screen.
+func resultsModel(t *testing.T) Model {
+	t.Helper()
+	m := New("test")
+	m.width, m.height = 120, 40
+	m.screen = screenResults
+	m.rows = []ui.Row{
+		{IP: "10.0.0.2", Host: "beta", Up: true, Ports: []string{"22/tcp ssh", "80/tcp http nginx"}},
+		{IP: "10.0.0.10", Host: "alpha", Up: true, Ports: []string{"443/tcp https"}},
+		{IP: "10.0.0.1", Host: "router", Up: true, Ports: []string{}},
+	}
+	m.diff = map[string]config.HostDiff{
+		"10.0.0.10": {New: true},
+		"10.0.0.99": {Gone: true},
+	}
+	m.summary = "3 host(s) up"
+	m.rebuildTable()
+	return m
+}
+
+func TestFilterNarrowsRows(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	var tm tea.Model = m
+	tm, _ = tm.Update(keyRunes("/"))
+	if tm.(Model).mode != modeFilter {
+		t.Fatal("/ should enter filter mode")
+	}
+	tm = typeString(tm, "nginx")
+	got := tm.(Model).visible
+	if len(got) != 1 || got[0].row.IP != "10.0.0.2" {
+		t.Fatalf("filter 'nginx' should leave only 10.0.0.2, got %d rows", len(got))
+	}
+	// esc clears the filter
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if n := len(tm.(Model).visible); n != 4 { // 3 rows + 1 GONE
+		t.Fatalf("esc should clear filter, got %d visible", n)
+	}
+}
+
+func TestSortCyclesAndIPOrder(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	// default: numeric IP order (.1, .2, .10, then gone .99)
+	ips := func() []string {
+		var out []string
+		for _, rv := range m.visible {
+			out = append(out, rv.row.IP)
+		}
+		return out
+	}
+	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.10", "10.0.0.99"}
+	if got := ips(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ip sort wrong: %v", got)
+	}
+	var tm tea.Model = m
+	tm, _ = tm.Update(keyRunes("s")) // -> host
+	m = tm.(Model)
+	if m.sortBy != sortHost {
+		t.Fatal("s should cycle to host sort")
+	}
+	if m.visible[0].row.Host != "" && m.visible[0].row.Host != "alpha" {
+		// gone row has empty host and sorts first; alpha is first named
+		t.Fatalf("host sort wrong: first=%q", m.visible[0].row.Host)
+	}
+	tm, _ = tm.Update(keyRunes("s")) // -> ports (most first)
+	m = tm.(Model)
+	if m.visible[0].row.IP != "10.0.0.2" {
+		t.Fatalf("ports sort should put 10.0.0.2 (2 ports) first, got %s", m.visible[0].row.IP)
+	}
+}
+
+func TestDetailAndHelpOverlays(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if tm.(Model).mode != modeDetail {
+		t.Fatal("enter should open detail")
+	}
+	if v := tm.View(); !strings.Contains(v, "Open ports") {
+		t.Fatal("detail view missing ports section")
+	}
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if tm.(Model).mode != modeNone {
+		t.Fatal("esc should close detail")
+	}
+	tm, _ = tm.Update(keyRunes("?"))
+	if tm.(Model).mode != modeHelp {
+		t.Fatal("? should open help")
+	}
+	if v := tm.View(); !strings.Contains(v, "Keybindings") {
+		t.Fatal("help view missing")
+	}
+}
+
+func TestDiffBadgesShown(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	var newBadge, goneBadge bool
+	for _, rv := range m.visible {
+		if rv.row.IP == "10.0.0.10" && rv.badge == "NEW" {
+			newBadge = true
+		}
+		if rv.row.IP == "10.0.0.99" && rv.gone && rv.badge == "GONE" {
+			goneBadge = true
+		}
+	}
+	if !newBadge || !goneBadge {
+		t.Fatalf("badges missing: new=%v gone=%v", newBadge, goneBadge)
+	}
+	if v := m.View(); !strings.Contains(v, "new host") {
+		t.Fatal("diff summary line missing")
+	}
+}
+
+func TestWatchToggleAndTick(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	var tm tea.Model = m
+	tm, cmd := tm.Update(keyRunes("w"))
+	mm := tm.(Model)
+	if !mm.watch || cmd == nil {
+		t.Fatal("w should enable watch and schedule a tick")
+	}
+	left := mm.watchLeft
+	tm, _ = tm.Update(watchTickMsg{gen: mm.watchGen})
+	if got := tm.(Model).watchLeft; got != left-1 {
+		t.Fatalf("tick should decrement countdown: %d -> %d", left, got)
+	}
+	// stale generation is ignored
+	tm, _ = tm.Update(watchTickMsg{gen: mm.watchGen - 1})
+	if got := tm.(Model).watchLeft; got != left-1 {
+		t.Fatal("stale tick should be ignored")
+	}
+	tm, _ = tm.Update(keyRunes("w")) // off
+	if tm.(Model).watch {
+		t.Fatal("w should disable watch")
+	}
+}
+
+func TestExportJSONAndCSV(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+
+	m := resultsModel(t)
+	notice := m.export("json")
+	if !strings.Contains(notice, "wrote 3 row(s)") {
+		t.Fatalf("json export notice: %s", notice)
+	}
+	notice = m.export("csv")
+	if !strings.Contains(notice, "wrote 3 row(s)") {
+		t.Fatalf("csv export notice: %s", notice)
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "ndscan-*"))
+	if len(files) != 2 {
+		t.Fatalf("expected 2 export files, got %v", files)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, ".json") {
+			b, _ := os.ReadFile(f)
+			var rows []ui.Row
+			if err := json.Unmarshal(b, &rows); err != nil || len(rows) != 3 {
+				t.Fatalf("bad json export: err=%v rows=%d", err, len(rows))
+			}
+		}
+	}
+}
+
+func TestProfileSaveAndLoadFlow(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := New("test")
+	m.targetsIn.SetValue("10.1.2.0/24")
+	m.presetIdx = 3 // deep
+	var tm tea.Model = m
+
+	// ctrl+s -> name overlay -> type name -> enter
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	if tm.(Model).mode != modeProfileName {
+		t.Fatal("ctrl+s should open profile name input")
+	}
+	tm = typeString(tm, "lab")
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := tm.(Model)
+	if mm.mode != modeNone || len(mm.profiles) != 1 {
+		t.Fatalf("profile not saved: mode=%v profiles=%d", mm.mode, len(mm.profiles))
+	}
+
+	// mutate the form, then load the profile back via picker
+	mm.targetsIn.SetValue("changed")
+	mm.presetIdx = 0
+	tm = mm
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	if tm.(Model).mode != modeProfilePicker {
+		t.Fatal("ctrl+p should open picker")
+	}
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = tm.(Model)
+	if mm.targetsIn.Value() != "10.1.2.0/24" || presets[mm.presetIdx] != "deep" {
+		t.Fatalf("profile load failed: targets=%q preset=%q", mm.targetsIn.Value(), presets[mm.presetIdx])
+	}
+}
+
+func TestSettingsPersistAcrossNew(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	if err := config.SaveLast(config.Settings{Targets: "172.16.0.0/16", Preset: "udp", ShowMac: true}); err != nil {
+		t.Fatal(err)
+	}
+	m := New("test")
+	if m.targetsIn.Value() != "172.16.0.0/16" || presets[m.presetIdx] != "udp" || !m.showMac {
+		t.Fatalf("New() did not restore last settings: %q %q %v",
+			m.targetsIn.Value(), presets[m.presetIdx], m.showMac)
+	}
+}
+
+func TestNmapMissingFriendlyError(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	t.Setenv("PATH", t.TempDir()) // hide nmap
+	m := New("test")
+	m.targetsIn.SetValue("127.0.0.1")
+	tm, _ := m.startScan()
+	err := tm.(Model).err
+	if err == nil || !strings.Contains(err.Error(), "brew install nmap") {
+		t.Fatalf("expected friendly nmap error, got %v", err)
+	}
+}
+
+// ----- live integration tests (need nmap + localhost) -----
+
+func TestScanStreamsAndDiffsE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs nmap")
+	}
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+
+	run := func() (streamed int, done doneMsg) {
+		ch, cancel := runScan(scanParams{
+			targets:     []string{"127.0.0.1"},
+			preset:      "quick",
+			ports:       "22,80,443",
+			concurrency: 8,
+			hostTimeout: 20 * time.Second,
+		})
+		defer cancel()
+		deadline := time.After(60 * time.Second)
+		for {
+			select {
+			case msg := <-ch:
+				switch v := msg.(type) {
+				case hostRowMsg:
+					streamed += len(v.rows)
+				case doneMsg:
+					return streamed, v
+				case errMsg:
+					t.Fatalf("scan error: %v", v.err)
+				}
+			case <-deadline:
+				t.Fatal("scan timed out")
+			}
+		}
+	}
+
+	streamed, done1 := run()
+	if streamed == 0 || len(done1.rows) == 0 {
+		t.Fatalf("expected streamed rows, got streamed=%d final=%d", streamed, len(done1.rows))
+	}
+	if done1.diff != nil {
+		t.Fatalf("first scan should have nil diff, got %v", done1.diff)
+	}
+	_, done2 := run()
+	if done2.diff == nil {
+		t.Fatal("second scan of same signature should produce a (possibly empty) diff map")
+	}
+	if len(done2.diff) != 0 {
+		t.Logf("note: localhost changed between runs: %v", done2.diff)
+	}
+}
+
+// Drives the actual Model through a real scan: start via the form, pump every
+// channel message through Update, and assert rows streamed into the table
+// before landing on the results screen.
+func TestModelFullScanLoopE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs nmap")
+	}
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+
+	m := New("test")
+	m.width, m.height = 120, 40
+	m.targetsIn.SetValue("127.0.0.1")
+	m.portsIn.SetValue("22,80,443")
+	tm, _ := m.startScan()
+	mm := tm.(Model)
+	if mm.screen != screenRunning || mm.cancel == nil {
+		t.Fatalf("startScan: screen=%v cancel=%v", mm.screen, mm.cancel)
+	}
+
+	sawStream := false
+	deadline := time.After(60 * time.Second)
+	for mm.screen != screenResults {
+		select {
+		case msg := <-mm.events:
+			if _, ok := msg.(hostRowMsg); ok {
+				sawStream = true
+			}
+			tm, _ = tm.Update(msg)
+			mm = tm.(Model)
+		case <-deadline:
+			t.Fatal("never reached results screen")
+		}
+	}
+	if !sawStream {
+		t.Fatal("no hostRowMsg streamed during scan")
+	}
+	if len(mm.visible) == 0 {
+		t.Fatal("results table empty")
+	}
+	if !strings.Contains(mm.View(), "host(s) up") {
+		t.Fatal("results view missing summary")
+	}
+}
+
+func TestCancelMidScanE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("needs nmap")
+	}
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+
+	// discovering a /16 takes far longer than the cancel delay, so the
+	// cancel reliably lands mid-discovery
+	ch, cancel := runScan(scanParams{
+		targets:     []string{"10.123.0.0/16"},
+		preset:      "quick",
+		concurrency: 4,
+		hostTimeout: 120 * time.Second,
+	})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case msg := <-ch:
+			if d, ok := msg.(doneMsg); ok {
+				if !d.cancelled {
+					t.Fatal("expected cancelled doneMsg")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("cancel did not produce a doneMsg within 30s")
+		}
+	}
+}
