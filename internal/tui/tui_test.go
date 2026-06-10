@@ -279,16 +279,34 @@ func TestExportJSONAndCSV(t *testing.T) {
 	if !strings.Contains(notice, "wrote 3 row(s)") {
 		t.Fatalf("csv export notice: %s", notice)
 	}
+	if notice := m.export("md"); !strings.Contains(notice, "wrote 3 row(s)") {
+		t.Fatalf("md export notice: %s", notice)
+	}
+	if notice := m.export("html"); !strings.Contains(notice, "wrote 3 row(s)") {
+		t.Fatalf("html export notice: %s", notice)
+	}
+
 	files, _ := filepath.Glob(filepath.Join(dir, "ndscan-*"))
-	if len(files) != 2 {
-		t.Fatalf("expected 2 export files, got %v", files)
+	if len(files) != 4 {
+		t.Fatalf("expected 4 export files, got %v", files)
 	}
 	for _, f := range files {
-		if strings.HasSuffix(f, ".json") {
+		switch {
+		case strings.HasSuffix(f, ".json"):
 			b, _ := os.ReadFile(f)
 			var rows []ui.Row
 			if err := json.Unmarshal(b, &rows); err != nil || len(rows) != 3 {
 				t.Fatalf("bad json export: err=%v rows=%d", err, len(rows))
+			}
+		case strings.HasSuffix(f, ".md"):
+			b, _ := os.ReadFile(f)
+			if !strings.Contains(string(b), "# Network scan") {
+				t.Error("md export missing report header")
+			}
+		case strings.HasSuffix(f, ".html"):
+			b, _ := os.ReadFile(f)
+			if !strings.HasPrefix(string(b), "<!doctype html>") {
+				t.Error("html export not a full document")
 			}
 		}
 	}

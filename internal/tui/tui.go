@@ -728,6 +728,12 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		m.notice = m.export("csv")
 		return m, nil
+	case "m":
+		m.notice = m.export("md")
+		return m, nil
+	case "h":
+		m.notice = m.export("html")
+		return m, nil
 	case "w":
 		m.watch = !m.watch
 		m.watchGen++

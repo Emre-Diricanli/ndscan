@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
 
@@ -21,12 +22,25 @@ func (m Model) export(format string) string {
 			rows = append(rows, rv.row)
 		}
 	}
-	name := fmt.Sprintf("ndscan-%s.%s", time.Now().Format("20060102-150405"), format)
+	now := time.Now()
+	name := fmt.Sprintf("ndscan-%s.%s", now.Format("20060102-150405"), format)
 
 	var err error
 	switch format {
 	case "csv":
 		err = writeCSV(name, rows)
+	case "md", "html":
+		rep := report.Report{
+			Targets:   strings.Join(m.params.targets, ", "),
+			Preset:    m.params.preset,
+			Generated: now.Format("2006-01-02 15:04:05"),
+			Rows:      rows,
+		}
+		content := rep.Markdown()
+		if format == "html" {
+			content = rep.HTML()
+		}
+		err = os.WriteFile(name, []byte(content), 0o644)
 	default:
 		err = writeJSON(name, rows)
 	}

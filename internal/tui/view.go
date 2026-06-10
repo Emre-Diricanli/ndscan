@@ -84,6 +84,7 @@ func (m Model) helpPanel() string {
 		"  /               filter rows (esc clears)",
 		"  s               cycle sort: ip · host · ports · up",
 		"  e / c           export JSON / CSV",
+		"  m / h           export Markdown / HTML report",
 		"  w               toggle watch mode (auto-rescan)",
 		"  b               toggle desktop notifications on change",
 		"  + / -           watch interval ±15s",
@@ -420,7 +421,7 @@ func (m Model) viewResults() string {
 		viewTag = "tree"
 	}
 	help := helpStyle.Render(fmt.Sprintf(
-		"enter details · t view [%s] · / filter · s sort · e/c export · w watch · b bell · r rescan · ? help · q quit", viewTag))
+		"enter details · t view [%s] · / filter · s sort · e/c/m/h export · w watch · b bell · r rescan · ? help · q quit", viewTag))
 
 	return "\n" + m.header() + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
 }

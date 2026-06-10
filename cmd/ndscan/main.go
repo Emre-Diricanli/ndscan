@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -48,6 +49,7 @@ func main() {
 		preset         string
 		ports          string
 		jsonOut        string
+		reportOut      string
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
@@ -208,6 +210,25 @@ Otherwise, nmap runs locally.`,
 			}
 
 			// 4) output
+			// Markdown/HTML report (inferred from the file extension).
+			if reportOut != "" {
+				rows := ui.BuildRows(results, oui, showMac, showVendors, macMap)
+				rep := report.Report{
+					Targets:   strings.Join(targets, ", "),
+					Preset:    preset,
+					Generated: start.Format("2006-01-02 15:04:05"),
+					Rows:      rows,
+				}
+				content := rep.Markdown()
+				if strings.HasSuffix(strings.ToLower(reportOut), ".html") {
+					content = rep.HTML()
+				}
+				if err := os.WriteFile(reportOut, []byte(content), 0o644); err != nil {
+					return err
+				}
+				ui.Infof("Wrote report to %s", reportOut)
+				return nil
+			}
 			if jsonOut != "" {
 				if err := ui.WriteJSONWithMACMap(results, oui, jsonOut, showMac, showVendors, macMap); err != nil {
 					return err
@@ -232,6 +253,7 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().StringVarP(&preset, "preset", "P", "quick", "quick|default|udp|deep")
 	scanCmd.Flags().StringVarP(&ports, "ports", "p", "", "ports (e.g., 1-1024 or 22,80,443)")
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
+	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")
 	scanCmd.Flags().BoolVar(&showVendors, "show-vendors", false, "include vendor names (requires --show-mac)")
 	scanCmd.Flags().BoolVar(&rootScan, "root-scan", false, "use SYN scan (-sS), requires root on the machine running nmap")
