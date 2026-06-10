@@ -880,33 +880,20 @@ func ipLess(a, b string) bool {
 func (m *Model) rebuildTable() {
 	m.buildVisible()
 
-	width := m.width
-	if width == 0 {
-		width = 100
-	}
 	hasDiff := len(m.diff) > 0
 	var cols []table.Column
-	used := 0
 	add := func(title string, w int) {
 		cols = append(cols, table.Column{Title: title, Width: w})
-		used += w + 2
 	}
 	add("IP", 16)
 	if m.params.showMac {
 		add("MAC", 18)
 		add("Vendor", 14)
 	}
-	add("Host", 18)
 	add("Up", 5)
 	if hasDiff {
 		add("Δ", 10)
 	}
-	add("Risk", 5)
-	rest := width - used - 6
-	if rest < 12 {
-		rest = 12
-	}
-	add("Open Ports", rest)
 
 	rows := make([]table.Row, 0, len(m.visible))
 	for _, rv := range m.visible {
@@ -918,20 +905,14 @@ func (m *Model) rebuildTable() {
 		if rv.gone {
 			up = "✗"
 		}
-		var nums []string
-		for _, lbl := range r.Ports {
-			nums = append(nums, ui.PortNumber(lbl))
-		}
 		cells := []string{r.IP}
 		if m.params.showMac {
 			cells = append(cells, dash(r.MAC), dash(r.Vendor))
 		}
-		cells = append(cells, dash(r.Host), up)
+		cells = append(cells, up)
 		if hasDiff {
 			cells = append(cells, rv.badge)
 		}
-		cells = append(cells, riskGlyph(r.PortDetails))
-		cells = append(cells, strings.Join(nums, ", "))
 		rows = append(rows, table.Row(cells))
 	}
 
@@ -1005,27 +986,6 @@ func rankSeverity(s string) int {
 		return 1
 	default:
 		return 0
-	}
-}
-
-// riskGlyph returns a compact one-glyph indicator of the highest-severity
-// open port on a host, for the results table's Risk column.
-func riskGlyph(ports []ui.PortInfo) string {
-	highest := 0
-	for _, p := range ports {
-		if r := rankSeverity(p.Severity); r > highest {
-			highest = r
-		}
-	}
-	switch highest {
-	case 3:
-		return "!!"
-	case 2:
-		return "▲"
-	case 1:
-		return "·"
-	default:
-		return ""
 	}
 }
 
