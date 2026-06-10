@@ -46,6 +46,8 @@ func (m Model) overlay(base string) string {
 				hintStyle.Render("enter save · esc cancel"))
 	case modeProfilePicker:
 		panel = m.profilePanel()
+	case modeDiscover:
+		panel = m.discoverPanel()
 	default:
 		return base
 	}
@@ -79,7 +81,8 @@ func (m Model) helpPanel() string {
 		"  ↑↓              move selection (table) / scroll (tree)",
 		"  mouse wheel      scroll the list",
 		"  pgup/pgdn g G   page / jump (tree)",
-		"  enter           host details",
+		"  enter           Discover: deep-scan the selected host",
+		"    in Discover:   r rescan · o open web services · esc back",
 		"  t               table ⇄ tree view",
 		"  /               filter rows (esc clears)",
 		"  s               cycle sort: ip · host · ports · up",
@@ -422,7 +425,7 @@ func (m Model) viewResults() string {
 		viewTag = "tree"
 	}
 	help := helpStyle.Render(fmt.Sprintf(
-		"enter details · t view [%s] · / filter · s sort · e/c/m/h export · w watch · b bell · r rescan · ? help · q quit", viewTag))
+		"enter discover · t view [%s] · / filter · s sort · e/c/m/h export · w watch · b bell · r rescan · ? help · q quit", viewTag))
 
 	return "\n" + m.header() + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
 }

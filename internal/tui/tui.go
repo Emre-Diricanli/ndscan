@@ -49,6 +49,7 @@ const (
 	modeFilter
 	modeProfileName
 	modeProfilePicker
+	modeDiscover
 )
 
 type sortKey int
@@ -144,6 +145,9 @@ type Model struct {
 	failed   int
 	filterIn textinput.Model
 	sortBy   sortKey
+
+	// discover: a focused deep scan of a single host, shown in an overlay
+	disco discoverState
 
 	// watch mode
 	watch       bool
@@ -371,6 +375,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case notifyDoneMsg:
 		return m, nil
+
+	case discoverDoneMsg:
+		// Ignore a stale result if the user moved on to another host.
+		if m.mode != modeDiscover || msg.ip != m.disco.ip {
+			return m, nil
+		}
+		m.disco.scanning = false
+		m.disco.row = msg.row
+		m.disco.err = msg.err
+		m.disco.elapsed = msg.elapsed
+		m.disco.cancel = nil
+		return m, nil
 	}
 
 	return m, nil
@@ -463,6 +479,29 @@ func (m Model) updateMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.notice = fmt.Sprintf("loaded profile %q", m.profiles[m.profileIdx].Name)
 			}
 			m.mode = modeNone
+		}
+		return m, nil
+
+	case modeDiscover:
+		switch msg.String() {
+		case "esc", "q":
+			if m.disco.cancel != nil {
+				m.disco.cancel()
+				m.disco.cancel = nil
+			}
+			m.mode = modeNone
+			return m, nil
+		case "r":
+			// rescan this host (ignored while a scan is in flight)
+			if !m.disco.scanning {
+				return m, m.startDiscover(m.disco.ip)
+			}
+			return m, nil
+		case "o":
+			if !m.disco.scanning {
+				m.disco.notice = m.openWeb()
+			}
+			return m, nil
 		}
 		return m, nil
 	}
@@ -718,8 +757,16 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.rebuildTable()
 		return m, nil
 	case "enter":
-		if m.view == viewTable && len(m.visible) > 0 {
-			m.mode = modeDetail
+		// Enter on a host runs a focused deep scan (Discover). Falls back to
+		// the static detail pane for synthetic GONE rows.
+		if m.view == viewTable {
+			if rv := m.selectedRow(); rv != nil {
+				if rv.gone {
+					m.mode = modeDetail
+					return m, nil
+				}
+				return m, m.startDiscover(rv.row.IP)
+			}
 		}
 		return m, nil
 	case "e":
@@ -971,11 +1018,11 @@ func speedTier(rtt string) string {
 	}
 	switch {
 	case ms < 10:
-		return "⚡ fast"
+		return ">>> fast"
 	case ms < 80:
-		return "~ medium"
+		return ">>  medium"
 	default:
-		return "🐌 slow"
+		return ">   slow"
 	}
 }
 

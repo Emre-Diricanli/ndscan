@@ -99,14 +99,14 @@ func TestFilterNarrowsRows(t *testing.T) {
 func TestSpeedTier(t *testing.T) {
 	cases := map[string]string{
 		"":        "",
-		"2.1ms":   "⚡ fast",
-		"9.9ms":   "⚡ fast",
-		"10ms":    "~ medium",
-		"48ms":    "~ medium",
-		"80ms":    "🐌 slow",
-		"210ms":   "🐌 slow",
-		"1.50s":   "🐌 slow",
-		"0.4ms":   "⚡ fast",
+		"2.1ms":   ">>> fast",
+		"9.9ms":   ">>> fast",
+		"10ms":    ">>  medium",
+		"48ms":    ">>  medium",
+		"80ms":    ">   slow",
+		"210ms":   ">   slow",
+		"1.50s":   ">   slow",
+		"0.4ms":   ">>> fast",
 		"garbage": "",
 	}
 	for in, want := range cases {
@@ -192,10 +192,9 @@ func TestDetailPaneShowsFingerprint(t *testing.T) {
 		}},
 	}}
 	m.rebuildTable()
+	m.mode = modeDetail // the static detail pane (used for GONE rows)
 
-	var tm tea.Model = m
-	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	v := tm.View()
+	v := m.View()
 	for _, want := range []string{"92%", "cpe:/o:linux", "tls", "Admin Console", "Acme — exp 2027-01-02", "Ubuntu"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("detail view missing %q", want)
@@ -203,21 +202,49 @@ func TestDetailPaneShowsFingerprint(t *testing.T) {
 	}
 }
 
-func TestDetailAndHelpOverlays(t *testing.T) {
+func TestEnterStartsDiscover(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	m := resultsModel(t)
 	var tm tea.Model = m
-	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	if tm.(Model).mode != modeDetail {
-		t.Fatal("enter should open detail")
+	// Enter on a live host opens the Discover overlay in its scanning state.
+	tm, cmd := tm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := tm.(Model)
+	if mm.mode != modeDiscover {
+		t.Fatalf("enter should open Discover, got mode %d", mm.mode)
 	}
-	if v := tm.View(); !strings.Contains(v, "Open ports") {
-		t.Fatal("detail view missing ports section")
+	if !mm.disco.scanning || mm.disco.ip == "" {
+		t.Fatalf("discover should be scanning a host, got %+v", mm.disco)
 	}
+	if cmd == nil {
+		t.Fatal("enter should return a scan command")
+	}
+	if v := tm.View(); !strings.Contains(v, "Discover") {
+		t.Fatal("discover panel not rendered")
+	}
+
+	// A completed scan populates the panel.
+	row := &ui.Row{IP: mm.disco.ip, Up: true, OS: "Linux", RTT: "2ms",
+		PortDetails: []ui.PortInfo{{Port: 80, Proto: "tcp", Service: "http"}}}
+	tm, _ = tm.Update(discoverDoneMsg{ip: mm.disco.ip, row: row, elapsed: time.Second})
+	mm = tm.(Model)
+	if mm.disco.scanning {
+		t.Fatal("discover should no longer be scanning after done")
+	}
+	if v := mm.View(); !strings.Contains(v, "Open ports") || !strings.Contains(v, "80/tcp") {
+		t.Fatal("discover panel should show scanned ports")
+	}
+
+	// esc closes the overlay.
 	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if tm.(Model).mode != modeNone {
-		t.Fatal("esc should close detail")
+		t.Fatal("esc should close discover")
 	}
+}
+
+func TestHelpOverlay(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	var tm tea.Model = m
 	tm, _ = tm.Update(keyRunes("?"))
 	if tm.(Model).mode != modeHelp {
 		t.Fatal("? should open help")
