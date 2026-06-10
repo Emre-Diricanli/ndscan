@@ -83,6 +83,7 @@ func (m Model) helpPanel() string {
 		"  s               cycle sort: ip · host · ports · up",
 		"  e / c           export JSON / CSV",
 		"  w               toggle watch mode (auto-rescan)",
+		"  b               toggle desktop notifications on change",
 		"  + / -           watch interval ±15s",
 		"  r               new scan (back to form)",
 		"  q               quit",
@@ -370,7 +371,11 @@ func (m Model) viewResults() string {
 	}
 	status = append(status, hintStyle.Render("sort: ")+accentText.Render(m.sortBy.String()))
 	if m.watch {
-		status = append(status, okStyle.Render(fmt.Sprintf("watch: rescan in %ds (every %s)", m.watchLeft, m.watchEvery)))
+		bell := "🔔"
+		if !m.notify {
+			bell = "🔕"
+		}
+		status = append(status, okStyle.Render(fmt.Sprintf("watch: rescan in %ds (every %s) %s", m.watchLeft, m.watchEvery, bell)))
 	}
 	statusLine := "  " + strings.Join(status, hintStyle.Render("  ·  "))
 
@@ -379,7 +384,7 @@ func (m Model) viewResults() string {
 		viewTag = "tree"
 	}
 	help := helpStyle.Render(fmt.Sprintf(
-		"enter details · t view [%s] · / filter · s sort · e/c export · w watch · r rescan · ? help · q quit", viewTag))
+		"enter details · t view [%s] · / filter · s sort · e/c export · w watch · b bell · r rescan · ? help · q quit", viewTag))
 
 	return "\n" + m.header() + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
 }

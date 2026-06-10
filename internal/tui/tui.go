@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/notify"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
@@ -90,6 +91,9 @@ type rowView struct {
 
 type watchTickMsg struct{ gen int }
 
+// notifyDoneMsg is returned after a desktop notification attempt completes.
+type notifyDoneMsg struct{}
+
 // Model is the root Bubble Tea model for the ndscan TUI.
 type Model struct {
 	version string
@@ -139,10 +143,12 @@ type Model struct {
 	sortBy   sortKey
 
 	// watch mode
-	watch      bool
-	watchEvery time.Duration
-	watchLeft  int
-	watchGen   int
+	watch       bool
+	watchEvery  time.Duration
+	watchLeft   int
+	watchGen    int
+	notify      bool // desktop notifications on watch-mode changes
+	watchRescan bool // the in-flight scan was triggered by a watch tick
 }
 
 // New constructs the initial model, restoring saved settings when present.
@@ -180,6 +186,7 @@ func New(version string) Model {
 		view:          viewTable,
 		filterIn:      fl,
 		watchEvery:    60 * time.Second,
+		notify:        notify.Available(),
 	}
 
 	cf := config.Load()
@@ -301,12 +308,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			hostsUp, openPorts, map[bool]string{true: "cancelled", false: "done"}[msg.cancelled],
 			msg.elapsed.Round(10*time.Millisecond))
 		m.rebuildTable()
-		var cmd tea.Cmd
+
+		var cmds []tea.Cmd
+		// On a watch-mode rescan, alert on any change via desktop notification.
+		if m.watchRescan && m.notify && !msg.cancelled {
+			if title, body, ok := notifySummary(m.diff, m.rows); ok {
+				cmds = append(cmds, notifyCmd(title, body))
+			}
+		}
+		m.watchRescan = false
 		if m.watch {
 			m.watchLeft = int(m.watchEvery.Seconds())
-			cmd = m.watchTick()
+			cmds = append(cmds, m.watchTick())
 		}
-		return m, cmd
+		return m, tea.Batch(cmds...)
 
 	case errMsg:
 		m.err = msg.err
@@ -331,9 +346,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.watchLeft--
 		if m.watchLeft <= 0 {
+			m.watchRescan = true
 			return m.startWithParams(m.params)
 		}
 		return m, m.watchTick()
+
+	case notifyDoneMsg:
+		return m, nil
 	}
 
 	return m, nil
@@ -699,6 +718,18 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.watchTick()
 		}
 		return m, nil
+	case "b":
+		if !notify.Available() {
+			m.notice = "desktop notifications unavailable on this system"
+			return m, nil
+		}
+		m.notify = !m.notify
+		if m.notify {
+			m.notice = "watch notifications on"
+		} else {
+			m.notice = "watch notifications off"
+		}
+		return m, nil
 	case "+", "=":
 		m.watchEvery += 15 * time.Second
 		m.watchLeft = int(m.watchEvery.Seconds())
@@ -938,6 +969,103 @@ func riskGlyph(ports []ui.PortInfo) string {
 	default:
 		return ""
 	}
+}
+
+// notifyCmd fires a desktop notification off the main loop. It returns a
+// notifyDoneMsg so the model can surface delivery state without blocking.
+func notifyCmd(title, body string) tea.Cmd {
+	return func() tea.Msg {
+		_ = notify.Send(notify.Notification{
+			Title:    "ndscan",
+			Subtitle: title,
+			Message:  body,
+		})
+		return notifyDoneMsg{}
+	}
+}
+
+// notifySummary condenses a watch-mode diff into a notification title + body.
+// It returns ok=false when nothing meaningfully changed (so no alert fires).
+// rows supplies host context (vendor/hostname) for friendlier new-host lines.
+func notifySummary(diff map[string]config.HostDiff, rows []ui.Row) (title, body string, ok bool) {
+	if len(diff) == 0 {
+		return "", "", false
+	}
+	rowByIP := make(map[string]ui.Row, len(rows))
+	for _, r := range rows {
+		rowByIP[r.IP] = r
+	}
+
+	var newHosts, goneHosts []string
+	newCount, goneCount, opened, closed := 0, 0, 0, 0
+	for ip, d := range diff {
+		switch {
+		case d.New:
+			newCount++
+			newHosts = append(newHosts, hostLabel(ip, rowByIP[ip]))
+		case d.Gone:
+			goneCount++
+			goneHosts = append(goneHosts, ip)
+		}
+		opened += len(d.PortsOpened)
+		closed += len(d.PortsClosed)
+	}
+	if newCount == 0 && goneCount == 0 && opened == 0 && closed == 0 {
+		return "", "", false
+	}
+	sort.Strings(newHosts)
+	sort.Strings(goneHosts)
+
+	// Title: the single most important change, prioritizing new hosts.
+	switch {
+	case newCount == 1 && goneCount == 0 && opened == 0:
+		title = "New host: " + newHosts[0]
+	case newCount > 0:
+		title = fmt.Sprintf("%d new host(s) on the network", newCount)
+	case goneCount > 0:
+		title = fmt.Sprintf("%d host(s) went offline", goneCount)
+	case opened > 0:
+		title = fmt.Sprintf("%d port(s) opened", opened)
+	default:
+		title = "Network changed"
+	}
+
+	// Body: a compact breakdown of everything that changed.
+	var parts []string
+	if len(newHosts) > 0 {
+		parts = append(parts, "+ "+strings.Join(clip(newHosts, 3), ", "))
+	}
+	if len(goneHosts) > 0 {
+		parts = append(parts, "- "+strings.Join(clip(goneHosts, 3), ", "))
+	}
+	if opened > 0 {
+		parts = append(parts, fmt.Sprintf("%d port(s) opened", opened))
+	}
+	if closed > 0 {
+		parts = append(parts, fmt.Sprintf("%d port(s) closed", closed))
+	}
+	return title, strings.Join(parts, " · "), true
+}
+
+// hostLabel renders an IP with its hostname or vendor in parens when known.
+func hostLabel(ip string, r ui.Row) string {
+	switch {
+	case r.Host != "":
+		return ip + " (" + r.Host + ")"
+	case r.Vendor != "":
+		return ip + " (" + r.Vendor + ")"
+	default:
+		return ip
+	}
+}
+
+// clip caps a slice for display, appending "+N more" when truncated.
+func clip(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	out := append([]string(nil), s[:n]...)
+	return append(out, fmt.Sprintf("+%d more", len(s)-n))
 }
 
 // exposureNote is the summary line shown when a host has notable open ports.

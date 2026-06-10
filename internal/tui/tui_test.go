@@ -164,6 +164,45 @@ func TestWatchToggleAndTick(t *testing.T) {
 	}
 }
 
+func TestNotifyToggle(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	m.notify = true // force a known starting state regardless of platform
+	var tm tea.Model = m
+	tm, _ = tm.Update(keyRunes("b"))
+	mm := tm.(Model)
+	// On systems with a notifier, b toggles off; without one, it stays off
+	// and explains why. Either way it must not be left on after one press.
+	if mm.notify {
+		t.Fatal("b should toggle notifications off")
+	}
+	if mm.notice == "" {
+		t.Fatal("b should set a notice")
+	}
+}
+
+func TestWatchRescanFiresNotifyCmd(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	m.watch = true
+	m.watchRescan = true
+	m.notify = true // bypass platform availability for the command path
+
+	done := doneMsg{
+		rows: []ui.Row{{IP: "10.0.0.9", Up: true}},
+		diff: map[string]config.HostDiff{"10.0.0.9": {New: true}},
+	}
+	var tm tea.Model = m
+	out, cmd := tm.Update(done)
+	if cmd == nil {
+		t.Fatal("watch rescan with a diff should batch a notify command")
+	}
+	// watchRescan must reset so a later manual scan doesn't re-alert.
+	if out.(Model).watchRescan {
+		t.Fatal("watchRescan flag should clear after the rescan completes")
+	}
+}
+
 func TestExportJSONAndCSV(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	dir := t.TempDir()
