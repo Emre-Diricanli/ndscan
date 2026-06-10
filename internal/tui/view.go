@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Emre-Diricanli/ndscan/internal/scan"
 )
 
 func (m Model) View() string {
@@ -65,6 +67,7 @@ func (m Model) helpPanel() string {
 		"  tab / ↑↓        move between fields",
 		"  ← →             change preset",
 		"  space / enter   toggle checkbox",
+		"  Use sudo        elevate for full discovery (prompts once)",
 		"  ctrl+s          save form as profile",
 		"  ctrl+p          load / manage profiles",
 		"  enter on Start  begin scan",
@@ -172,9 +175,14 @@ func (m Model) viewForm() string {
 	field(fTargets, "Targets", m.targetsIn.View(), "")
 	field(fPreset, "Preset", presetSelector(m.presetIdx), "← → to change")
 	field(fPorts, "Ports", m.portsIn.View(), "")
-	field(fShowMac, "Show MAC", checkbox(m.showMac), "space to toggle")
+	field(fShowMac, "Show MAC", checkbox(m.showMac), "from ARP cache (no root) + nmap")
 	field(fShowVendors, "Show vendors", checkbox(m.showVend), "needs Show MAC")
-	field(fRootScan, "SYN scan", checkbox(m.rootScan), "-sS, needs root")
+	field(fRootScan, "SYN scan", checkbox(m.rootScan), "-sS, needs root/sudo")
+	sudoHint := "thorough ARP + SYN scan via sudo"
+	if scan.IsRoot() {
+		sudoHint = "already root — not needed"
+	}
+	field(fSudo, "Use sudo", checkbox(m.sudo || scan.IsRoot()), sudoHint)
 	field(fConcurrency, "Concurrency", m.concurIn.View(), "parallel hosts")
 	field(fHostTimeout, "Host timeout", m.timeoutIn.View(), "seconds")
 
@@ -186,6 +194,15 @@ func (m Model) viewForm() string {
 		startBtn = buttonFocusedStyle.Render("▶ Start scan")
 	}
 	b.WriteString(cursor + startBtn + "\n")
+
+	// advisory when an unprivileged local scan will under-report
+	if !scan.IsRoot() && !m.sudo {
+		b.WriteString("\n  " + warnStyle.Render("⚠ not root: ") +
+			hintStyle.Render("MACs come from the ARP cache; for full host discovery"))
+		b.WriteString("\n    " + hintStyle.Render("and SYN scans, toggle ") +
+			accentText.Render("Use sudo") + hintStyle.Render(" or run ") +
+			accentText.Render("sudo ndscan") + "\n")
+	}
 
 	if m.err != nil {
 		b.WriteString("\n  " + errStyle.Render("✖ "+m.err.Error()) + "\n")

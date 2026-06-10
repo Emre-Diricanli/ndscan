@@ -51,6 +51,7 @@ func main() {
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
+		useSudo        bool
 		concurrency    int
 		hostTimeoutSec int
 		view           string
@@ -116,8 +117,23 @@ Otherwise, nmap runs locally.`,
 			ui.Banner(version)
 			start := time.Now()
 
+			// Elevate local scans when requested (or already root).
+			if useSudo && sshTarget == "" && !scan.IsRoot() {
+				if !scan.SudoAvailable() {
+					return fmt.Errorf("--sudo requested but sudo not found on PATH")
+				}
+				if err := scan.PrimeSudo(); err != nil {
+					return fmt.Errorf("sudo authentication failed: %w", err)
+				}
+			}
+
 			// Choose runner (local or ssh)
-			runner := scan.NewRunner(sshTarget)
+			var runner scan.Runner
+			if sshTarget != "" {
+				runner = scan.NewRunner(sshTarget)
+			} else {
+				runner = scan.NewLocalRunner(useSudo && !scan.IsRoot())
+			}
 			where := "locally"
 			if sshTarget != "" {
 				where = "via " + sshTarget
@@ -143,17 +159,30 @@ Otherwise, nmap runs locally.`,
 				sp.Fail("Host discovery failed")
 				return err
 			}
+			// ARP-cache fallback: find neighbors + MACs unprivileged nmap misses.
+			arpMap := scan.ARPCache(ctx, runner)
+			live = scan.MergeARPHosts(live, targets, arpMap)
 			if len(live) == 0 {
 				sp.Fail("No live hosts found.")
 				return nil
 			}
 			sp.Success(fmt.Sprintf("Found %d live host(s)", len(live)))
 
-			// 1b) optional: collect MACs with a separate ARP/ND discovery pass
+			// 1b) optional: collect MACs (nmap when privileged, plus ARP cache)
 			var macMap map[string]string
 			if showMac {
 				sp = ui.StartSpinner("Collecting MAC addresses…")
-				macMap, _ = scan.DiscoverMACs(ctx, live, runner) // best-effort; empty off-L2 or if perms missing
+				macMap = map[string]string{}
+				if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
+					for ip, mac := range nmapMACs {
+						macMap[ip] = mac
+					}
+				}
+				for ip, mac := range arpMap {
+					if _, ok := macMap[ip]; !ok {
+						macMap[ip] = mac
+					}
+				}
 				sp.Success(fmt.Sprintf("Collected %d MAC address(es)", len(macMap)))
 			}
 
@@ -206,6 +235,7 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")
 	scanCmd.Flags().BoolVar(&showVendors, "show-vendors", false, "include vendor names (requires --show-mac)")
 	scanCmd.Flags().BoolVar(&rootScan, "root-scan", false, "use SYN scan (-sS), requires root on the machine running nmap")
+	scanCmd.Flags().BoolVar(&useSudo, "sudo", false, "run local nmap via sudo for full ARP discovery, SYN scans, and MACs")
 	scanCmd.Flags().IntVar(&concurrency, "concurrency", 32, "max parallel host scans")
 	scanCmd.Flags().IntVar(&hostTimeoutSec, "host-timeout", 20, "per-host timeout seconds (nmap)")
 	scanCmd.Flags().StringVar(&view, "view", "table", "output view: table | tree")

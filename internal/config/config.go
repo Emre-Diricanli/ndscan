@@ -21,6 +21,7 @@ type Settings struct {
 	ShowMac     bool   `json:"show_mac"`
 	ShowVendors bool   `json:"show_vendors"`
 	RootScan    bool   `json:"root_scan"`
+	Sudo        bool   `json:"sudo"`
 	Concurrency string `json:"concurrency"`
 	HostTimeout string `json:"host_timeout"`
 }

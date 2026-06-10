@@ -26,6 +26,7 @@ type scanParams struct {
 	showMac     bool
 	showVendors bool
 	rootScan    bool
+	sudo        bool
 	concurrency int
 	hostTimeout time.Duration
 }
@@ -80,7 +81,12 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		defer close(ch)
 		defer cancel()
 		start := time.Now()
-		runner := scan.NewRunner(p.sshTarget)
+		var runner scan.Runner
+		if p.sshTarget != "" {
+			runner = scan.NewRunner(p.sshTarget)
+		} else {
+			runner = scan.NewLocalRunner(p.sudo)
+		}
 
 		finish := func(rows []ui.Row, failed int, cancelled bool) {
 			prev := config.LoadHistory(p.targets, p.ports, p.preset)
@@ -112,15 +118,32 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			ch <- errMsg{err}
 			return
 		}
+
+		// ARP-cache fallback: recover neighbors and MACs that unprivileged
+		// nmap misses. Always read it — MACs are free and require no root.
+		arpMap := scan.ARPCache(ctx, runner)
+		live = scan.MergeARPHosts(live, p.targets, arpMap)
+
 		if len(live) == 0 {
 			finish(nil, 0, false)
 			return
 		}
 
-		var macMap map[string]string
+		// Seed the MAC map from ARP, then let a privileged nmap pass (if any)
+		// override with its own results.
+		macMap := map[string]string{}
 		if p.showMac {
 			ch <- phaseMsg{phase: "mac"}
-			macMap, _ = scan.DiscoverMACs(ctx, live, runner) // best-effort
+			if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
+				for ip, mac := range nmapMACs {
+					macMap[ip] = mac
+				}
+			}
+		}
+		for ip, mac := range arpMap {
+			if _, ok := macMap[ip]; !ok {
+				macMap[ip] = mac
+			}
 		}
 
 		var oui vendor.DB

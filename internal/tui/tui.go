@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
 
@@ -70,6 +73,7 @@ const (
 	fShowMac
 	fShowVendors
 	fRootScan
+	fSudo
 	fConcurrency
 	fHostTimeout
 	fStart
@@ -107,6 +111,7 @@ type Model struct {
 	showMac   bool
 	showVend  bool
 	rootScan  bool
+	sudo      bool
 
 	// profiles
 	profiles      []config.Profile
@@ -196,6 +201,7 @@ func (m Model) currentSettings() config.Settings {
 		ShowMac:     m.showMac,
 		ShowVendors: m.showVend,
 		RootScan:    m.rootScan,
+		Sudo:        m.sudo,
 		Concurrency: m.concurIn.Value(),
 		HostTimeout: m.timeoutIn.Value(),
 	}
@@ -214,6 +220,7 @@ func (m *Model) applySettings(s config.Settings) {
 	m.showMac = s.ShowMac
 	m.showVend = s.ShowVendors
 	m.rootScan = s.RootScan
+	m.sudo = s.Sudo
 	for i, p := range presets {
 		if p == s.Preset {
 			m.presetIdx = i
@@ -306,6 +313,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenForm
 		m.cancel = nil
 		m.watch = false
+		return m, nil
+
+	case sudoPrimedMsg:
+		if msg.err != nil {
+			m.sudo = false
+			m.err = fmt.Errorf("sudo authentication failed")
+		} else {
+			m.sudo = true
+			m.notice = "sudo enabled — thorough ARP/SYN scans active"
+		}
 		return m, nil
 
 	case watchTickMsg:
@@ -463,6 +480,8 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case fRootScan:
 			m.rootScan = !m.rootScan
 			return m, nil
+		case fSudo:
+			return m.toggleSudo()
 		}
 	case "enter":
 		switch m.focus {
@@ -478,6 +497,8 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case fRootScan:
 			m.rootScan = !m.rootScan
 			return m, nil
+		case fSudo:
+			return m.toggleSudo()
 		case fStart:
 			return m.startScan()
 		default:
@@ -498,6 +519,38 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.timeoutIn, cmd = m.timeoutIn.Update(msg)
 	}
 	return m, cmd
+}
+
+// sudoPrimedMsg reports the result of an interactive sudo authentication.
+type sudoPrimedMsg struct{ err error }
+
+// toggleSudo flips the sudo flag. Turning it on when sudo isn't already
+// authenticated suspends the TUI to run an interactive `sudo -v` on the real
+// terminal (the only place a password prompt is visible), then resumes.
+func (m Model) toggleSudo() (tea.Model, tea.Cmd) {
+	if scan.IsRoot() {
+		m.sudo = false
+		m.notice = "already running as root — sudo not needed"
+		return m, nil
+	}
+	if m.sudo {
+		m.sudo = false
+		return m, nil
+	}
+	if !scan.SudoAvailable() {
+		m.err = fmt.Errorf("sudo not found on PATH")
+		return m, nil
+	}
+	if scan.SudoPrimed() {
+		m.sudo = true
+		return m, nil
+	}
+	// suspend alt-screen, prompt for the password, resume
+	prime := exec.Command("sudo", "-v")
+	prime.Stdin, prime.Stdout, prime.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return m, tea.ExecProcess(prime, func(err error) tea.Msg {
+		return sudoPrimedMsg{err: err}
+	})
 }
 
 func (m Model) focusIsTextField() bool {
@@ -560,6 +613,7 @@ func (m Model) startScan() (tea.Model, tea.Cmd) {
 		showMac:     m.showMac,
 		showVendors: m.showVend,
 		rootScan:    m.rootScan,
+		sudo:        m.sudo,
 		concurrency: concur,
 		hostTimeout: time.Duration(tmo) * time.Second,
 	})

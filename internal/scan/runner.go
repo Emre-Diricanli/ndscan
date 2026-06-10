@@ -14,8 +14,15 @@ type Runner interface {
 
 // ----- Local runner -----
 
-type LocalRunner struct{}
+type LocalRunner struct {
+	// Sudo, when true, prefixes commands with `sudo -n` so nmap can use ARP
+	// host discovery, SYN scans, and report MACs. Requires sudo to already be
+	// authenticated (see PrimeSudo); -n never prompts, so an unprimed sudo
+	// fails fast rather than hanging the UI.
+	Sudo bool
+}
 
+// NewRunner returns a local runner (optionally elevated) or an SSH runner.
 func NewRunner(sshTarget string) Runner {
 	if sshTarget == "" {
 		return LocalRunner{}
@@ -23,9 +30,18 @@ func NewRunner(sshTarget string) Runner {
 	return &SSHRunner{Target: sshTarget}
 }
 
-func (LocalRunner) Run(ctx context.Context, bin string, args ...string) ([]byte, error) {
+// NewLocalRunner returns a local runner that elevates via sudo when requested.
+func NewLocalRunner(sudo bool) Runner { return LocalRunner{Sudo: sudo} }
+
+func (r LocalRunner) Run(ctx context.Context, bin string, args ...string) ([]byte, error) {
+	name := bin
+	full := args
+	if r.Sudo {
+		name = "sudo"
+		full = append([]string{"-n", bin}, args...)
+	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, name, full...)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
