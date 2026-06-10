@@ -54,3 +54,17 @@ func checkbox(on bool) string {
 	}
 	return hintStyle.Render("[ ]")
 }
+
+// sevStyle maps a risk severity string to its display style.
+func sevStyle(severity string) lipgloss.Style {
+	switch severity {
+	case "high":
+		return errStyle
+	case "warn":
+		return warnStyle
+	case "info":
+		return accentText
+	default:
+		return valueStyle
+	}
+}

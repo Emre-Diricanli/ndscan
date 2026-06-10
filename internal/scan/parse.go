@@ -2,6 +2,7 @@ package scan
 
 import (
 	"encoding/xml"
+	"time"
 )
 
 type NmapRun struct {
@@ -14,6 +15,21 @@ type Host struct {
 	Hostnames Hostnames `xml:"hostnames"`
 	Ports     Ports     `xml:"ports"`
 	OS        OS        `xml:"os"`
+	Times     Times     `xml:"times"`
+}
+
+// Times holds nmap's timing data; srtt is the smoothed round-trip time in
+// microseconds (populated once nmap has probed the host).
+type Times struct {
+	SRTT int `xml:"srtt,attr"`
+}
+
+// RTT returns the host's smoothed round-trip time, or 0 if nmap reported none.
+func (h Host) RTT() time.Duration {
+	if h.Times.SRTT <= 0 {
+		return 0
+	}
+	return time.Duration(h.Times.SRTT) * time.Microsecond
 }
 
 // OS holds nmap's OS-detection guesses (populated by -A / -O presets).

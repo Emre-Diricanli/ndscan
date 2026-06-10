@@ -842,6 +842,7 @@ func (m *Model) rebuildTable() {
 	if hasDiff {
 		add("Δ", 10)
 	}
+	add("Risk", 5)
 	rest := width - used - 6
 	if rest < 12 {
 		rest = 12
@@ -870,6 +871,7 @@ func (m *Model) rebuildTable() {
 		if hasDiff {
 			cells = append(cells, rv.badge)
 		}
+		cells = append(cells, riskGlyph(r.PortDetails))
 		cells = append(cells, strings.Join(nums, ", "))
 		rows = append(rows, table.Row(cells))
 	}
@@ -901,4 +903,47 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// rankSeverity orders severity strings so we can find the highest on a host.
+func rankSeverity(s string) int {
+	switch s {
+	case "high":
+		return 3
+	case "warn":
+		return 2
+	case "info":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// riskGlyph returns a compact one-glyph indicator of the highest-severity
+// open port on a host, for the results table's Risk column.
+func riskGlyph(ports []ui.PortInfo) string {
+	highest := 0
+	for _, p := range ports {
+		if r := rankSeverity(p.Severity); r > highest {
+			highest = r
+		}
+	}
+	switch highest {
+	case 3:
+		return "!!"
+	case 2:
+		return "▲"
+	case 1:
+		return "·"
+	default:
+		return ""
+	}
+}
+
+// exposureNote is the summary line shown when a host has notable open ports.
+func exposureNote(severity string) string {
+	if severity == "high" {
+		return "high-risk service exposed — review whether this should be open"
+	}
+	return "notable service exposed on this host"
 }

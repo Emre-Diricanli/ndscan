@@ -21,9 +21,36 @@ type Row struct {
 	MAC    string   `json:"mac,omitempty"`
 	Vendor string   `json:"vendor,omitempty"`
 	Host   string   `json:"hostname,omitempty"`
-	OS     string   `json:"os,omitempty"` // best OS-detection guess (needs -A presets)
+	OS     string   `json:"os,omitempty"`  // best OS-detection guess (needs -A presets)
+	RTT    string   `json:"rtt,omitempty"` // smoothed round-trip time, e.g. "2.1ms"
 	Up     bool     `json:"up"`
 	Ports  []string `json:"ports,omitempty"` // labels like "22/tcp ssh"
+	// PortDetails carries the structured per-port view (number, service,
+	// version, risk) for detail panes and reports. It mirrors Ports.
+	PortDetails []PortInfo `json:"port_details,omitempty"`
+}
+
+// PortInfo is the structured form of one open port.
+type PortInfo struct {
+	Port     int    `json:"port"`
+	Proto    string `json:"proto"`
+	Service  string `json:"service,omitempty"`
+	Product  string `json:"product,omitempty"`
+	Version  string `json:"version,omitempty"`
+	Severity string `json:"severity,omitempty"` // "", "info", "warn", "high"
+	Risk     string `json:"risk,omitempty"`     // human-readable reason
+}
+
+// VersionLabel renders product + version, e.g. "OpenSSH 9.6", or "".
+func (p PortInfo) VersionLabel() string {
+	parts := make([]string, 0, 2)
+	if p.Product != "" {
+		parts = append(parts, p.Product)
+	}
+	if p.Version != "" {
+		parts = append(parts, p.Version)
+	}
+	return strings.Join(parts, " ")
 }
 
 func flatten(res []scan.HostResult) []Row {
@@ -51,6 +78,9 @@ func flatten(res []scan.HostResult) []Row {
 				row.Host = h.Hostnames.Names[0].Name
 			}
 			row.OS = h.BestOSGuess()
+			if rtt := h.RTT(); rtt > 0 {
+				row.RTT = formatRTT(rtt)
+			}
 			for _, p := range h.Ports.List {
 				if p.State.State == "open" {
 					label := fmt.Sprintf("%d/%s %s", p.PortID, p.Protocol, p.Service.Name)
@@ -61,6 +91,17 @@ func flatten(res []scan.HostResult) []Row {
 						label += " " + p.Service.Version
 					}
 					row.Ports = append(row.Ports, label)
+
+					risk := scan.ClassifyPort(p.PortID, p.Service.Name)
+					row.PortDetails = append(row.PortDetails, PortInfo{
+						Port:     p.PortID,
+						Proto:    p.Protocol,
+						Service:  p.Service.Name,
+						Product:  p.Service.Product,
+						Version:  p.Service.Version,
+						Severity: risk.Severity.String(),
+						Risk:     risk.Reason,
+					})
 				}
 			}
 			out = append(out, row)
@@ -94,6 +135,20 @@ func BuildRows(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, m
 // PortNumber exposes the "22/tcp ssh" -> "22" reduction for table-style views.
 func PortNumber(label string) string { return extractPortNumber(label) }
 
+// formatRTT renders a round-trip time compactly: sub-millisecond as "0.4ms",
+// otherwise one decimal of milliseconds ("2.1ms"), seconds for slow hosts.
+func formatRTT(d time.Duration) string {
+	ms := float64(d) / float64(time.Millisecond)
+	switch {
+	case ms >= 1000:
+		return fmt.Sprintf("%.2fs", ms/1000)
+	case ms >= 10:
+		return fmt.Sprintf("%.0fms", ms)
+	default:
+		return fmt.Sprintf("%.1fms", ms)
+	}
+}
+
 func mergePorts(rows []Row) []Row {
 	key := func(r Row) string { return r.IP + "|" + r.MAC + "|" + r.Host }
 	m := map[string]Row{}
@@ -105,6 +160,10 @@ func mergePorts(rows []Row) []Row {
 			continue
 		}
 		ex.Ports = append(ex.Ports, r.Ports...)
+		ex.PortDetails = append(ex.PortDetails, r.PortDetails...)
+		if ex.RTT == "" {
+			ex.RTT = r.RTT
+		}
 		m[k] = ex
 	}
 	out := make([]Row, 0, len(m))
@@ -132,18 +191,7 @@ func extractPortNumber(label string) string {
 // ====== TABLE (port numbers only) ======
 
 func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, macMap map[string]string) {
-	rows := flatten(res)
-
-	// fill missing MACs from macMap (best-effort)
-	if showMac && macMap != nil {
-		for i := range rows {
-			if rows[i].MAC == "" {
-				if mac, ok := macMap[rows[i].IP]; ok {
-					rows[i].MAC = mac
-				}
-			}
-		}
-	}
+	rows := BuildRows(res, db, showMac, showVendors, macMap)
 
 	t := table.NewWriter()
 	t.SetOutputMirror(os.Stdout)
@@ -151,19 +199,15 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 	t.Style().Format.Header = text.FormatDefault
 	t.Style().Color.Header = cTitle
 	if showMac {
-		t.AppendHeader(table.Row{"IP", "MAC", "Vendor", "Host", "Up", "Open Ports"})
+		t.AppendHeader(table.Row{"IP", "MAC", "Vendor", "Host", "Up", "Risk", "Open Ports"})
 	} else {
-		t.AppendHeader(table.Row{"IP", "Host", "Up", "Open Ports"})
+		t.AppendHeader(table.Row{"IP", "Host", "Up", "Risk", "Open Ports"})
 	}
 
 	for _, r := range rows {
 		up := cErr.Sprint("✖ no")
 		if r.Up {
 			up = cOK.Sprint("✔ yes")
-		}
-		vend := ""
-		if showMac && showVendors {
-			vend = vendor.Lookup(db, r.MAC, "")
 		}
 		// Convert labels like "22/tcp ssh" -> "22" and join
 		var justNums []string
@@ -174,6 +218,7 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 			}
 		}
 		ports := cAccent.Sprint(strings.Join(justNums, ", "))
+		risk := riskCell(r.PortDetails)
 
 		host := r.Host
 		if host == "" {
@@ -185,12 +230,33 @@ func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVend
 			if mac == "" {
 				mac = cDim.Sprint("-")
 			}
-			t.AppendRow(table.Row{ip, mac, vend, host, up, ports})
+			t.AppendRow(table.Row{ip, mac, dashStr(r.Vendor), host, up, risk, ports})
 		} else {
-			t.AppendRow(table.Row{ip, host, up, ports})
+			t.AppendRow(table.Row{ip, host, up, risk, ports})
 		}
 	}
 	t.Render()
+}
+
+// riskCell renders a colored severity glyph for the highest-risk open port.
+func riskCell(ports []PortInfo) string {
+	highest := ""
+	rank := map[string]int{"high": 3, "warn": 2, "info": 1, "": 0}
+	for _, p := range ports {
+		if rank[p.Severity] > rank[highest] {
+			highest = p.Severity
+		}
+	}
+	switch highest {
+	case "high":
+		return cErr.Sprint("!!")
+	case "warn":
+		return cWarn.Sprint("▲")
+	case "info":
+		return cAccent.Sprint("·")
+	default:
+		return ""
+	}
 }
 
 // Summarize returns the number of hosts that are up and the total count of
@@ -238,85 +304,75 @@ func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showM
 // ====== TREE (detailed labels) ======
 
 func PrintTreeWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, macMap map[string]string) {
-	rows := flatten(res)
-
-	// fill missing MACs from macMap (best-effort)
-	if showMac && macMap != nil {
-		for i := range rows {
-			if rows[i].MAC == "" {
-				if mac, ok := macMap[rows[i].IP]; ok {
-					rows[i].MAC = mac
-				}
-			}
-		}
-	}
-
-	type node struct {
-		IP, Host, MAC, Vendor string
-		Up                    bool
-		Ports                 []string
-	}
-	byIP := map[string]*node{}
-	order := []string{}
-	for _, r := range rows {
-		n, ok := byIP[r.IP]
-		if !ok {
-			n = &node{IP: r.IP, Host: r.Host, Up: r.Up, MAC: r.MAC}
-			byIP[r.IP] = n
-			order = append(order, r.IP)
-		}
-		if showMac && showVendors && n.Vendor == "" {
-			n.Vendor = vendor.Lookup(db, r.MAC, "")
-		}
-		if len(r.Ports) > 0 {
-			n.Ports = append(n.Ports, r.Ports...)
-		}
-	}
-
-	// stable order
-	sort.Strings(order)
+	rows := BuildRows(res, db, showMac, showVendors, macMap)
 
 	branch := cDim.Sprint("├─")
 	leaf := cDim.Sprint("└─")
-	for _, ip := range order {
-		n := byIP[ip]
-		fmt.Println(cTitle.Sprint(n.IP))
-		host := n.Host
+	for _, r := range rows {
+		fmt.Println(cTitle.Sprint(r.IP))
+		host := r.Host
 		if host == "" {
 			host = "-"
 		}
 		fmt.Printf("%s Host: %s\n", branch, host)
 		up := cErr.Sprint("no")
-		if n.Up {
+		if r.Up {
 			up = cOK.Sprint("yes")
 		}
 		fmt.Printf("%s Up: %s\n", branch, up)
 		if showMac {
-			mac := n.MAC
-			if mac == "" {
-				mac = "-"
-			}
-			fmt.Printf("%s MAC: %s\n", branch, mac)
+			fmt.Printf("%s MAC: %s\n", branch, dashStr(r.MAC))
 		}
 		if showMac && showVendors {
-			vend := n.Vendor
-			if vend == "" {
-				vend = "-"
-			}
-			fmt.Printf("%s Vendor: %s\n", branch, vend)
+			fmt.Printf("%s Vendor: %s\n", branch, dashStr(r.Vendor))
 		}
-		if len(n.Ports) == 0 {
+		if r.OS != "" {
+			fmt.Printf("%s OS: %s\n", branch, r.OS)
+		}
+		if r.RTT != "" {
+			fmt.Printf("%s RTT: %s\n", branch, r.RTT)
+		}
+		if len(r.PortDetails) == 0 {
 			fmt.Printf("%s Ports: -\n", leaf)
 		} else {
 			fmt.Printf("%s Ports:\n", leaf)
-			for i, p := range n.Ports {
+			for i, p := range r.PortDetails {
 				prefix := "   " + branch + " "
-				if i == len(n.Ports)-1 {
+				if i == len(r.PortDetails)-1 {
 					prefix = "   " + leaf + " "
 				}
-				fmt.Println(prefix + cAccent.Sprint(p))
+				label := fmt.Sprintf("%d/%s %s", p.Port, p.Proto, p.Service)
+				if vl := p.VersionLabel(); vl != "" {
+					label += " " + vl
+				}
+				out := prefix + cAccent.Sprint(label)
+				if p.Risk != "" {
+					out += "  " + sevColor(p.Severity).Sprint("⚠ "+p.Risk)
+				}
+				fmt.Println(out)
 			}
 		}
 		fmt.Println()
+	}
+}
+
+func dashStr(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// sevColor maps a risk severity string to its terminal color for CLI output.
+func sevColor(severity string) text.Colors {
+	switch severity {
+	case "high":
+		return cErr
+	case "warn":
+		return cWarn
+	case "info":
+		return cAccent
+	default:
+		return cDim
 	}
 }

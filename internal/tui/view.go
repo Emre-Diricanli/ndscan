@@ -90,6 +90,13 @@ func (m Model) helpPanel() string {
 		hintStyle.Render("Δ column shows changes vs the previous scan of the"),
 		hintStyle.Render("same targets: NEW host, GONE host, +/-port."),
 		"",
+		hintStyle.Render("Risk column flags notable open ports:"),
+		"  " + errStyle.Render("!!") + hintStyle.Render(" high (telnet/ftp/nfs)  ") +
+			warnStyle.Render("▲") + hintStyle.Render(" warn (smb/rdp/db)  ") +
+			accentText.Render("·") + hintStyle.Render(" info"),
+		hintStyle.Render("Open host details (enter) for per-port service,"),
+		hintStyle.Render("version, RTT, and the reason a port is flagged."),
+		"",
 		hintStyle.Render("press any key to close"),
 	}
 	return panelStyle.Render(strings.Join(rows, "\n"))
@@ -117,16 +124,44 @@ func (m Model) detailPanel() string {
 	line("MAC", r.MAC)
 	line("Vendor", r.Vendor)
 	line("OS", r.OS)
+	line("RTT", r.RTT)
 	if rv.diff.Changed() && !rv.gone {
 		b.WriteString(labelStyle.Width(9).Render("Changes") + " " + warnStyle.Render(diffBadge(rv.diff)) + "\n")
 	}
+
+	// Open ports, with service+version and a risk badge for notable services.
 	b.WriteString("\n" + labelStyle.Render("Open ports") + "\n")
-	if len(r.Ports) == 0 {
+	if len(r.PortDetails) == 0 && len(r.Ports) == 0 {
 		b.WriteString(hintStyle.Render("  none") + "\n")
 	}
-	for _, p := range r.Ports {
-		b.WriteString("  " + accentText.Render(p) + "\n")
+	if len(r.PortDetails) > 0 {
+		highest := ""
+		for _, p := range r.PortDetails {
+			head := accentText.Render(fmt.Sprintf("%d/%s", p.Port, p.Proto))
+			if p.Service != "" {
+				head += "  " + valueStyle.Render(p.Service)
+			}
+			if vl := p.VersionLabel(); vl != "" {
+				head += "  " + hintStyle.Render(vl)
+			}
+			b.WriteString("  " + head + "\n")
+			if p.Risk != "" {
+				b.WriteString("      " + sevStyle(p.Severity).Render("⚠ "+p.Risk) + "\n")
+			}
+			if rankSeverity(p.Severity) > rankSeverity(highest) {
+				highest = p.Severity
+			}
+		}
+		if highest == "high" || highest == "warn" {
+			b.WriteString("\n  " + sevStyle(highest).Render("▲ "+exposureNote(highest)) + "\n")
+		}
+	} else {
+		// fall back to raw labels if structured detail is unavailable
+		for _, p := range r.Ports {
+			b.WriteString("  " + accentText.Render(p) + "\n")
+		}
 	}
+
 	b.WriteString("\n" + hintStyle.Render("esc to close"))
 	return panelStyle.Render(b.String())
 }
@@ -410,14 +445,34 @@ func (m Model) treeView() string {
 		if r.OS != "" {
 			b.WriteString(hintStyle.Render("  ├─ ") + "OS: " + r.OS + "\n")
 		}
+		if r.RTT != "" {
+			b.WriteString(hintStyle.Render("  ├─ ") + "RTT: " + r.RTT + "\n")
+		}
 		if m.params.showMac {
 			b.WriteString(hintStyle.Render("  ├─ ") + "MAC: " + dash(r.MAC) + "\n")
 			if m.params.showVendors {
 				b.WriteString(hintStyle.Render("  ├─ ") + "Vendor: " + dash(r.Vendor) + "\n")
 			}
 		}
-		if len(r.Ports) == 0 {
+		if len(r.PortDetails) == 0 && len(r.Ports) == 0 {
 			b.WriteString(hintStyle.Render("  └─ ") + "Ports: -\n")
+		} else if len(r.PortDetails) > 0 {
+			b.WriteString(hintStyle.Render("  └─ ") + "Ports:\n")
+			for i, p := range r.PortDetails {
+				branch := "     ├─ "
+				if i == len(r.PortDetails)-1 {
+					branch = "     └─ "
+				}
+				label := fmt.Sprintf("%d/%s %s", p.Port, p.Proto, p.Service)
+				if vl := p.VersionLabel(); vl != "" {
+					label += " " + vl
+				}
+				line := hintStyle.Render(branch) + accentText.Render(label)
+				if p.Risk != "" {
+					line += "  " + sevStyle(p.Severity).Render("⚠ "+p.Risk)
+				}
+				b.WriteString(line + "\n")
+			}
 		} else {
 			b.WriteString(hintStyle.Render("  └─ ") + "Ports:\n")
 			for i, p := range r.Ports {
