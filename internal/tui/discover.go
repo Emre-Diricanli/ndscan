@@ -64,11 +64,16 @@ func (m *Model) runDiscover(ip string) tea.Cmd {
 			runner = scan.NewLocalRunner(sudo)
 		}
 
+		// "default" preset gives -A (service versions, OS, default scripts,
+		// TLS certs, HTTP titles) without deep's all-65535-ports sweep, which
+		// is impractical per-host — especially against hosts that SYN-ACK
+		// every port. A 45s host budget keeps it responsive.
 		cfg := scan.Config{
-			Preset:      "deep", // 1-65535 + -A (versions, OS, scripts)
+			Preset:      "default",
+			Ports:       "1-1024,1433,3306,3389,5432,5900,6379,8080,8443,9200,27017",
 			UseSYN:      sudo || scan.IsRoot(),
 			Concurrency: 1,
-			HostTimeout: 4 * time.Minute,
+			HostTimeout: 45 * time.Second,
 			NeedMAC:     true,
 		}
 		results, err := scan.ScanHosts(ctx, []string{ip}, cfg, runner)
@@ -120,8 +125,8 @@ func (m Model) discoverPanel() string {
 		hintStyle.Render("  deep scan · ") + valueStyle.Bold(true).Render(d.ip) + "\n\n")
 
 	if d.scanning {
-		b.WriteString("  " + m.spin.View() + accentText.Render("scanning all ports + service/OS detection…") + "\n")
-		b.WriteString("\n  " + hintStyle.Render("this is thorough and can take a little while · esc to cancel"))
+		b.WriteString("  " + m.spin.View() + accentText.Render("deep scan: ports + service/version + OS…") + "\n")
+		b.WriteString("\n  " + hintStyle.Render("this is thorough and can take ~30s · esc to cancel"))
 		return discoverBox(b.String())
 	}
 	if d.err != nil {
@@ -131,9 +136,10 @@ func (m Model) discoverPanel() string {
 	}
 
 	r := d.row
-	if r == nil || !r.Up {
-		b.WriteString("  " + warnStyle.Render("host did not respond to a deep scan") + "\n")
-		b.WriteString(hintStyle.Render("  (it may be asleep, firewalled, or filtering probes)") + "\n")
+	if r == nil {
+		// No parseable result — the scan timed out or was inconclusive.
+		b.WriteString("  " + warnStyle.Render("scan timed out before finishing") + "\n")
+		b.WriteString(hintStyle.Render("  (the host may be filtering probes or SYN-ACKing every port)") + "\n")
 		b.WriteString("\n  " + hintStyle.Render("r rescan · esc back"))
 		return discoverBox(b.String())
 	}
@@ -159,7 +165,17 @@ func (m Model) discoverPanel() string {
 	b.WriteString("  " + labelStyle.Width(9).Render("Scan") + " " +
 		hintStyle.Render(fmt.Sprintf("completed in %s", d.elapsed.Round(time.Millisecond*100))) + "\n")
 
-	// Ports / services
+	// Ports / services. A host reporting hundreds of "open" ports is almost
+	// certainly SYN-ACKing everything (a tarpit / firewall), not genuinely
+	// running that many services — call it out instead of listing noise.
+	const saturated = 100
+	if len(r.PortDetails) >= saturated {
+		b.WriteString("\n  " + warnStyle.Render(fmt.Sprintf("⚠ %d ports report open", len(r.PortDetails))) + "\n")
+		b.WriteString("  " + hintStyle.Render("this host SYN-ACKs every port (a firewall/tarpit) —") + "\n")
+		b.WriteString("  " + hintStyle.Render("the \"open\" ports aren't real services. Try a SYN scan with sudo.") + "\n")
+		b.WriteString("\n  " + hintStyle.Render("r rescan · esc back"))
+		return discoverBox(b.String())
+	}
 	b.WriteString("\n  " + labelFocusedStyle.Render(fmt.Sprintf("Open ports (%d)", len(r.PortDetails))) + "\n")
 	if len(r.PortDetails) == 0 {
 		b.WriteString("  " + hintStyle.Render("none open") + "\n")
