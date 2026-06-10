@@ -1,5 +1,6 @@
 # .goreleaser.yml
 # https://goreleaser.com/customization/
+version: 2
 
 project_name: ndscan
 
@@ -25,15 +26,14 @@ builds:
       - arm64
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
       {{- .Os }}_
       {{- .Arch }}
-    # We only want the binary inside the archive
-    files:
-      - none
+    # Only the binary goes in the archive (the default); the installer
+    # extracts it from the tarball root.
 
 checksum:
   name_template: 'checksums.txt'
