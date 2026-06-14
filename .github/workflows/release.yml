@@ -1,0 +1,35 @@
+name: Release
+
+# Runs GoReleaser whenever a version tag is pushed (e.g. v0.1.0).
+# GoReleaser builds the cross-platform binaries, packages the tarballs,
+# and publishes a GitHub Release that install.sh downloads from.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required for GoReleaser to create the GitHub Release
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so the changelog is correct
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
