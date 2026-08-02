@@ -31,6 +31,34 @@ func TestExportPath_DatedFolderAndCreate(t *testing.T) {
 	}
 }
 
+// Two exports of the same format within the same second must not collide:
+// the first keeps the plain name, later ones get a -2/-3 suffix.
+func TestExportPath_AvoidsCollisions(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("NDSCAN_EXPORT_DIR", base)
+	at := time.Date(2026, 6, 10, 14, 22, 5, 0, time.UTC)
+
+	seen := map[string]bool{}
+	want := []string{"ndscan-142205.json", "ndscan-142205-2.json", "ndscan-142205-3.json"}
+	for i, wantName := range want {
+		path, err := ExportPath(at, "json")
+		if err != nil {
+			t.Fatalf("ExportPath #%d: %v", i+1, err)
+		}
+		if got := filepath.Base(path); got != wantName {
+			t.Errorf("export #%d name = %q, want %q", i+1, got, wantName)
+		}
+		if seen[path] {
+			t.Fatalf("export #%d reused path %q", i+1, path)
+		}
+		seen[path] = true
+		// Simulate the caller writing the file, so the next call must step aside.
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+}
+
 func TestExportDir_DefaultsToDownloads(t *testing.T) {
 	os.Unsetenv("NDSCAN_EXPORT_DIR")
 	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)

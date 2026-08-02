@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -99,6 +100,25 @@ Otherwise, nmap runs locally.`,
 			}
 			if flagTR {
 				view = "tree"
+			}
+			// Reject bad values before doing any work, so a typo can't quietly
+			// run a different scan than the one requested.
+			if err := validatePreset(preset); err != nil {
+				return err
+			}
+			if err := validateView(view); err != nil {
+				return err
+			}
+			if err := validatePositive("concurrency", concurrency); err != nil {
+				return err
+			}
+			if err := validatePositive("host-timeout", hostTimeoutSec); err != nil {
+				return err
+			}
+			if reportOut != "" {
+				if _, err := reportFormat(reportOut); err != nil {
+					return err
+				}
 			}
 			// guard vendor flag when mac is off
 			if showVendors && !showMac {
@@ -225,7 +245,9 @@ Otherwise, nmap runs locally.`,
 			}
 
 			// 4) output
-			// Markdown/HTML report (inferred from the file extension).
+			// --report and --json are independent: passing both writes both.
+			// (The report branch used to return early, silently dropping the
+			// JSON file the user asked for.)
 			if reportOut != "" {
 				rows := ui.BuildRows(results, oui, showMac, showVendors, macMap)
 				rep := report.Report{
@@ -234,7 +256,11 @@ Otherwise, nmap runs locally.`,
 					Generated: start.Format("2006-01-02 15:04:05"),
 					Rows:      rows,
 				}
-				isHTML := strings.HasSuffix(strings.ToLower(reportOut), ".html")
+				format, err := reportFormat(reportOut) // already validated in PreRunE
+				if err != nil {
+					return err
+				}
+				isHTML := format == "html"
 				content := rep.Markdown()
 				if isHTML {
 					content = rep.HTML()
@@ -249,13 +275,15 @@ Otherwise, nmap runs locally.`,
 						ui.Infof("Opened %s in your browser", reportOut)
 					}
 				}
-				return nil
 			}
 			if jsonOut != "" {
 				if err := ui.WriteJSONWithMACMap(results, oui, jsonOut, showMac, showVendors, macMap); err != nil {
 					return err
 				}
 				ui.Infof("Wrote JSON results to %s", jsonOut)
+			}
+			// Writing files is the requested output; don't also dump a table.
+			if reportOut != "" || jsonOut != "" {
 				return nil
 			}
 			fmt.Println()
@@ -316,6 +344,56 @@ func firstError(results []scan.HostResult) error {
 		}
 	}
 	return nil
+}
+
+// validPresets and validViews are the accepted values for --preset and --view.
+// Unknown values used to fall through to a default, silently producing a scan
+// the user didn't ask for, so both are validated up front.
+var (
+	validPresets = []string{"quick", "default", "udp", "deep"}
+	validViews   = []string{"table", "tree"}
+)
+
+func validatePreset(p string) error {
+	for _, v := range validPresets {
+		if p == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid --preset %q (choose one of: %s)", p, strings.Join(validPresets, ", "))
+}
+
+func validateView(v string) error {
+	for _, ok := range validViews {
+		if v == ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid --view %q (choose one of: %s)", v, strings.Join(validViews, ", "))
+}
+
+// validatePositive rejects zero and negative values for flags where they'd
+// silently disable a safety limit (a non-positive host timeout means "no
+// timeout" to nmap) or be clamped without telling the user.
+func validatePositive(flag string, n int) error {
+	if n < 1 {
+		return fmt.Errorf("--%s must be at least 1 (got %d)", flag, n)
+	}
+	return nil
+}
+
+// reportFormat resolves the report format from the output path's extension.
+// Anything other than .md/.html is an error: the old behavior wrote Markdown
+// into, say, "report.json", which looked like it had honored the name.
+func reportFormat(path string) (string, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".html":
+		return "html", nil
+	case ".md":
+		return "md", nil
+	default:
+		return "", fmt.Errorf("cannot infer report format from %q: use a .md or .html extension", path)
+	}
 }
 
 // treat "user@host" as SSH target if it contains '@' and no '/' (CIDR)

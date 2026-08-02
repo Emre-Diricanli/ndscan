@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strings"
@@ -154,6 +155,23 @@ func BuildRows(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, m
 // PortNumber exposes the "22/tcp ssh" -> "22" reduction for table-style views.
 func PortNumber(label string) string { return extractPortNumber(label) }
 
+// IPLess orders IPv4/IPv6 addresses numerically, falling back to a string
+// compare for values that don't parse. Every view sorts through this so the CLI
+// and the TUI agree on ordering (a lexical sort would put .10 before .9).
+func IPLess(a, b string) bool {
+	ia, ib := net.ParseIP(a), net.ParseIP(b)
+	if ia == nil || ib == nil {
+		return a < b
+	}
+	ia, ib = ia.To16(), ib.To16()
+	for i := range ia {
+		if ia[i] != ib[i] {
+			return ia[i] < ib[i]
+		}
+	}
+	return false
+}
+
 // formatRTT renders a round-trip time compactly: sub-millisecond as "0.4ms",
 // otherwise one decimal of milliseconds ("2.1ms"), seconds for slow hosts.
 func formatRTT(d time.Duration) string {
@@ -189,8 +207,8 @@ func mergePorts(rows []Row) []Row {
 	for _, v := range m {
 		out = append(out, v)
 	}
-	// stable order (sort by IP)
-	sort.Slice(out, func(i, j int) bool { return out[i].IP < out[j].IP })
+	// stable order (sort by IP, numerically — see IPLess)
+	sort.Slice(out, func(i, j int) bool { return IPLess(out[i].IP, out[j].IP) })
 	return out
 }
 

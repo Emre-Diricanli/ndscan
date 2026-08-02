@@ -24,11 +24,24 @@ func ExportDir(at time.Time) string {
 
 // ExportPath builds the full path for an export of the given format at time
 // `at`, creating the dated directory if needed. It returns the path to write.
+//
+// Names are second-resolution, so two exports of the same format within one
+// second would collide; the second and later get a "-2", "-3", … suffix rather
+// than silently overwriting the earlier file.
 func ExportPath(at time.Time, format string) (string, error) {
 	dir := ExportDir(at)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("ndscan-%s.%s", at.Format("150405"), format)
-	return filepath.Join(dir, name), nil
+	stamp := at.Format("150405")
+	path := filepath.Join(dir, fmt.Sprintf("ndscan-%s.%s", stamp, format))
+	// Bounded probe: give up and reuse the base name rather than spin forever
+	// if something is creating files as fast as we can test for them.
+	for n := 2; n < 1000; n++ {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			break
+		}
+		path = filepath.Join(dir, fmt.Sprintf("ndscan-%s-%d.%s", stamp, n, format))
+	}
+	return path, nil
 }
