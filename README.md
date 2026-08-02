@@ -14,8 +14,6 @@ curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.
 
 ## Features
 
-## Features
-
 - **Interactive TUI** (`ndscan` or `ndscan tui`) — form-driven scanning, live progress, table/tree views, filtering, sorting, detail inspection, and one-key exports.
 - **Powerful CLI** (`ndscan scan`) — scriptable and great for CI/automation.
 - **Table view** (`--tb` / `--view table`) — clean, compact list of hosts and open ports.
@@ -139,14 +137,18 @@ Running `ndscan` with no arguments opens a full-screen terminal UI powered by Bu
 
 - Enter targets and tweak options in a friendly form
 - Watch live host discovery and port scanning progress
-- Toggle between table and tree views on the fly
-- Filter, sort, and drill into individual hosts
+- Toggle between table and tree views on the fly (`t`)
+- Filter (`/`) and sort (`s` — by IP, hostname, open-port count, or state)
+- Press `enter` on a host to run a **Discover deep-scan** — service versions, OS detection, TLS certificate and HTTP-title details, and one-key opening of web UIs (`o`)
+- See per-host latency at a glance — RTT and a speed-tier column (`>>>` / `>>` / `>`)
+- Track changes between scans — a `Δ` column flags `NEW`/`GONE` hosts and opened/closed ports compared to the previous scan of the same targets
 - Export results instantly with single keys:
   - `e` → JSON
   - `c` → CSV
   - `m` → Markdown report
   - `h` → HTML report (opens automatically in your browser)
-- Save and load scan profiles
+- Save and load scan profiles (`ctrl+s` to save, `ctrl+p` to pick)
+- **Watch mode** (`w`) — re-scan on an interval (adjust with `+` / `-`), with optional desktop notifications (`b`) when hosts or ports change
 
 Exports are saved to `~/Downloads/ndscan/<date>/`.
 
@@ -233,6 +235,8 @@ Reports include:
 | `--concurrency`     | Max parallel host scans (default 64; auto-capped to host count) |
 | `--host-timeout`    | Per-host timeout in seconds (default 20)                         |
 
+> **Note on MAC/vendor enrichment:** ARP-based host and MAC discovery is IPv4-only, and ARP fallback only applies to literal IP/CIDR targets (e.g. `192.168.1.0/24`) — hostname targets skip it.
+
 ---
 
 ## Vendor Lookup
@@ -287,7 +291,6 @@ Format (tab or space separated):
 - `--ssh-sudo` flag for automatic sudo on jump hosts
 - Lightweight built-in port scanner for ultra-fast sweeps (no nmap dependency)
 - Service banner grabbing (SSH/HTTP)
-- Scan history and comparison
 - More export templates and theming for HTML reports
 
 ---
@@ -306,7 +309,7 @@ Some areas that would be especially helpful:
 
 ## License
 
-This project is currently unlicensed. A license will be added in a future release.
+ndscan is released under the [MIT License](LICENSE).
 
 ---
 

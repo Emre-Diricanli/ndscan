@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # ndscan one-line installer
 # Usage:
@@ -9,7 +9,7 @@
 #   INSTALL_DIR=...    # Custom install location (default: /usr/local/bin)
 #   FORCE=1            # Overwrite existing binary without prompting
 #
-set -euo pipefail
+set -eu
 
 REPO="Emre-Diricanli/ndscan"
 BINARY="ndscan"
@@ -17,10 +17,10 @@ DEFAULT_INSTALL_DIR="/usr/local/bin"
 
 # Colors (only if stdout is a tty)
 if [ -t 1 ]; then
-  GREEN=$'\033[0;32m'
-  YELLOW=$'\033[1;33m'
-  RED=$'\033[0;31m'
-  NC=$'\033[0m'
+  GREEN=$(printf '\033[0;32m')
+  YELLOW=$(printf '\033[1;33m')
+  RED=$(printf '\033[0;31m')
+  NC=$(printf '\033[0m')
 else
   GREEN=""
   YELLOW=""
@@ -69,23 +69,27 @@ if [ "$VERSION" = "latest" ]; then
   info "Resolving latest release..."
   # Follow the /latest redirect to extract the tag without hitting the API rate limit hard
   LATEST_URL=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)
-  if [ -z "$LATEST_URL" ] || [[ "$LATEST_URL" != *"tag/"* ]]; then
-    error "Could not determine latest version."
-    echo "Please check https://github.com/${REPO}/releases or specify VERSION explicitly."
-    exit 1
-  fi
+  case "$LATEST_URL" in
+    *"tag/"*) ;;
+    *)
+      error "Could not determine latest version."
+      echo "Please check https://github.com/${REPO}/releases or specify VERSION explicitly."
+      exit 1
+      ;;
+  esac
   VERSION="${LATEST_URL##*/}"   # e.g. v0.1.0
 fi
 
 # Strip leading 'v' if present for asset name construction, then re-add for download URL
-VERSION_TAG="$VERSION"
-if [[ "$VERSION" != v* ]]; then
-  VERSION_TAG="v${VERSION}"
-fi
+case "$VERSION" in
+  v*) VERSION_TAG="$VERSION" ;;
+  *)  VERSION_TAG="v${VERSION}" ;;
+esac
 
 ASSET_VERSION="${VERSION_TAG#v}"   # GoReleaser assets use 0.1.0 without the v in the filename
 TARBALL="${BINARY}_${ASSET_VERSION}_${OS}_${ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION_TAG}/${TARBALL}"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION_TAG}/checksums.txt"
 
 info "Installing ${BINARY} ${VERSION_TAG} for ${OS}/${ARCH}..."
 
@@ -93,7 +97,7 @@ TMPDIR=$(mktemp -d)
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
-# Download
+# Download the tarball and the release checksums
 if ! curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMPDIR/$TARBALL"; then
   error "Failed to download $TARBALL"
   echo
@@ -105,6 +109,42 @@ if ! curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMPDIR/$TARBALL"; then
   echo "  go install github.com/Emre-Diricanli/ndscan/cmd/ndscan@${VERSION_TAG}"
   exit 1
 fi
+
+# Verify the tarball against the release's checksums.txt (published by
+# GoReleaser, sha256). Never install an unverified binary.
+info "Verifying checksum..."
+if ! curl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/checksums.txt"; then
+  error "Failed to download checksums.txt — cannot verify the release."
+  echo "Aborting rather than installing an unverified binary."
+  exit 1
+fi
+
+EXPECTED=$(grep " ${TARBALL}\$" "$TMPDIR/checksums.txt" | awk '{print $1}')
+if [ -z "$EXPECTED" ]; then
+  error "No checksum entry for ${TARBALL} found in checksums.txt"
+  echo "Aborting rather than installing an unverified binary."
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "$TMPDIR/$TARBALL" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "$TMPDIR/$TARBALL" | awk '{print $1}')
+else
+  error "Neither sha256sum nor shasum found — cannot verify the download."
+  echo "Install coreutils (e.g. 'brew install coreutils') and try again."
+  exit 1
+fi
+
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  error "Checksum mismatch for ${TARBALL}!"
+  echo "  expected: $EXPECTED"
+  echo "  actual:   $ACTUAL"
+  echo
+  echo "Aborting — the download may be corrupted or tampered with."
+  exit 1
+fi
+info "Checksum verified (sha256)."
 
 # Extract
 tar -xzf "$TMPDIR/$TARBALL" -C "$TMPDIR"
@@ -126,11 +166,20 @@ DEST="$INSTALL_DIR/$BINARY"
 if [ -e "$DEST" ] && [ "$FORCE" != "1" ]; then
   CURRENT_VERSION="$("$DEST" --version 2>/dev/null | head -n1 || echo "unknown version")"
   warn "${BINARY} is already installed at $DEST ($CURRENT_VERSION)"
-  read -r -p "Overwrite? [y/N] " reply
-  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
-    info "Aborted. Existing binary left in place."
-    exit 0
+  # Read from the terminal, not stdin — this script is usually piped from curl.
+  if [ -e /dev/tty ]; then
+    printf "Overwrite? [y/N] " > /dev/tty
+    read -r reply < /dev/tty
+  else
+    reply=""
   fi
+  case "$reply" in
+    [Yy]) ;;
+    *)
+      info "Aborted. Existing binary left in place."
+      exit 0
+      ;;
+  esac
 fi
 
 # Install
