@@ -151,8 +151,11 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 	}
 
 	args := []string{"-oX", "-", "-Pn"}
-	// choose scan type
-	if cfg.UseSYN {
+	// Choose exactly one scan type. UDP is its own scan mode; otherwise use
+	// SYN when requested and fall back to an unprivileged TCP connect scan.
+	if cfg.Preset == "udp" {
+		args = append(args, "-sU")
+	} else if cfg.UseSYN {
 		args = append(args, "-sS")
 	} else {
 		args = append(args, "-sT")
@@ -163,7 +166,7 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 	case "default":
 		args = append(args, "-T4", "-A")
 	case "udp":
-		args = append(args, "-sU", "-T4")
+		args = append(args, "-T4")
 	case "deep":
 		args = append(args, "-T4", "-A")
 		if cfg.Ports == "" {
