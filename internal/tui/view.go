@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
@@ -25,10 +26,26 @@ func (m Model) View() string {
 	return base
 }
 
-func (m Model) header() string {
+// header renders the title bar, with a right-aligned context chip and a rule
+// beneath it so every screen starts the same way.
+func (m Model) header(context string) string {
 	title := titleStyle.Render("ndscan")
-	sub := appBar.Render(fmt.Sprintf("fast network scanner · v%s", m.version))
-	return lipgloss.JoinHorizontal(lipgloss.Center, title, sub)
+	sub := appBar.Render(fmt.Sprintf("network scanner · v%s", m.version))
+	left := lipgloss.JoinHorizontal(lipgloss.Center, title, sub)
+
+	w := m.width
+	if w == 0 {
+		w = 100
+	}
+	bar := left
+	if context != "" {
+		chip := badgeStyle.Render(context)
+		gap := w - lipgloss.Width(left) - lipgloss.Width(chip) - 2
+		if gap > 1 {
+			bar = left + strings.Repeat(" ", gap) + chip
+		}
+	}
+	return bar + "\n" + divider(w-2)
 }
 
 // overlay renders the active modal centered over dimmed base content.
@@ -83,9 +100,9 @@ func (m Model) helpPanel() string {
 		"  pgup/pgdn g G   page / jump (tree)",
 		"  enter           Discover: deep-scan the selected host",
 		"    in Discover:   r rescan · o open web services · esc back",
-		"  t               table ⇄ tree view",
+		"  t               cycle view: table · tree · map",
 		"  /               filter rows (esc clears)",
-		"  s               cycle sort: ip · host · ports · up",
+		"  s               cycle sort (in the map: scan next network)",
 		"  e / c           export JSON / CSV",
 		"  m / h           export Markdown / HTML report",
 		"  " + hintStyle.Render("                 → ~/Downloads/ndscan/<date>/"),
@@ -94,6 +111,13 @@ func (m Model) helpPanel() string {
 		"  + / -           watch interval ±15s",
 		"  r               new scan (back to form)",
 		"  q               quit",
+		"",
+		accentText.Render("Network map") + hintStyle.Render("  (t to reach it)"),
+		hintStyle.Render("  Shows every network this machine is attached to, the"),
+		hintStyle.Render("  default gateway, and the hosts found on each. Networks"),
+		hintStyle.Render("  you haven't scanned are marked — press s to scan one."),
+		hintStyle.Render("  It reads interfaces and the routing table only, so it"),
+		hintStyle.Render("  can't see subnets beyond the gateway."),
 		"",
 		hintStyle.Render("Δ column shows changes vs the previous scan of the"),
 		hintStyle.Render("same targets: NEW host, GONE host, +/-port."),
@@ -245,17 +269,28 @@ func (m Model) viewForm() string {
 		b.WriteString("\n")
 	}
 
+	section := func(name string) {
+		b.WriteString("\n  " + sectionStyle.Render(name) + "\n")
+	}
+
+	section("TARGET")
 	field(fTargets, "Targets", m.targetsIn.View(), "")
 	field(fPreset, "Preset", presetSelector(m.presetIdx), "← → to change")
 	field(fPorts, "Ports", m.portsIn.View(), "")
+
+	section("DETAIL")
 	field(fShowMac, "Show MAC", checkbox(m.showMac), "from ARP cache (no root) + nmap")
 	field(fShowVendors, "Show vendors", checkbox(m.showVend), "needs Show MAC")
+
+	section("PRIVILEGE")
 	field(fRootScan, "SYN scan", checkbox(m.rootScan), "-sS, needs root/sudo")
 	sudoHint := "thorough ARP + SYN scan via sudo"
 	if scan.IsRoot() {
 		sudoHint = "already root — not needed"
 	}
 	field(fSudo, "Use sudo", checkbox(m.sudo || scan.IsRoot()), sudoHint)
+
+	section("PERFORMANCE")
 	field(fConcurrency, "Concurrency", m.concurIn.View(), "parallel hosts")
 	field(fHostTimeout, "Host timeout", m.timeoutIn.View(), "seconds")
 
@@ -284,10 +319,17 @@ func (m Model) viewForm() string {
 		b.WriteString("\n  " + okStyle.Render("✔ "+m.notice) + "\n")
 	}
 
-	help := helpStyle.Render("tab/↑↓ move · space toggle · enter start · ctrl+s save profile · ctrl+p profiles · esc quit")
+	help := helpStyle.Render(keyHint(
+		[2]string{"tab/↑↓", "move"},
+		[2]string{"space", "toggle"},
+		[2]string{"enter", "start"},
+		[2]string{"ctrl+s", "save profile"},
+		[2]string{"ctrl+p", "profiles"},
+		[2]string{"esc", "quit"},
+	))
 
 	panel := panelStyle.Render(b.String())
-	return "\n" + m.header() + "\n\n" + panel + "\n" + help
+	return "\n" + m.header("configure") + "\n\n" + panel + "\n" + help
 }
 
 func presetSelector(active int) string {
@@ -355,37 +397,60 @@ func (m Model) viewRunning() string {
 		live = "\n" + m.tbl.View()
 	}
 
-	help := helpStyle.Render("esc cancel (keeps partial results) · ? help")
-	return "\n" + m.header() + "\n\n" + panel + live + "\n" + help
+	help := helpStyle.Render(keyHint(
+		[2]string{"esc", "cancel (keeps partial results)"},
+		[2]string{"?", "help"},
+	))
+	return "\n" + m.header("scanning") + "\n\n" + panel + live + "\n" + help
 }
 
+// progressBar renders a filled bar with a partial leading cell, so slow scans
+// still show visible movement between whole-cell steps.
 func progressBar(done, total, width int) string {
 	if total <= 0 {
 		total = 1
 	}
-	filled := done * width / total
+	if done > total {
+		done = total
+	}
+	// Work in eighths for sub-cell resolution.
+	eighths := done * width * 8 / total
+	filled := eighths / 8
 	if filled > width {
 		filled = width
 	}
-	bar := accentText.Render(strings.Repeat("█", filled)) +
-		hintStyle.Render(strings.Repeat("░", width-filled))
+	partial := ""
+	if filled < width {
+		if rem := eighths % 8; rem > 0 {
+			partial = string([]rune("▏▎▍▌▋▊▉")[rem-1])
+		}
+	}
+	empty := width - filled - lipgloss.Width(partial)
+	if empty < 0 {
+		empty = 0
+	}
+	bar := accentText.Render(strings.Repeat("█", filled)+partial) +
+		dividerStyle.Render(strings.Repeat("░", empty))
 	pct := done * 100 / total
-	return fmt.Sprintf("%s %s", bar, hintStyle.Render(fmt.Sprintf("%d%%", pct)))
+	return fmt.Sprintf("%s %s", bar, accentText.Render(fmt.Sprintf("%3d%%", pct)))
 }
 
 // ----- RESULTS VIEW -----
 
 func (m Model) viewResults() string {
 	var body string
-	if len(m.visible) == 0 {
-		if m.filterIn.Value() != "" {
-			body = warnStyle.Render("  No rows match the filter.")
-		} else {
-			body = warnStyle.Render("  No live hosts found.")
-		}
-	} else if m.view == viewTree {
+	switch {
+	// The map is meaningful even with no results: it still shows the networks
+	// this machine is attached to.
+	case m.view == viewTopology:
+		body = m.mapVP.View()
+	case len(m.visible) == 0 && m.filterIn.Value() != "":
+		body = warnStyle.Render("  No rows match the filter.")
+	case len(m.visible) == 0:
+		body = warnStyle.Render("  No live hosts found.")
+	case m.view == viewTree:
 		body = m.treeVP.View()
-	} else {
+	default:
 		body = m.tbl.View()
 	}
 
@@ -407,9 +472,9 @@ func (m Model) viewResults() string {
 		status = append(status, hintStyle.Render("filter: ")+accentText.Render(m.filterIn.Value()))
 	}
 	status = append(status, hintStyle.Render("sort: ")+accentText.Render(m.sortBy.String()))
-	// Scroll indicator for the tree view when content overflows the viewport.
-	if m.view == viewTree && len(m.visible) > 0 && (m.treeVP.TotalLineCount() > m.treeVP.Height) {
-		status = append(status, hintStyle.Render("scroll: ")+accentText.Render(fmt.Sprintf("%3.0f%%", m.treeVP.ScrollPercent()*100)))
+	// Scroll indicator when the active scrollable view overflows its viewport.
+	if vp, ok := m.activeViewport(); ok && vp.TotalLineCount() > vp.Height {
+		status = append(status, hintStyle.Render("scroll: ")+accentText.Render(fmt.Sprintf("%3.0f%%", vp.ScrollPercent()*100)))
 	}
 	if m.watch {
 		bell := "🔔"
@@ -420,14 +485,38 @@ func (m Model) viewResults() string {
 	}
 	statusLine := "  " + strings.Join(status, hintStyle.Render("  ·  "))
 
-	viewTag := "table"
-	if m.view == viewTree {
-		viewTag = "tree"
+	// The sort key is meaningless in the map, where "s" scans instead.
+	sortOrScan := [2]string{"s", "sort"}
+	if m.view == viewTopology {
+		sortOrScan = [2]string{"s", "scan next network"}
 	}
-	help := helpStyle.Render(fmt.Sprintf(
-		"enter discover · t view [%s] · / filter · s sort · e/c/m/h export · w watch · b bell · r rescan · ? help · q quit", viewTag))
+	help := helpStyle.Render(keyHint(
+		[2]string{"enter", "discover"},
+		[2]string{"t", "view [" + m.view.String() + "]"},
+		[2]string{"/", "filter"},
+		sortOrScan,
+		[2]string{"e/c/m/h", "export"},
+		[2]string{"w", "watch"},
+		[2]string{"r", "rescan"},
+		[2]string{"?", "help"},
+		[2]string{"q", "quit"},
+	))
 
-	return "\n" + m.header() + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
+	return "\n" + m.header(m.view.String()) + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
+}
+
+// activeViewport returns the scrollable viewport for the current view, if the
+// current view is a scrolling one.
+func (m Model) activeViewport() (viewport.Model, bool) {
+	switch m.view {
+	case viewTree:
+		if len(m.visible) > 0 {
+			return m.treeVP, true
+		}
+	case viewTopology:
+		return m.mapVP, true
+	}
+	return viewport.Model{}, false
 }
 
 // diffSummary aggregates the change map into one line.

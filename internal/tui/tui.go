@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"sort"
@@ -19,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/notify"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -37,7 +37,13 @@ type resultView int
 const (
 	viewTable resultView = iota
 	viewTree
+	viewTopology
+	resultViewCount
 )
+
+func (v resultView) String() string {
+	return [...]string{"table", "tree", "map"}[v]
+}
 
 // mode is a modal overlay layered on top of the current screen.
 type mode int
@@ -149,6 +155,13 @@ type Model struct {
 	// discover: a focused deep scan of a single host, shown in an overlay
 	disco discoverState
 
+	// topology: the machine's own networks, read once at startup. Passive —
+	// no probing — so the map can render before any scan has run.
+	netLocals  []netinfo.Network
+	netGateway netinfo.Gateway
+	mapVP      viewport.Model // scrollable container for the map view
+	mapRdy     bool
+
 	// watch mode
 	watch       bool
 	watchEvery  time.Duration
@@ -195,6 +208,11 @@ func New(version string) Model {
 		watchEvery:    60 * time.Second,
 		notify:        notify.Available(),
 	}
+
+	// Read the machine's own networks up front: passive, instant, and it lets
+	// the map show attached networks even before the first scan.
+	m.netLocals = netinfo.Locals()
+	m.netGateway = netinfo.DefaultGateway()
 
 	cf := config.Load()
 	m.profiles = cf.Profiles
@@ -289,6 +307,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == viewTree {
 				var cmd tea.Cmd
 				m.treeVP, cmd = m.treeVP.Update(msg)
+				return m, cmd
+			}
+			if m.view == viewTopology {
+				var cmd tea.Cmd
+				m.mapVP, cmd = m.mapVP.Update(msg)
 				return m, cmd
 			}
 			var cmd tea.Cmd
@@ -742,17 +765,26 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.notice = ""
 		return m.syncFocus()
 	case "t":
-		if m.view == viewTable {
-			m.view = viewTree
-		} else {
-			m.view = viewTable
-		}
+		m.view = (m.view + 1) % resultViewCount
+		m.rebuildTable()
 		return m, nil
 	case "/":
 		m.filterIn.Focus()
 		m.mode = modeFilter
 		return m, textinput.Blink
 	case "s":
+		// In the map, sorting is meaningless — "s" scans the first attached
+		// network that hasn't been covered yet, which is what the map offers.
+		if m.view == viewTopology {
+			if cidr, ok := m.firstUnscannedNetwork(); ok {
+				p := m.params
+				p.sshTarget = ""
+				p.targets = []string{cidr}
+				return m.startWithParams(p)
+			}
+			m.notice = "every attached network has been scanned"
+			return m, nil
+		}
 		m.sortBy = (m.sortBy + 1) % sortKeyCount
 		m.rebuildTable()
 		return m, nil
@@ -822,9 +854,13 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 	}
-	// Tree view: forward navigation keys (↑↓, j/k, PgUp/PgDn, g/G) to the
-	// scrollable viewport.
+	// Tree and map views: forward navigation keys (↑↓, j/k, PgUp/PgDn, g/G) to
+	// the active scrollable viewport.
 	var cmd tea.Cmd
+	if m.view == viewTopology {
+		m.mapVP, cmd = m.mapVP.Update(msg)
+		return m, cmd
+	}
 	m.treeVP, cmd = m.treeVP.Update(msg)
 	return m, cmd
 }
@@ -914,20 +950,9 @@ func diffBadge(d config.HostDiff) string {
 	return strings.Join(parts, " ")
 }
 
-// ipLess orders IPv4/IPv6 numerically, falling back to string compare.
-func ipLess(a, b string) bool {
-	ia, ib := net.ParseIP(a), net.ParseIP(b)
-	if ia == nil || ib == nil {
-		return a < b
-	}
-	ia, ib = ia.To16(), ib.To16()
-	for i := range ia {
-		if ia[i] != ib[i] {
-			return ia[i] < ib[i]
-		}
-	}
-	return false
-}
+// ipLess orders IPv4/IPv6 numerically, falling back to string compare. It
+// delegates to ui.IPLess so the TUI and the CLI printers sort identically.
+func ipLess(a, b string) bool { return ui.IPLess(a, b) }
 
 func (m *Model) rebuildTable() {
 	m.buildVisible()
@@ -937,18 +962,22 @@ func (m *Model) rebuildTable() {
 	add := func(title string, w int) {
 		cols = append(cols, table.Column{Title: title, Width: w})
 	}
+	// Column set is chosen so the most-asked questions — who is this, what is
+	// it running, is any of it risky — are answerable without opening a host.
 	add("IP", 16)
+	add("Host", 18)
 	if m.params.showMac {
 		add("MAC", 18)
 		add("Vendor", 14)
 	}
-	add("Up", 5)
+	add("Up", 4)
+	add("!", 3)
+	add("Ports", 24)
 	add("Latency", 9)
-	add("Speed", 10)
 	if hasDiff {
 		add("Δ", 10)
 	}
-	add("Discover", 12)
+	add("", 12) // discover affordance, header left blank
 
 	cursor := m.tbl.Cursor()
 	rows := m.tableRows(cursor)
@@ -966,7 +995,7 @@ func (m *Model) rebuildTable() {
 	st := table.DefaultStyles()
 	st.Header = st.Header.BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(accent).BorderBottom(true).Bold(true).Foreground(accentText.GetForeground())
-	st.Selected = st.Selected.Foreground(lipgloss.Color("#0b1120")).Background(accent).Bold(true)
+	st.Selected = st.Selected.Foreground(bgDark).Background(accent).Bold(true)
 	t.SetStyles(st)
 	if cursor > 0 && cursor < len(rows) {
 		t.SetCursor(cursor)
@@ -991,11 +1020,15 @@ func (m Model) tableRows(cursor int) []table.Row {
 		if rv.gone {
 			up = "✗"
 		}
-		cells := []string{r.IP}
+		name := r.Host
+		if name == "" {
+			name = r.Vendor
+		}
+		cells := []string{r.IP, dash(name)}
 		if m.params.showMac {
 			cells = append(cells, dash(r.MAC), dash(r.Vendor))
 		}
-		cells = append(cells, up, dash(r.RTT), speedTier(r.RTT))
+		cells = append(cells, up, riskGlyph(r), dash(portSummary(r)), dash(r.RTT))
 		if hasDiff {
 			cells = append(cells, rv.badge)
 		}
@@ -1009,35 +1042,24 @@ func (m Model) tableRows(cursor int) []table.Row {
 	return rows
 }
 
-// speedTier maps an RTT label ("2.1ms", "48ms", "1.50s") to a qualitative,
-// glyph-tagged tier. Returns "" when there's no latency reading.
-func speedTier(rtt string) string {
-	ms, ok := rttMillis(rtt)
-	if !ok {
+// riskGlyph renders the highest severity among a host's open ports as a single
+// compact marker for the results table.
+func riskGlyph(r ui.Row) string {
+	worst := ""
+	for _, p := range r.PortDetails {
+		if rankSeverity(p.Severity) > rankSeverity(worst) {
+			worst = p.Severity
+		}
+	}
+	switch worst {
+	case "high":
+		return "!!"
+	case "warn":
+		return "▲"
+	case "info":
+		return "·"
+	default:
 		return ""
-	}
-	switch {
-	case ms < 10:
-		return ">>> fast"
-	case ms < 80:
-		return ">>  medium"
-	default:
-		return ">   slow"
-	}
-}
-
-// rttMillis parses an RTT label back into milliseconds. Mirrors the formats
-// produced by ui.formatRTT ("0.4ms", "48ms", "1.50s").
-func rttMillis(rtt string) (float64, bool) {
-	switch {
-	case strings.HasSuffix(rtt, "ms"):
-		v, err := strconv.ParseFloat(strings.TrimSuffix(rtt, "ms"), 64)
-		return v, err == nil
-	case strings.HasSuffix(rtt, "s"):
-		v, err := strconv.ParseFloat(strings.TrimSuffix(rtt, "s"), 64)
-		return v * 1000, err == nil
-	default:
-		return 0, false
 	}
 }
 
@@ -1067,6 +1089,36 @@ func (m *Model) refreshTree() {
 		m.treeVP.Height = h
 	}
 	m.treeVP.SetContent(m.treeView())
+	m.refreshMap()
+}
+
+// refreshMap re-renders the topology map into its scrollable viewport.
+func (m *Model) refreshMap() {
+	w := m.width
+	if w == 0 {
+		w = 100
+	}
+	h := m.treeViewportHeight()
+	if !m.mapRdy {
+		m.mapVP = viewport.New(w, h)
+		m.mapRdy = true
+	} else {
+		m.mapVP.Width = w
+		m.mapVP.Height = h
+	}
+	m.mapVP.SetContent(m.topologyView())
+}
+
+// shortHostname returns this machine's hostname without any domain suffix.
+func shortHostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	if i := strings.IndexByte(h, '.'); i > 0 {
+		h = h[:i]
+	}
+	return h
 }
 
 func dash(s string) string {

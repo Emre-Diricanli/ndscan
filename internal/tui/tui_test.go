@@ -96,26 +96,6 @@ func TestFilterNarrowsRows(t *testing.T) {
 	}
 }
 
-func TestSpeedTier(t *testing.T) {
-	cases := map[string]string{
-		"":        "",
-		"2.1ms":   ">>> fast",
-		"9.9ms":   ">>> fast",
-		"10ms":    ">>  medium",
-		"48ms":    ">>  medium",
-		"80ms":    ">   slow",
-		"210ms":   ">   slow",
-		"1.50s":   ">   slow",
-		"0.4ms":   ">>> fast",
-		"garbage": "",
-	}
-	for in, want := range cases {
-		if got := speedTier(in); got != want {
-			t.Errorf("speedTier(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestDiscoverArrowFollowsCursor(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	m := resultsModel(t) // 3 live rows + 1 gone
