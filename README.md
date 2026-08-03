@@ -89,15 +89,18 @@ Make sure `$(go env GOPATH)/bin` (or `$GOBIN`) is in your `PATH`.
   - Linux: `sudo apt install nmap` / `sudo dnf install nmap` etc.
 - For best ARP/MAC/SYN scan results on local scans: use the `--sudo` flag (or run as root)
 
-### For maintainers: cutting a new release
+### For maintainers: releases and versioning
 
-Once you have [goreleaser](https://goreleaser.com/install/) installed:
+Releases are automatic: every push to `main` bumps the **patch** version (`v0.1.0` → `v0.1.1` → …), tags the commit, and publishes a GitHub Release via GoReleaser (`.github/workflows/auto-version.yml`). To merge without releasing, include `[skip release]` in the commit message.
+
+For a **minor/major** bump (a big overhaul), push the tag yourself — auto-bumping resumes from it (next commit becomes `v0.2.1`):
 
 ```bash
-make release VERSION=v0.2.0
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
 ```
 
-This will tag the repo, build binaries for macOS + Linux (amd64 + arm64), and publish them as a GitHub Release. The `install.sh` script will then be able to install that version for everyone.
+Human-pushed tags are built and published by `.github/workflows/release.yml`.
 
 ---
 
