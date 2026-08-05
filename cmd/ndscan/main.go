@@ -15,6 +15,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/update"
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
@@ -82,6 +83,18 @@ func main() {
 		Use:     "ndscan",
 		Short:   "ndscan — fast, modular network scan CLI/TUI (local or over SSH)",
 		Version: version,
+		// Offer a self-update before any real work — importantly before the
+		// TUI alt-screen starts. Silent and fast when up to date, offline, or
+		// non-interactive.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			update.MaybeUpdate(context.Background(), update.Options{
+				In:          os.Stdin,
+				Out:         os.Stderr,
+				Current:     version,
+				Interactive: ui.Interactive,
+				Exec:        update.Reexec,
+			})
+		},
 		// Bare `ndscan` launches the interactive TUI.
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return tui.Run(version)

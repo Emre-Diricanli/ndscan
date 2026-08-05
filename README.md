@@ -23,6 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.
 - **Rich reports** — `--report results.md` or `--report report.html` with exposure/risk findings.
 - **Multiple export formats** — JSON, CSV, Markdown, HTML (from both CLI and TUI).
 - **Built-in risk intelligence** — surfaces potentially dangerous open services.
+- **Self-updating** — interactive runs check for a new release (at most once an hour) and offer to update in place; downloads are sha256-verified against the release checksums.
 - **Flexible presets** — `quick`, `smart` (two-stage), `default`, `udp`, `deep` (or specify custom ports).
 - **Automatic privileged mode** — ndscan relaunches through `sudo` for complete local discovery.
 
@@ -101,6 +102,28 @@ git push origin v0.2.0
 ```
 
 Human-pushed tags are built and published by `.github/workflows/release.yml`.
+
+---
+
+## Automatic Updates
+
+When you run `ndscan` interactively, it checks (at most once an hour, cached in `~/.config/ndscan/update-check.json`) whether a newer release exists. If one does, you'll see:
+
+```
+ndscan v0.1.4 is available (you have v0.1.2). Update now? [y/N/s]
+```
+
+- `y` — downloads the new release, verifies it against the release's sha256 checksums, replaces the binary in place, and restarts into the new version with your original arguments.
+- `N` (or Enter) — skip for now; you'll be asked again on a later check.
+- `s` — skip this version permanently; you're only asked again when a newer release appears.
+
+The check never runs in scripts or pipes (non-interactive), never blocks on network failures, and the old binary is only replaced after the new one is fully downloaded and verified. If the binary lives in a root-owned directory (e.g. `/usr/local/bin`), re-run with `sudo` or use `install.sh`.
+
+To disable update checks entirely (useful for development builds, which always report `0.1.0`):
+
+```bash
+export NDSCAN_NO_UPDATE_CHECK=1
+```
 
 ---
 
