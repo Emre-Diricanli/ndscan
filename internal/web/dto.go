@@ -11,14 +11,18 @@ import (
 // internal types carry unexported fields that cannot be serialized anyway.
 
 type portDTO struct {
-	Port     int    `json:"port"`
-	Proto    string `json:"proto"`
-	Service  string `json:"service,omitempty"`
-	Product  string `json:"product,omitempty"`
-	Version  string `json:"version,omitempty"`
-	TLS      bool   `json:"tls,omitempty"`
-	Severity string `json:"severity,omitempty"`
-	Risk     string `json:"risk,omitempty"`
+	Port      int    `json:"port"`
+	Proto     string `json:"proto"`
+	Service   string `json:"service,omitempty"`
+	Product   string `json:"product,omitempty"`
+	Version   string `json:"version,omitempty"`
+	ExtraInfo string `json:"extraInfo,omitempty"`
+	CPE       string `json:"cpe,omitempty"`
+	TLS       bool   `json:"tls,omitempty"`
+	HTTPTitle string `json:"httpTitle,omitempty"`
+	Cert      string `json:"cert,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Risk      string `json:"risk,omitempty"`
 }
 
 type hostDTO struct {
@@ -61,7 +65,8 @@ func toHostDTO(r ui.Row) hostDTO {
 	for _, p := range r.PortDetails {
 		h.Ports = append(h.Ports, portDTO{
 			Port: p.Port, Proto: p.Proto, Service: p.Service,
-			Product: p.Product, Version: p.Version, TLS: p.TLS,
+			Product: p.Product, Version: p.Version, ExtraInfo: p.ExtraInfo,
+			CPE: p.CPE, TLS: p.TLS, HTTPTitle: p.HTTPTitle, Cert: p.Cert,
 			Severity: p.Severity, Risk: p.Risk,
 		})
 	}

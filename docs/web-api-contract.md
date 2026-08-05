@@ -65,6 +65,47 @@ comment every 15s so proxies don't time the stream out.
 ### `GET /api/topology`
 The current topology, same shape as `state.topology`. `null` before any scan.
 
+### `GET /api/export?format=json|csv|md|html`
+Downloads the most recently completed scan. JSON and CSV contain the same row
+data as the TUI exports; Markdown and HTML use the shared report renderer.
+Returns `409 Conflict` before a scan has completed and `400 Bad Request` for an
+unsupported format. Successful responses include a timestamped
+`Content-Disposition` filename such as `ndscan-20260805-195421.csv`.
+
+### `GET /api/history`
+Returns the previous snapshot for the current scan signature and its diff
+against the current scan. This endpoint never reads or writes history on disk;
+history is loaded, compared, and saved when a scan completes.
+
+```json
+{
+  "hasPrevious": true,
+  "previous": [{"ip":"192.168.2.1","host":"router","ports":["22/tcp ssh"]}],
+  "diff": {
+    "192.168.2.1": {"portsOpened":["443"],"portsClosed":["22"]},
+    "192.168.2.50": {"new":true},
+    "192.168.2.99": {"gone":true}
+  }
+}
+```
+
+Before the first scan, or when no prior matching scan exists, `hasPrevious` is
+false and `diff` is `{}`. `previous` is omitted in that case.
+
+### `POST /api/discover`
+Runs a focused deep scan of exactly one literal IPv4 or IPv6 address, using the
+default service/OS/scripts preset, the fixed Discover port set, and a 45-second
+per-host budget. Hostnames, CIDRs, scanner options, and arbitrary strings are
+rejected. The response is an enriched `Host`, including service versions, OS
+guess, TLS certificate summaries, and HTTP titles when detected.
+
+Request:
+```json
+{"ip":"192.168.2.50"}
+```
+
+Returns `404 Not Found` when the host produces no scan result.
+
 ## Types
 
 ### Topology
@@ -111,7 +152,7 @@ host's open ports.
   "rtt": "3.1ms",
   "up": true,
   "ports": [
-    { "port": 443, "proto": "tcp", "service": "https", "severity": "info", "risk": "..." }
+    { "port": 443, "proto": "tcp", "service": "https", "product": "nginx", "version": "1.26", "tls": true, "cert": "example — exp 2027-01-02", "httpTitle": "Admin", "severity": "info", "risk": "..." }
   ]
 }
 ```
@@ -119,7 +160,9 @@ All string fields may be empty. `ports` may be empty or absent.
 
 ## Rules
 
-- Every response is `application/json` except `/api/events` (`text/event-stream`).
+- Every response is `application/json` except `/api/events` (`text/event-stream`)
+  and successful `/api/export` downloads (the requested format's media type).
 - Errors: `{"error": "..."}` with an appropriate status code.
-- No endpoint blocks longer than a few ms except `/api/events`, which streams.
+- No endpoint blocks longer than a few ms except `/api/events`, which streams,
+  and `/api/discover`, which waits for its focused scan (up to its time budget).
 - The frontend is served from `/` as an embedded single page.

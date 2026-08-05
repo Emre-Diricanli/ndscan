@@ -8,14 +8,21 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
+	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -25,13 +32,18 @@ import (
 type Server struct {
 	version string
 
-	mu       sync.RWMutex
-	scanning bool
-	targets  []string
-	lastScan *time.Time
-	topo     *topology.Map
-	cancel   context.CancelFunc
-	watch    watchState
+	mu          sync.RWMutex
+	scanning    bool
+	targets     []string
+	lastScan    *time.Time
+	topo        *topology.Map
+	rows        []ui.Row
+	preset      string
+	previous    []config.HostSnapshot
+	diff        map[string]config.HostDiff
+	hasPrevious bool
+	cancel      context.CancelFunc
+	watch       watchState
 
 	bus *eventBus
 }
@@ -48,7 +60,10 @@ func (s *Server) Handler(addr string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/topology", s.handleTopology)
+	mux.HandleFunc("GET /api/export", s.handleExport)
+	mux.HandleFunc("GET /api/history", s.handleHistory)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
+	mux.HandleFunc("POST /api/discover", s.handleDiscover)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
 	mux.HandleFunc("POST /api/watch", s.handleWatch)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
@@ -110,6 +125,116 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toTopologyDTO(*s.topo))
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	contentTypes := map[string]string{"json": "application/json", "csv": "text/csv", "md": "text/markdown", "html": "text/html"}
+	contentType, ok := contentTypes[format]
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "format must be one of json, csv, md, html")
+		return
+	}
+	s.mu.RLock()
+	if s.lastScan == nil {
+		s.mu.RUnlock()
+		writeErr(w, http.StatusConflict, "no scan has run yet")
+		return
+	}
+	rows := append([]ui.Row(nil), s.rows...)
+	targets := append([]string(nil), s.targets...)
+	preset, generated := s.preset, *s.lastScan
+	s.mu.RUnlock()
+
+	var body []byte
+	var err error
+	switch format {
+	case "json":
+		body, err = json.MarshalIndent(rows, "", "  ")
+	case "csv":
+		var b bytes.Buffer
+		cw := csv.NewWriter(&b)
+		err = cw.Write([]string{"ip", "hostname", "mac", "vendor", "os", "up", "ports"})
+		for _, row := range rows {
+			if err == nil {
+				err = cw.Write([]string{row.IP, row.Host, row.MAC, row.Vendor, row.OS, strconv.FormatBool(row.Up), strings.Join(row.Ports, "; ")})
+			}
+		}
+		cw.Flush()
+		if err == nil {
+			err = cw.Error()
+		}
+		body = b.Bytes()
+	default:
+		rep := report.Report{Targets: strings.Join(targets, ", "), Preset: preset, Generated: generated.Format("2006-01-02 15:04:05"), Rows: rows}
+		if format == "md" {
+			body = []byte(rep.Markdown())
+		} else {
+			body = []byte(rep.HTML())
+		}
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not render export")
+		return
+	}
+	w.Header().Set("Content-Type", contentType+"; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="ndscan-%s.%s"`, generated.Format("20060102-150405"), format))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+type historyResponse struct {
+	HasPrevious bool                   `json:"hasPrevious"`
+	Previous    []config.HostSnapshot  `json:"previous,omitempty"`
+	Diff        map[string]historyDiff `json:"diff"`
+}
+
+type historyDiff struct {
+	New         bool     `json:"new,omitempty"`
+	Gone        bool     `json:"gone,omitempty"`
+	PortsOpened []string `json:"portsOpened,omitempty"`
+	PortsClosed []string `json:"portsClosed,omitempty"`
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	resp := historyResponse{HasPrevious: s.hasPrevious, Previous: append([]config.HostSnapshot(nil), s.previous...), Diff: make(map[string]historyDiff, len(s.diff))}
+	for ip, d := range s.diff {
+		resp.Diff[ip] = historyDiff{New: d.New, Gone: d.Gone, PortsOpened: d.PortsOpened, PortsClosed: d.PortsClosed}
+	}
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type discoverRequest struct {
+	IP string `json:"ip"`
+}
+
+func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	var req discoverRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if _, err := netip.ParseAddr(req.IP); err != nil {
+		writeErr(w, http.StatusBadRequest, "ip must be a literal IP address")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
+	defer cancel()
+	runner := scan.NewLocalRunner()
+	cfg := scan.Config{Preset: "default", Ports: "1-1024,1433,3306,3389,5432,5900,6379,8080,8443,9200,27017", UseSYN: scan.IsRoot(), Concurrency: 1, HostTimeout: 45 * time.Second, NeedMAC: true}
+	results, err := scan.ScanHosts(ctx, []string{req.IP}, cfg, runner)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rows := ui.BuildRows(results, nil, true, false, scan.ARPCache(ctx, runner))
+	if len(rows) == 0 {
+		writeErr(w, http.StatusNotFound, "host did not return a scan result")
+		return
+	}
+	writeJSON(w, http.StatusOK, toHostDTO(rows[0]))
 }
 
 type scanRequest struct {
@@ -207,7 +332,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		return
 	}
 	if ctx.Err() != nil {
-		s.finishScan(nil, start, true)
+		s.finishScan(nil, targets, preset, start, true)
 		return
 	}
 
@@ -241,17 +366,29 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	for _, row := range rows {
 		s.bus.publish("host", toHostDTO(row))
 	}
-	s.finishScan(rows, start, ctx.Err() != nil)
+	s.finishScan(rows, targets, preset, start, ctx.Err() != nil)
 }
 
 // finishScan stores the resulting topology and announces completion.
-func (s *Server) finishScan(rows []ui.Row, start time.Time, cancelled bool) {
+func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, start time.Time, cancelled bool) {
 	m := topology.Build(rows, netinfo.Locals(), netinfo.DefaultGateway())
 	now := time.Now()
+	cur := make([]config.HostSnapshot, 0, len(rows))
+	for _, row := range rows {
+		cur = append(cur, config.HostSnapshot{IP: row.IP, Host: row.Host, Ports: row.Ports})
+	}
+	prev := config.LoadHistory(targets, "", preset)
+	diff := config.Diff(prev, cur)
+	_ = config.SaveHistory(targets, "", preset, cur)
 
 	s.mu.Lock()
 	s.topo = &m
 	s.lastScan = &now
+	s.rows = append([]ui.Row(nil), rows...)
+	s.preset = preset
+	s.previous = append([]config.HostSnapshot(nil), prev...)
+	s.hasPrevious = prev != nil
+	s.diff = diff
 	s.mu.Unlock()
 
 	openPorts := 0
