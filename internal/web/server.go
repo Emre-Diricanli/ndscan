@@ -40,8 +40,10 @@ func NewServer(version string) *Server {
 	return &Server{version: version, bus: newEventBus()}
 }
 
-// Handler returns the HTTP routes: the JSON API plus the embedded frontend.
-func (s *Server) Handler() http.Handler {
+// Handler returns the HTTP routes: the JSON API plus the embedded frontend,
+// wrapped in the Host/Origin guard. addr is the bind address, which determines
+// which Host headers are acceptable.
+func (s *Server) Handler(addr string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/topology", s.handleTopology)
@@ -49,7 +51,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.Handle("/", frontendHandler())
-	return mux
+	return guard(mux, addr)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -112,8 +114,10 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if len(req.Targets) == 0 {
-		writeErr(w, http.StatusBadRequest, "targets must not be empty")
+	// Strict validation: only literal IPs and CIDRs reach the scan engine, so
+	// a target can never be smuggled through as a scanner flag or shell token.
+	if err := validateTargets(req.Targets); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	preset := req.Preset
@@ -258,7 +262,7 @@ func (s *Server) finishScan(rows []ui.Row, start time.Time, cancelled bool) {
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           s.Handler(),
+		Handler:           s.Handler(addr),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

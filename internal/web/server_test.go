@@ -15,11 +15,37 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
 
+// newTestServer starts a server whose guard allowlist matches its own random
+// test port, so requests from the test client look same-origin.
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(NewServer("test").Handler())
+	return startServer(t, NewServer("test"))
+}
+
+func startServer(t *testing.T, s *Server) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(nil)
+	addr := srv.Listener.Addr().String()
+	srv.Config.Handler = s.Handler(addr)
+	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// postJSON sends a same-origin JSON POST, as the browser frontend would.
+func postJSON(t *testing.T, srv *httptest.Server, path, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", srv.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func TestState_EmptyBeforeAnyScan(t *testing.T) {
@@ -65,10 +91,7 @@ func TestScan_RejectsBadRequests(t *testing.T) {
 		{"bad preset", `{"targets":["127.0.0.1"],"preset":"nope"}`, http.StatusBadRequest},
 	}
 	for _, c := range cases {
-		resp, err := http.Post(srv.URL+"/api/scan", "application/json", strings.NewReader(c.body))
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := postJSON(t, srv, "/api/scan", c.body)
 		resp.Body.Close()
 		if resp.StatusCode != c.want {
 			t.Errorf("%s: status = %d, want %d", c.name, resp.StatusCode, c.want)
@@ -78,10 +101,7 @@ func TestScan_RejectsBadRequests(t *testing.T) {
 
 func TestCancel_ConflictsWhenIdle(t *testing.T) {
 	srv := newTestServer(t)
-	resp, err := http.Post(srv.URL+"/api/cancel", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := postJSON(t, srv, "/api/cancel", "{}")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("cancel while idle = %d, want 409", resp.StatusCode)
@@ -91,14 +111,9 @@ func TestCancel_ConflictsWhenIdle(t *testing.T) {
 // A scan of loopback should run end to end and leave state populated.
 func TestScan_EndToEnd(t *testing.T) {
 	s := NewServer("test")
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
+	srv := startServer(t, s)
 
-	resp, err := http.Post(srv.URL+"/api/scan", "application/json",
-		strings.NewReader(`{"targets":["127.0.0.1"],"fast":true}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := postJSON(t, srv, "/api/scan", `{"targets":["127.0.0.1"],"fast":true}`)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("scan start = %d, want 202", resp.StatusCode)
@@ -132,19 +147,14 @@ func TestScan_EndToEnd(t *testing.T) {
 // Starting a second scan while one runs must conflict, not run both.
 func TestScan_RejectsConcurrent(t *testing.T) {
 	s := NewServer("test")
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
+	srv := startServer(t, s)
 
 	s.mu.Lock()
 	s.scanning = true
 	s.cancel = func() {}
 	s.mu.Unlock()
 
-	resp, err := http.Post(srv.URL+"/api/scan", "application/json",
-		strings.NewReader(`{"targets":["127.0.0.1"]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := postJSON(t, srv, "/api/scan", `{"targets":["127.0.0.1"]}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("concurrent scan = %d, want 409", resp.StatusCode)
@@ -154,8 +164,7 @@ func TestScan_RejectsConcurrent(t *testing.T) {
 // SSE must deliver published events in the documented framing.
 func TestEvents_StreamsPublishedEvents(t *testing.T) {
 	s := NewServer("test")
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
+	srv := startServer(t, s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
