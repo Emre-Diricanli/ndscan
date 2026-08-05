@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"net"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,17 +68,17 @@ func listen(ch <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-ch }
 }
 
-// nmapAvailable reports whether nmap can run for the given SSH target
+// nmapAvailable reports whether a scan can proceed for the given SSH target
 // ("" = locally). Remote availability is left to the SSH side to report.
+//
+// Local scans no longer require nmap: discovery and the quick-preset port scan
+// both run natively (see internal/sweep). nmap is only needed for the presets
+// that use its fingerprinting, so its absence must not block a scan outright.
 func nmapAvailable(sshTarget string) bool {
-	if sshTarget != "" {
-		return true
-	}
-	if os.Getenv("NDSCAN_NMAP_PATH") != "" {
-		return true
-	}
-	_, err := exec.LookPath("nmap")
-	return err == nil
+	// Remote: the SSH side reports its own missing-nmap error.
+	// Local: the native scanner handles discovery and quick port scans, so a
+	// missing nmap only limits the fingerprinting presets, not scanning itself.
+	return true
 }
 
 // runScan launches the scan in a background goroutine, returning the channel

@@ -420,15 +420,24 @@ func TestSettingsPersistAcrossNew(t *testing.T) {
 	}
 }
 
-func TestNmapMissingFriendlyError(t *testing.T) {
+// Local scans no longer depend on nmap: discovery and the quick-preset port
+// scan run natively. With nmap hidden, a scan must still start rather than
+// failing with an install prompt.
+func TestScanStartsWithoutNmap(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	t.Setenv("PATH", t.TempDir()) // hide nmap
 	m := New("test")
 	m.targetsIn.SetValue("127.0.0.1")
 	tm, _ := m.startScan()
-	err := tm.(Model).err
-	if err == nil || !strings.Contains(err.Error(), "brew install nmap") {
-		t.Fatalf("expected friendly nmap error, got %v", err)
+	mm := tm.(Model)
+	if mm.err != nil {
+		t.Fatalf("scan should start without nmap, got error: %v", mm.err)
+	}
+	if mm.screen != screenRunning {
+		t.Fatalf("screen = %v, want running", mm.screen)
+	}
+	if mm.cancel != nil {
+		mm.cancel()
 	}
 }
 

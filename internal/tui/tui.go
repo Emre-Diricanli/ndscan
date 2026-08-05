@@ -877,6 +877,10 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "b":
 		if !notify.Available() {
+			// No notifier on this system: force the flag off rather than
+			// leaving it on, so the indicator never claims notifications are
+			// enabled when none can ever be delivered.
+			m.notify = false
 			m.notice = "desktop notifications unavailable on this system"
 			return m, nil
 		}
