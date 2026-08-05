@@ -18,6 +18,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/update"
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
+	"github.com/Emre-Diricanli/ndscan/internal/web"
 )
 
 // version is the app version, overridable at build time via
@@ -359,8 +360,39 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().BoolVar(&flagTB, "tb", false, "alias: same as --view table (use as -tb)")
 	scanCmd.Flags().BoolVar(&flagTR, "tr", false, "alias: same as --view tree (use as -tr)")
 
+	var (
+		webAddr   string
+		webNoOpen bool
+	)
+	webCmd := &cobra.Command{
+		Use:   "web",
+		Short: "Serve the browser interface (localhost only by default)",
+		Long: `Starts a local web server exposing the network map and scan controls.
+
+It binds to 127.0.0.1 by default. ndscan is a network scanner, so a reachable
+web interface is a remotely-controllable scanner — only bind it to a wider
+address on a network you trust, and never on an untrusted one.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
+
+			if !strings.HasPrefix(webAddr, "127.0.0.1:") && !strings.HasPrefix(webAddr, "localhost:") {
+				ui.Warnf("binding to %s — the web UI can control scans from any host that can reach it", webAddr)
+			}
+			url := "http://" + webAddr
+			ui.Infof("ndscan web listening on %s", url)
+			if !webNoOpen && report.CanOpen() {
+				_ = report.Open(url)
+			}
+			return web.NewServer(version).ListenAndServe(ctx, webAddr)
+		},
+	}
+	webCmd.Flags().StringVar(&webAddr, "addr", "127.0.0.1:8080", "address to bind (loopback by default)")
+	webCmd.Flags().BoolVar(&webNoOpen, "no-open", false, "don't open a browser on start")
+
 	root.AddCommand(scanCmd)
 	root.AddCommand(tuiCmd)
+	root.AddCommand(webCmd)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

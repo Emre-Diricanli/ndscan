@@ -1,0 +1,257 @@
+package web
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
+	"github.com/Emre-Diricanli/ndscan/internal/topology"
+	"github.com/Emre-Diricanli/ndscan/internal/ui"
+)
+
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(NewServer("test").Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestState_EmptyBeforeAnyScan(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Get(srv.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var got stateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Version != "test" {
+		t.Errorf("version = %q", got.Version)
+	}
+	if got.Scanning {
+		t.Error("should not be scanning before any request")
+	}
+	// The contract says topology is null before the first scan.
+	if got.Topology != nil {
+		t.Errorf("topology should be null before a scan, got %+v", got.Topology)
+	}
+	// targets must be [] not null, so the frontend can iterate safely.
+	if got.Targets == nil {
+		t.Error("targets should be an empty array, not null")
+	}
+}
+
+func TestScan_RejectsBadRequests(t *testing.T) {
+	srv := newTestServer(t)
+	cases := []struct {
+		name, body string
+		want       int
+	}{
+		{"malformed json", `{`, http.StatusBadRequest},
+		{"no targets", `{"targets":[]}`, http.StatusBadRequest},
+		{"missing targets", `{}`, http.StatusBadRequest},
+		{"bad preset", `{"targets":["127.0.0.1"],"preset":"nope"}`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		resp, err := http.Post(srv.URL+"/api/scan", "application/json", strings.NewReader(c.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("%s: status = %d, want %d", c.name, resp.StatusCode, c.want)
+		}
+	}
+}
+
+func TestCancel_ConflictsWhenIdle(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Post(srv.URL+"/api/cancel", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("cancel while idle = %d, want 409", resp.StatusCode)
+	}
+}
+
+// A scan of loopback should run end to end and leave state populated.
+func TestScan_EndToEnd(t *testing.T) {
+	s := NewServer("test")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/api/scan", "application/json",
+		strings.NewReader(`{"targets":["127.0.0.1"],"fast":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("scan start = %d, want 202", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		done := !s.scanning && s.topo != nil
+		s.mu.RUnlock()
+		if done {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	s.mu.RLock()
+	scanning, topo, last := s.scanning, s.topo, s.lastScan
+	s.mu.RUnlock()
+	if scanning {
+		t.Fatal("scan did not finish within 60s")
+	}
+	if topo == nil {
+		t.Fatal("topology not populated after scan")
+	}
+	if last == nil {
+		t.Error("lastScan not recorded")
+	}
+}
+
+// Starting a second scan while one runs must conflict, not run both.
+func TestScan_RejectsConcurrent(t *testing.T) {
+	s := NewServer("test")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	s.mu.Lock()
+	s.scanning = true
+	s.cancel = func() {}
+	s.mu.Unlock()
+
+	resp, err := http.Post(srv.URL+"/api/scan", "application/json",
+		strings.NewReader(`{"targets":["127.0.0.1"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("concurrent scan = %d, want 409", resp.StatusCode)
+	}
+}
+
+// SSE must deliver published events in the documented framing.
+func TestEvents_StreamsPublishedEvents(t *testing.T) {
+	s := NewServer("test")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("content-type = %q, want text/event-stream", ct)
+	}
+
+	// Give the subscriber time to register before publishing.
+	time.Sleep(150 * time.Millisecond)
+	s.bus.publish("phase", map[string]any{"phase": "discover", "done": 1, "total": 2})
+
+	sawEvent, sawData := false, false
+	sc := bufio.NewScanner(resp.Body)
+	deadline := time.Now().Add(5 * time.Second)
+	for sc.Scan() && time.Now().Before(deadline) {
+		line := sc.Text()
+		if strings.HasPrefix(line, "event: phase") {
+			sawEvent = true
+		}
+		if strings.HasPrefix(line, "data: ") && strings.Contains(line, "discover") {
+			sawData = true
+		}
+		if sawEvent && sawData {
+			break
+		}
+	}
+	if !sawEvent || !sawData {
+		t.Errorf("SSE framing wrong: sawEvent=%v sawData=%v", sawEvent, sawData)
+	}
+}
+
+// A slow subscriber must never block publishing — the scan comes first.
+func TestEventBus_DoesNotBlockOnSlowSubscriber(t *testing.T) {
+	b := newEventBus()
+	id, _ := b.subscribe() // never drained
+	defer b.unsubscribe(id)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			b.publish("phase", map[string]int{"n": i})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publish blocked on a slow subscriber")
+	}
+}
+
+// The DTO conversion must match the frozen contract's field names.
+func TestToTopologyDTO_MatchesContract(t *testing.T) {
+	m := topology.Build(
+		[]ui.Row{{
+			IP: "192.168.1.1", Host: "router", Up: true, RTT: "3ms",
+			PortDetails: []ui.PortInfo{{Port: 443, Proto: "tcp", Service: "https", Severity: "info"}},
+		}},
+		[]netinfo.Network{{Interface: "en0", CIDR: "192.168.1.0/24", Addr: "192.168.1.5"}},
+		netinfo.Gateway{IP: "192.168.1.1"},
+	)
+	b, err := json.Marshal(toTopologyDTO(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(b)
+	for _, key := range []string{
+		`"gateway"`, `"segments"`, `"cidr"`, `"interface"`, `"nodes"`,
+		`"isGateway"`, `"host"`, `"ip"`, `"hostname"`, `"ports"`, `"service"`,
+	} {
+		if !strings.Contains(js, key) {
+			t.Errorf("contract key %s missing from JSON: %s", key, js)
+		}
+	}
+	// Nodes must serialize as an array, never null.
+	if strings.Contains(js, `"nodes":null`) {
+		t.Errorf("nodes must be [] not null: %s", js)
+	}
+}
+
+// The frontend route must respond even before the SPA is embedded.
+func TestFrontend_RespondsWithoutEmbeddedApp(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET / = %d, want 200", resp.StatusCode)
+	}
+}
