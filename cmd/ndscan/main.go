@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
@@ -44,6 +46,18 @@ func normalizeArgs() {
 }
 
 func main() {
+	// Only the `scan` subcommand needs elevation. --version, --help, and the
+	// interactive TUI (bare `ndscan` or `ndscan tui`) must run unprivileged —
+	// forcing sudo on those breaks the unprivileged-by-default design and makes
+	// the tool unusable without a password.
+	if wantsPrivilegedScan(os.Args[1:]) {
+		if elevated, err := ensureRoot(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		} else if elevated {
+			return
+		}
+	}
 	normalizeArgs()
 
 	var (
@@ -53,10 +67,10 @@ func main() {
 		reportOut      string
 		noOpen         bool
 		discoverOnly   bool
+		fastDiscover   bool
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
-		useSudo        bool
 		concurrency    int
 		hostTimeoutSec int
 		view           string
@@ -141,22 +155,12 @@ Otherwise, nmap runs locally.`,
 			ui.Banner(version)
 			start := time.Now()
 
-			// Elevate local scans when requested (or already root).
-			if useSudo && sshTarget == "" && !scan.IsRoot() {
-				if !scan.SudoAvailable() {
-					return fmt.Errorf("--sudo requested but sudo not found on PATH")
-				}
-				if err := scan.PrimeSudo(); err != nil {
-					return fmt.Errorf("sudo authentication failed: %w", err)
-				}
-			}
-
 			// Choose runner (local or ssh)
 			var runner scan.Runner
 			if sshTarget != "" {
 				runner = scan.NewRunner(sshTarget)
 			} else {
-				runner = scan.NewLocalRunner(useSudo && !scan.IsRoot())
+				runner = scan.NewLocalRunner()
 			}
 			where := "locally"
 			if sshTarget != "" {
@@ -174,11 +178,24 @@ Otherwise, nmap runs locally.`,
 				HostTimeout:    time.Duration(hostTimeoutSec) * time.Second,
 				DisableVendors: !(showMac && showVendors),
 				NeedMAC:        showMac,
+				BatchSize:      16,
 			}
 
 			// 1) host discovery first (runs where runner points)
 			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
-			live, err := scan.HostDiscovery(ctx, targets, runner)
+			nmapMACWorthwhile := sshTarget != "" || scan.IsRoot()
+			var live []string
+			var discoveredMACs map[string]string
+			var err error
+			switch {
+			case fastDiscover && scan.NativeDiscoverySupported(runner):
+				// Native ARP + TCP sweep: no nmap, no root, ~20x faster on a LAN.
+				live, discoveredMACs, err = scan.NativeDiscovery(ctx, targets, runner, nil)
+			case showMac && nmapMACWorthwhile:
+				live, discoveredMACs, err = scan.HostDiscoveryWithMACs(ctx, targets, runner)
+			default:
+				live, err = scan.HostDiscovery(ctx, targets, runner)
+			}
 			if err != nil {
 				sp.Fail("Host discovery failed")
 				return err
@@ -199,12 +216,9 @@ Otherwise, nmap runs locally.`,
 			if showMac {
 				sp = ui.StartSpinner("Collecting MAC addresses…")
 				macMap = map[string]string{}
-				nmapMACWorthwhile := sshTarget != "" || useSudo || scan.IsRoot()
 				if nmapMACWorthwhile {
-					if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
-						for ip, mac := range nmapMACs {
-							macMap[ip] = mac
-						}
+					for ip, mac := range discoveredMACs {
+						macMap[ip] = mac
 					}
 				}
 				for ip, mac := range arpMap {
@@ -227,7 +241,15 @@ Otherwise, nmap runs locally.`,
 					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", total, preset, done, total))
 				}
 				var err error
-				results, err = scan.ScanHosts(ctx, live, cfg, runner)
+				if fastDiscover && scan.NativePortScanViable(cfg, runner) {
+					// --fast means fast end-to-end: native connect scanning for
+					// ports too, not just discovery.
+					results = scan.NativePortScan(ctx, live, cfg, func(done, total int) {
+						sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (native)… %d/%d", total, done, total))
+					})
+				} else {
+					results, err = scan.ScanHosts(ctx, live, cfg, runner)
+				}
 				if err != nil {
 					sp.Fail("Port scan failed")
 					return err
@@ -235,6 +257,9 @@ Otherwise, nmap runs locally.`,
 				sp.Success("Port scan complete")
 				if failed := countFailed(results); failed > 0 {
 					ui.Warnf("%d host(s) failed to scan (first error: %v)", failed, firstError(results))
+				}
+				if fallback := countFallback(results); fallback > 0 {
+					ui.Warnf("SYN unavailable for %d host(s); used TCP connect fallback", fallback)
 				}
 			}
 
@@ -266,6 +291,9 @@ Otherwise, nmap runs locally.`,
 					content = rep.HTML()
 				}
 				if err := os.WriteFile(reportOut, []byte(content), 0o644); err != nil {
+					return err
+				}
+				if err := userenv.Chown(reportOut); err != nil {
 					return err
 				}
 				ui.Infof("Wrote report to %s", reportOut)
@@ -300,16 +328,16 @@ Otherwise, nmap runs locally.`,
 	}
 
 	// standard flags
-	scanCmd.Flags().StringVarP(&preset, "preset", "P", "quick", "quick|default|udp|deep")
+	scanCmd.Flags().StringVarP(&preset, "preset", "P", "quick", "quick|smart|default|udp|deep")
 	scanCmd.Flags().StringVarP(&ports, "ports", "p", "", "ports (e.g., 1-1024 or 22,80,443)")
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
 	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
 	scanCmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open HTML reports in the browser")
+	scanCmd.Flags().BoolVar(&fastDiscover, "fast", false, "native ARP+TCP host discovery (no nmap, no root) — much faster on a LAN")
 	scanCmd.Flags().BoolVar(&discoverOnly, "discover", false, "only list live hosts (skip the port scan) — fastest")
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")
 	scanCmd.Flags().BoolVar(&showVendors, "show-vendors", false, "include vendor names (requires --show-mac)")
 	scanCmd.Flags().BoolVar(&rootScan, "root-scan", false, "use SYN scan (-sS), requires root on the machine running nmap")
-	scanCmd.Flags().BoolVar(&useSudo, "sudo", false, "run local nmap via sudo for full ARP discovery, SYN scans, and MACs")
 	scanCmd.Flags().IntVar(&concurrency, "concurrency", 64, "max parallel host scans")
 	scanCmd.Flags().IntVar(&hostTimeoutSec, "host-timeout", 20, "per-host timeout seconds (nmap)")
 	scanCmd.Flags().StringVar(&view, "view", "table", "output view: table | tree")
@@ -327,11 +355,94 @@ Otherwise, nmap runs locally.`,
 	}
 }
 
+// wantsPrivilegedScan reports whether this invocation is a `scan` subcommand
+// that should relaunch as root. It scans argv directly (before Cobra parses) so
+// the decision happens before any elevation. Help and version requests never
+// qualify, and neither does the interactive TUI (bare `ndscan` or `ndscan
+// tui`), which is designed to run unprivileged.
+func wantsPrivilegedScan(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help", "-v", "--version", "help":
+			return false
+		case "--fast":
+			// Native ARP+TCP discovery is unprivileged by design. Elevating for
+			// it would defeat the point and force a password the scan does not
+			// need.
+			return false
+		}
+	}
+	// The first non-flag token is the subcommand. Only `scan` is elevated.
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a == "scan"
+	}
+	// No subcommand at all → bare `ndscan` launches the TUI, unprivileged.
+	return false
+}
+
+// ensureRoot relaunches ndscan through sudo before any CLI or TUI state is
+// created. The original home is passed explicitly so root-owned execution
+// still reads and writes the invoking user's ndscan config and exports.
+func ensureRoot() (bool, error) {
+	if scan.IsRoot() {
+		return false, nil
+	}
+	if !scan.SudoAvailable() {
+		return false, fmt.Errorf("ndscan scans require root, but sudo was not found on PATH.\n"+
+			"  Re-run as root, e.g.:  su -c 'ndscan %s'", strings.Join(os.Args[1:], " "))
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false, fmt.Errorf("locate ndscan executable: %w", err)
+	}
+	home, _ := os.UserHomeDir()
+	configDir, _ := os.UserConfigDir()
+	nmapPath, _ := exec.LookPath("nmap")
+	args := []string{"env",
+		"NDSCAN_USER_HOME=" + home,
+		"NDSCAN_USER_CONFIG_DIR=" + configDir,
+		fmt.Sprintf("NDSCAN_USER_UID=%d", os.Getuid()),
+		fmt.Sprintf("NDSCAN_USER_GID=%d", os.Getgid()),
+		"NDSCAN_NMAP_PATH=" + nmapPath,
+		"NDSCAN_ELEVATED=1",
+		exe,
+	}
+	args = append(args, os.Args[1:]...)
+	cmd := exec.Command("sudo", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		// Distinguish "couldn't authenticate" from "the scan itself failed".
+		// Without this the user sees a bare exit status and a pile of per-host
+		// failures, with no hint that the real problem was privileges.
+		return false, fmt.Errorf("ndscan scans require root, and elevating via sudo failed.\n"+
+			"  Re-run it yourself so sudo can prompt:  sudo ndscan %s\n"+
+			"  (underlying error: %w)", strings.Join(os.Args[1:], " "), err)
+	}
+	return true, nil
+}
+
 func countFailed(results []scan.HostResult) int {
 	n := 0
 	for _, r := range results {
 		if r.Err != nil {
-			n++
+			if len(r.Targets) > 0 {
+				n += len(r.Targets)
+			} else {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func countFallback(results []scan.HostResult) int {
+	n := 0
+	for _, r := range results {
+		if r.Fallback {
+			n += max(1, len(r.Targets))
 		}
 	}
 	return n
@@ -350,7 +461,7 @@ func firstError(results []scan.HostResult) error {
 // Unknown values used to fall through to a default, silently producing a scan
 // the user didn't ask for, so both are validated up front.
 var (
-	validPresets = []string{"quick", "default", "udp", "deep"}
+	validPresets = []string{"quick", "smart", "default", "udp", "deep"}
 	validViews   = []string{"table", "tree"}
 )
 

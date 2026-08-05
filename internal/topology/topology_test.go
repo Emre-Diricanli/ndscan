@@ -96,6 +96,57 @@ func TestBuild_OrphansGroupedBySubnet(t *testing.T) {
 	}
 }
 
+// Hosts on a sibling VLAN (reached through the gateway) must be tagged with the
+// gateway they transited, and must not be treated as attached.
+func TestBuild_RoutedSubnetTaggedViaGateway(t *testing.T) {
+	rows := []ui.Row{
+		row("192.168.1.10"),   // on the attached LAN
+		row("192.168.100.50"), // sibling VLAN, reached via the gateway
+		row("192.168.100.60"),
+	}
+	gw := netinfo.Gateway{IP: "192.168.1.1", Interface: "en0"}
+	m := Build(rows, homeLAN, gw)
+
+	var attached, routed *Segment
+	for i := range m.Segments {
+		switch m.Segments[i].CIDR {
+		case "192.168.1.0/24":
+			attached = &m.Segments[i]
+		case "192.168.100.0/24":
+			routed = &m.Segments[i]
+		}
+	}
+	if attached == nil || !attached.Attached() {
+		t.Fatalf("192.168.1.0/24 should be attached: %+v", attached)
+	}
+	if attached.RoutedVia != "" {
+		t.Errorf("attached network must not be RoutedVia: %q", attached.RoutedVia)
+	}
+	if routed == nil {
+		t.Fatalf("192.168.100.0/24 routed segment missing: %+v", m.Segments)
+	}
+	if routed.Attached() {
+		t.Errorf("routed VLAN must not report Attached()")
+	}
+	if routed.RoutedVia != "192.168.1.1" {
+		t.Errorf("routed VLAN RoutedVia = %q, want 192.168.1.1", routed.RoutedVia)
+	}
+	if routed.HostCount() != 2 {
+		t.Errorf("routed VLAN host count = %d, want 2", routed.HostCount())
+	}
+}
+
+// Without a known gateway, routed hosts still segment but carry no via label
+// (we can't claim a path we don't know).
+func TestBuild_RoutedWithoutGatewayHasNoVia(t *testing.T) {
+	m := Build([]ui.Row{row("10.9.9.9")}, homeLAN, netinfo.Gateway{})
+	for i := range m.Segments {
+		if m.Segments[i].CIDR == "10.9.9.0/24" && m.Segments[i].RoutedVia != "" {
+			t.Errorf("no gateway known, but RoutedVia = %q", m.Segments[i].RoutedVia)
+		}
+	}
+}
+
 func TestBuild_SeverityRollup(t *testing.T) {
 	rows := []ui.Row{
 		row("192.168.1.10", ui.PortInfo{Port: 22, Severity: "info"}, ui.PortInfo{Port: 23, Severity: "high"}),

@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,12 @@ type Config struct {
 	HostTimeout    time.Duration
 	DisableVendors bool
 	NeedMAC        bool
+	// BatchSize groups targets into one nmap process. Values <=1 preserve the
+	// original one-process-per-host behavior.
+	BatchSize int
+	// DiscardResults avoids retaining raw XML after OnResult has consumed it.
+	// Streaming TUI scans use this to bound memory on large/deep scans.
+	DiscardResults bool
 	// Progress, if set, is called after each host finishes scanning.
 	// It may be invoked from multiple goroutines.
 	Progress func(done, total int)
@@ -30,15 +37,17 @@ type Config struct {
 
 type HostResult struct {
 	IP       string
-	XMLBytes []byte // raw nmap xml for this host
+	Targets  []string // all targets represented when this is a batched result
+	XMLBytes []byte   // raw nmap xml for this host
 	Err      error
+	Fallback bool // requested SYN scan retried as TCP connect
 }
 
 // HostDiscovery uses 'nmap -sn -oG -' to find live hosts quickly, via the provided runner (local or ssh).
 func HostDiscovery(ctx context.Context, targets []string, runner Runner) ([]string, error) {
 	// Ensure nmap exists on the runner side (local: LookPath; ssh: rely on remote)
 	if _, ok := runner.(LocalRunner); ok {
-		if _, err := exec.LookPath("nmap"); err != nil {
+		if _, err := nmapExecutable(); err != nil {
 			return nil, errors.New("nmap not found in PATH")
 		}
 	}
@@ -63,25 +72,31 @@ func HostDiscovery(ctx context.Context, targets []string, runner Runner) ([]stri
 	return live, nil
 }
 
-// DiscoverMACs runs a lightweight discovery in XML and extracts IP->MAC pairs (same L2 only).
-func DiscoverMACs(ctx context.Context, targets []string, runner Runner) (map[string]string, error) {
+// HostDiscoveryWithMACs performs one XML discovery sweep and returns both live
+// hosts and any L2 MAC addresses nmap observed. It avoids a duplicate sweep
+// when privileged or remote scans request MAC data.
+func HostDiscoveryWithMACs(ctx context.Context, targets []string, runner Runner) ([]string, map[string]string, error) {
 	if _, ok := runner.(LocalRunner); ok {
-		if _, err := exec.LookPath("nmap"); err != nil {
-			return nil, errors.New("nmap not found in PATH")
+		if _, err := nmapExecutable(); err != nil {
+			return nil, nil, errors.New("nmap not found in PATH")
 		}
 	}
 	args := []string{"-sn", "-oX", "-"}
 	args = append(args, targets...)
 	xmlOut, err := runner.Run(ctx, "nmap", args...)
 	if err != nil {
-		return nil, fmt.Errorf("mac discovery failed: %w", err)
+		return nil, nil, fmt.Errorf("host discovery failed: %w", err)
 	}
 	nr, err := ParseOne(xmlOut)
 	if err != nil {
-		return nil, fmt.Errorf("mac discovery parse: %w", err)
+		return nil, nil, fmt.Errorf("host discovery parse: %w", err)
 	}
-	m := make(map[string]string, len(nr.Hosts))
+	live := make([]string, 0, len(nr.Hosts))
+	macs := make(map[string]string)
 	for _, h := range nr.Hosts {
+		if h.Status.State != "up" {
+			continue
+		}
 		var ip, mac string
 		for _, a := range h.Addresses {
 			switch a.AddrType {
@@ -91,39 +106,77 @@ func DiscoverMACs(ctx context.Context, targets []string, runner Runner) (map[str
 				mac = a.Addr
 			}
 		}
-		if ip != "" && mac != "" {
-			m[ip] = mac
+		if ip != "" {
+			live = append(live, ip)
+			if mac != "" {
+				macs[ip] = mac
+			}
 		}
 	}
-	return m, nil
+	return live, macs, nil
+}
+
+// DiscoverMACs runs a lightweight discovery in XML and extracts IP->MAC pairs (same L2 only).
+func DiscoverMACs(ctx context.Context, targets []string, runner Runner) (map[string]string, error) {
+	_, macs, err := HostDiscoveryWithMACs(ctx, targets, runner)
+	if err != nil {
+		return nil, fmt.Errorf("mac discovery: %w", err)
+	}
+	return macs, nil
 }
 
 func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([]HostResult, error) {
 	if len(live) == 0 {
 		return nil, nil
 	}
-	sem := make(chan struct{}, effectiveConcurrency(cfg.Concurrency, len(live)))
+	batchSize := cfg.BatchSize
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	var batches [][]string
+	for start := 0; start < len(live); start += batchSize {
+		end := min(start+batchSize, len(live))
+		batches = append(batches, live[start:end])
+	}
+	processes := (cfg.Concurrency + batchSize - 1) / batchSize
+	sem := make(chan struct{}, effectiveConcurrency(processes, len(batches)))
 	var wg sync.WaitGroup
-	res := make([]HostResult, len(live))
+	res := make([]HostResult, len(batches))
 	var done int32
 
-	for i, ip := range live {
+	for i, hosts := range batches {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(i int, host string) {
+		go func(i int, hosts []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			xml, err := scanOne(ctx, host, cfg, runner)
-			res[i] = HostResult{IP: host, XMLBytes: xml, Err: err}
+			xml, err := scanMany(ctx, hosts, cfg, runner)
+			fallbackUsed := false
+			// Some macOS configurations deny BPF/raw Ethernet handles even to
+			// an elevated Homebrew nmap. Preserve useful results by retrying a
+			// requested SYN scan as TCP connect; UDP has no equivalent fallback.
+			if err != nil && cfg.UseSYN && rawSocketDenied(err) {
+				fallback := cfg
+				fallback.UseSYN = false
+				xml, err = scanMany(ctx, hosts, fallback, runner)
+				fallbackUsed = err == nil
+			}
+			result := HostResult{IP: hosts[0], Targets: append([]string(nil), hosts...), XMLBytes: xml, Err: err, Fallback: fallbackUsed}
+			if !cfg.DiscardResults {
+				res[i] = result
+			}
 			if cfg.OnResult != nil {
-				cfg.OnResult(res[i])
+				cfg.OnResult(result)
 			}
 			if cfg.Progress != nil {
-				cfg.Progress(int(atomic.AddInt32(&done, 1)), len(live))
+				cfg.Progress(int(atomic.AddInt32(&done, int32(len(hosts)))), len(live))
 			}
-		}(i, ip)
+		}(i, hosts)
 	}
 	wg.Wait()
+	if cfg.DiscardResults {
+		return nil, nil
+	}
 	return res, nil
 }
 
@@ -143,9 +196,53 @@ func HostsUpResults(ips []string) []HostResult {
 }
 
 func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte, error) {
+	return scanMany(ctx, []string{ip}, cfg, runner)
+}
+
+func scanMany(ctx context.Context, targets []string, cfg Config, runner Runner) ([]byte, error) {
+	if cfg.Preset == "smart" {
+		quick := cfg
+		quick.Preset = "quick"
+		first, err := scanManyRaw(ctx, targets, quick, runner)
+		if err != nil {
+			return nil, err
+		}
+		nr, err := ParseOne(first)
+		if err != nil {
+			return nil, err
+		}
+		open := map[int]bool{}
+		for _, host := range nr.Hosts {
+			for _, port := range host.Ports.List {
+				if port.State.State == "open" {
+					open[port.PortID] = true
+				}
+			}
+		}
+		if len(open) == 0 {
+			return first, nil
+		}
+		ports := make([]int, 0, len(open))
+		for port := range open {
+			ports = append(ports, port)
+		}
+		sort.Ints(ports)
+		labels := make([]string, len(ports))
+		for i, port := range ports {
+			labels[i] = strconv.Itoa(port)
+		}
+		detail := cfg
+		detail.Preset = "default"
+		detail.Ports = strings.Join(labels, ",")
+		return scanManyRaw(ctx, targets, detail, runner)
+	}
+	return scanManyRaw(ctx, targets, cfg, runner)
+}
+
+func scanManyRaw(ctx context.Context, targets []string, cfg Config, runner Runner) ([]byte, error) {
 	// Local runner sanity check for nmap availability
 	if _, ok := runner.(LocalRunner); ok {
-		if _, err := exec.LookPath("nmap"); err != nil {
+		if _, err := nmapExecutable(); err != nil {
 			return nil, errors.New("nmap not found")
 		}
 	}
@@ -200,8 +297,14 @@ func scanOne(ctx context.Context, ip string, cfg Config, runner Runner) ([]byte,
 		args = append(args, "--max-retries", "0", "--min-rate", "1000")
 	}
 
-	args = append(args, ip)
+	args = append(args, targets...)
 	return runner.Run(ctx, "nmap", args...)
+}
+
+func rawSocketDenied(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "operation not permitted") &&
+		(strings.Contains(s, "raw socket") || strings.Contains(s, "eth handle") || strings.Contains(s, "dnet"))
 }
 
 func max(a, b int) int {

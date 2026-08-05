@@ -50,7 +50,6 @@ func (m *Model) runDiscover(ip string) tea.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	m.disco.cancel = cancel
 
-	sudo := m.sudo
 	sshTarget := m.params.sshTarget
 
 	return func() tea.Msg {
@@ -61,7 +60,7 @@ func (m *Model) runDiscover(ip string) tea.Cmd {
 		if sshTarget != "" {
 			runner = scan.NewRunner(sshTarget)
 		} else {
-			runner = scan.NewLocalRunner(sudo)
+			runner = scan.NewLocalRunner()
 		}
 
 		// "default" preset gives -A (service versions, OS, default scripts,
@@ -71,7 +70,7 @@ func (m *Model) runDiscover(ip string) tea.Cmd {
 		cfg := scan.Config{
 			Preset:      "default",
 			Ports:       "1-1024,1433,3306,3389,5432,5900,6379,8080,8443,9200,27017",
-			UseSYN:      sudo || scan.IsRoot(),
+			UseSYN:      scan.IsRoot(),
 			Concurrency: 1,
 			HostTimeout: 45 * time.Second,
 			NeedMAC:     true,
@@ -172,7 +171,7 @@ func (m Model) discoverPanel() string {
 	if len(r.PortDetails) >= saturated {
 		b.WriteString("\n  " + warnStyle.Render(fmt.Sprintf("⚠ %d ports report open", len(r.PortDetails))) + "\n")
 		b.WriteString("  " + hintStyle.Render("this host SYN-ACKs every port (a firewall/tarpit) —") + "\n")
-		b.WriteString("  " + hintStyle.Render("the \"open\" ports aren't real services. Try a SYN scan with sudo.") + "\n")
+		b.WriteString("  " + hintStyle.Render("the \"open\" ports aren't real services. Try enabling SYN scan.") + "\n")
 		b.WriteString("\n  " + hintStyle.Render("r rescan · esc back"))
 		return discoverBox(b.String())
 	}

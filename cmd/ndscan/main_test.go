@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+func TestWantsPrivilegedScan(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"bare TUI", nil, false},
+		{"tui subcommand", []string{"tui"}, false},
+		{"version flag", []string{"--version"}, false},
+		{"version short", []string{"-v"}, false},
+		{"help flag", []string{"--help"}, false},
+		{"help subcommand", []string{"help"}, false},
+		{"scan help does not elevate", []string{"scan", "--help"}, false},
+		{"plain scan elevates", []string{"scan", "192.168.1.0/24"}, true},
+		// --fast is native ARP+TCP discovery: unprivileged by design, so it must
+		// never trigger a sudo relaunch.
+		{"fast scan stays unprivileged", []string{"scan", "192.168.1.0/24", "--fast"}, false},
+		{"fast flag before target", []string{"scan", "--fast", "10.0.0.0/24"}, false},
+		{"scan with flags before target", []string{"scan", "-tb", "10.0.0.0/24"}, true},
+		{"unknown subcommand does not elevate", []string{"completion"}, false},
+	}
+	for _, c := range cases {
+		if got := wantsPrivilegedScan(c.args); got != c.want {
+			t.Errorf("%s: wantsPrivilegedScan(%v) = %v, want %v", c.name, c.args, got, c.want)
+		}
+	}
+}
+
 func TestLooksLikeSSHTarget(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -65,7 +93,7 @@ func TestNormalizeArgs_LeavesOtherArgsAlone(t *testing.T) {
 }
 
 func TestValidatePreset(t *testing.T) {
-	for _, ok := range []string{"quick", "default", "udp", "deep"} {
+	for _, ok := range []string{"quick", "smart", "default", "udp", "deep"} {
 		if err := validatePreset(ok); err != nil {
 			t.Errorf("validatePreset(%q) = %v, want nil", ok, err)
 		}

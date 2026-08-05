@@ -9,7 +9,7 @@
 package topology
 
 import (
-	"net"
+	"net/netip"
 	"sort"
 
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
@@ -22,6 +22,7 @@ type Node struct {
 	IsGateway bool // the default next hop
 	IsSelf    bool // this machine
 	Severity  string
+	addr      netip.Addr
 }
 
 // Segment is one network, with the hosts found on it.
@@ -31,7 +32,16 @@ type Segment struct {
 	SelfAddr   string // this machine's address on it, if any
 	Nodes      []Node
 	NotScanned bool // attached to this network, but no scan covered it
+	// RoutedVia is set on segments this machine is NOT attached to but reached
+	// through the gateway (a sibling VLAN, a remote SSH scan). It holds the
+	// gateway IP the traffic transited, so the map can show the segment nested
+	// under the gateway rather than as a peer of an attached network.
+	RoutedVia string
 }
+
+// Attached reports whether this machine has an interface on the segment.
+// Routed and orphan segments are not attached.
+func (s Segment) Attached() bool { return s.Interface != "" }
 
 // Map is the full topology.
 type Map struct {
@@ -47,14 +57,26 @@ func (s Segment) HostCount() int { return len(s.Nodes) }
 
 // worstSeverity returns the highest-ranked severity among a row's open ports.
 func worstSeverity(r ui.Row) string {
-	rank := map[string]int{"": 0, "info": 1, "warn": 2, "high": 3}
 	worst := ""
 	for _, p := range r.PortDetails {
-		if rank[p.Severity] > rank[worst] {
+		if severityRank(p.Severity) > severityRank(worst) {
 			worst = p.Severity
 		}
 	}
 	return worst
+}
+
+func severityRank(s string) int {
+	switch s {
+	case "high":
+		return 3
+	case "warn":
+		return 2
+	case "info":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // Build assembles the map from scan rows plus the machine's own networks.
@@ -63,7 +85,7 @@ func worstSeverity(r ui.Row) string {
 // netinfo here) keeps Build pure and testable.
 func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map {
 	type seg struct {
-		net   *net.IPNet
+		net   netip.Prefix
 		index int
 	}
 
@@ -72,7 +94,7 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 
 	// Seed one segment per attached network, in interface order.
 	for _, l := range locals {
-		_, ipnet, err := net.ParseCIDR(l.CIDR)
+		ipnet, err := netip.ParsePrefix(l.CIDR)
 		if err != nil {
 			continue
 		}
@@ -88,14 +110,15 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 
 	// Place each scanned host into the first network that contains it.
 	for _, r := range rows {
-		ip := net.ParseIP(r.IP)
+		ip, ipOK := netip.ParseAddr(r.IP)
 		node := Node{
 			Row:       r,
 			Severity:  worstSeverity(r),
 			IsGateway: gateway.IP != "" && r.IP == gateway.IP,
+			addr:      ip,
 		}
 		placed := false
-		if ip != nil {
+		if ipOK == nil {
 			for _, p := range parsed {
 				if !p.net.Contains(ip) {
 					continue
@@ -114,9 +137,17 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 	}
 
 	// Group orphans into synthetic segments by /24 so a remote scan still
-	// renders as a network rather than a flat list.
+	// renders as a network rather than a flat list. Hosts outside every
+	// attached network were reached through the gateway, so tag the resulting
+	// segments as routed-via that gateway (when we know it) — this is what
+	// lets the map draw them nested under the gateway rather than as peers of
+	// the local LAN.
 	if len(m.Orphans) > 0 {
-		m.Segments = append(m.Segments, orphanSegments(m.Orphans)...)
+		routed := orphanSegments(m.Orphans)
+		for i := range routed {
+			routed[i].RoutedVia = gateway.IP
+		}
+		m.Segments = append(m.Segments, routed...)
 		m.Orphans = nil
 	}
 
@@ -131,10 +162,10 @@ func orphanSegments(orphans []Node) []Segment {
 	byNet := map[string][]Node{}
 	var order []string
 	for _, n := range orphans {
-		ip := net.ParseIP(n.Row.IP)
+		ip, err := netip.ParseAddr(n.Row.IP)
 		key := "unknown"
-		if v4 := ip.To4(); v4 != nil {
-			key = v4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+		if err == nil && ip.Is4() {
+			key = netip.PrefixFrom(ip, 24).Masked().String()
 		}
 		if _, seen := byNet[key]; !seen {
 			order = append(order, key)
@@ -155,6 +186,9 @@ func sortNodes(nodes []Node) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		if nodes[i].IsGateway != nodes[j].IsGateway {
 			return nodes[i].IsGateway
+		}
+		if nodes[i].addr.IsValid() && nodes[j].addr.IsValid() {
+			return nodes[i].addr.Compare(nodes[j].addr) < 0
 		}
 		return ui.IPLess(nodes[i].Row.IP, nodes[j].Row.IP)
 	})

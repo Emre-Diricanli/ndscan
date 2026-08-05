@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +19,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/notify"
-	"github.com/Emre-Diricanli/ndscan/internal/scan"
+	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
 
@@ -72,7 +71,7 @@ func (s sortKey) String() string {
 	return [...]string{"ip", "host", "ports", "up"}[s]
 }
 
-var presets = []string{"quick", "default", "udp", "deep"}
+var presets = []string{"quick", "default", "udp", "deep", "smart"}
 
 // form field indices
 const (
@@ -82,7 +81,6 @@ const (
 	fShowMac
 	fShowVendors
 	fRootScan
-	fSudo
 	fConcurrency
 	fHostTimeout
 	fStart
@@ -91,13 +89,24 @@ const (
 
 // rowView pairs a result row with its change badge for display.
 type rowView struct {
-	row   ui.Row
-	diff  config.HostDiff
-	gone  bool
-	badge string
+	row        ui.Row
+	diff       config.HostDiff
+	gone       bool
+	badge      string
+	searchText string
+	risk       string
+	ports      string
+}
+
+type rowDerived struct {
+	searchText string
+	risk       string
+	ports      string
 }
 
 type watchTickMsg struct{ gen int }
+
+type renderTickMsg struct{}
 
 // notifyDoneMsg is returned after a desktop notification attempt completes.
 type notifyDoneMsg struct{}
@@ -123,7 +132,6 @@ type Model struct {
 	showMac   bool
 	showVend  bool
 	rootScan  bool
-	sudo      bool
 
 	// profiles
 	profiles      []config.Profile
@@ -131,26 +139,32 @@ type Model struct {
 	profileNameIn textinput.Model
 
 	// running state
-	spin       spinner.Model
-	phase      string
-	phaseDone  int
-	phaseTotal int
-	events     <-chan tea.Msg
-	cancel     context.CancelFunc
-	params     scanParams
+	spin            spinner.Model
+	phase           string
+	phaseDone       int
+	phaseTotal      int
+	events          <-chan tea.Msg
+	cancel          context.CancelFunc
+	params          scanParams
+	pendingRows     []ui.Row
+	renderScheduled bool
 
 	// results
-	rows     []ui.Row // authoritative rows (streamed during run, final on done)
-	diff     map[string]config.HostDiff
-	visible  []rowView // rows after filter/sort, aligned with table cursor
-	view     resultView
-	tbl      table.Model
-	treeVP   viewport.Model // scrollable container for the tree view
-	treeRdy  bool           // treeVP has been sized at least once
-	summary  string
-	failed   int
-	filterIn textinput.Model
-	sortBy   sortKey
+	rows      []ui.Row // authoritative rows (streamed during run, final on done)
+	diff      map[string]config.HostDiff
+	visible   []rowView // rows after filter/sort, aligned with table cursor
+	derived   map[string]rowDerived
+	view      resultView
+	tbl       table.Model
+	treeVP    viewport.Model // scrollable container for the tree view
+	treeRdy   bool           // treeVP has been sized at least once
+	treeDirty bool
+	summary   string
+	timing    string
+	scanError string
+	failed    int
+	filterIn  textinput.Model
+	sortBy    sortKey
 
 	// discover: a focused deep scan of a single host, shown in an overlay
 	disco discoverState
@@ -161,6 +175,8 @@ type Model struct {
 	netGateway netinfo.Gateway
 	mapVP      viewport.Model // scrollable container for the map view
 	mapRdy     bool
+	mapDirty   bool
+	topology   topology.Map
 
 	// watch mode
 	watch       bool
@@ -169,6 +185,7 @@ type Model struct {
 	watchGen    int
 	notify      bool // desktop notifications on watch-mode changes
 	watchRescan bool // the in-flight scan was triggered by a watch tick
+	routedSweep bool // the in-flight scan is a sibling-subnet sweep
 }
 
 // New constructs the initial model, restoring saved settings when present.
@@ -207,6 +224,8 @@ func New(version string) Model {
 		filterIn:      fl,
 		watchEvery:    60 * time.Second,
 		notify:        notify.Available(),
+		treeDirty:     true,
+		mapDirty:      true,
 	}
 
 	// Read the machine's own networks up front: passive, instant, and it lets
@@ -233,7 +252,6 @@ func (m Model) currentSettings() config.Settings {
 		ShowMac:     m.showMac,
 		ShowVendors: m.showVend,
 		RootScan:    m.rootScan,
-		Sudo:        m.sudo,
 		Concurrency: m.concurIn.Value(),
 		HostTimeout: m.timeoutIn.Value(),
 	}
@@ -252,7 +270,6 @@ func (m *Model) applySettings(s config.Settings) {
 	m.showMac = s.ShowMac
 	m.showVend = s.ShowVendors
 	m.rootScan = s.RootScan
-	m.sudo = s.Sudo
 	for i, p := range presets {
 		if p == s.Preset {
 			m.presetIdx = i
@@ -277,6 +294,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		if m.screen == screenResults || m.screen == screenRunning {
 			m.rebuildTable()
+			m.refreshActiveView()
 		}
 		return m, nil
 
@@ -332,14 +350,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listen(m.events)
 
 	case hostRowMsg:
-		m.rows = append(m.rows, msg.rows...)
-		m.rebuildTable()
-		return m, listen(m.events)
+		m.pendingRows = append(m.pendingRows, msg.rows...)
+		var cmds []tea.Cmd
+		cmds = append(cmds, listen(m.events))
+		if !m.renderScheduled {
+			m.renderScheduled = true
+			cmds = append(cmds, tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg { return renderTickMsg{} }))
+		}
+		return m, tea.Batch(cmds...)
+
+	case renderTickMsg:
+		m.renderScheduled = false
+		if len(m.pendingRows) > 0 && m.screen == screenRunning {
+			m.rows = append(m.rows, m.pendingRows...)
+			m.derived = nil
+			m.pendingRows = nil
+			m.rebuildTable()
+		}
+		return m, nil
 
 	case doneMsg:
 		m.screen = screenResults
 		m.cancel = nil
 		m.rows = msg.rows
+		m.derived = nil
+		m.pendingRows = nil
+		m.renderScheduled = false
 		m.diff = msg.diff
 		m.failed = msg.failed
 		hostsUp, openPorts := 0, 0
@@ -352,7 +388,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.summary = fmt.Sprintf("%d host(s) up · %d port(s) open · %s in %s",
 			hostsUp, openPorts, map[bool]string{true: "cancelled", false: "done"}[msg.cancelled],
 			msg.elapsed.Round(10*time.Millisecond))
+		m.timing = fmt.Sprintf("discover %s · enrich %s · ports %s",
+			msg.timings.discovery.Round(10*time.Millisecond),
+			msg.timings.enrichment.Round(10*time.Millisecond),
+			msg.timings.ports.Round(10*time.Millisecond))
+		if msg.firstErr != nil {
+			m.scanError = compactScanError(msg.firstErr.Error())
+		} else {
+			m.scanError = ""
+		}
+		if msg.fallbacks > 0 {
+			m.notice = fmt.Sprintf("SYN unavailable for %d host(s); used TCP connect fallback", msg.fallbacks)
+		}
 		m.rebuildTable()
+		m.refreshActiveView()
 
 		var cmds []tea.Cmd
 		// On a watch-mode rescan, alert on any change via desktop notification.
@@ -362,6 +411,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.watchRescan = false
+
+		// After a sibling-subnet sweep, land on the map and report honestly
+		// whether any routed hosts turned up — silence usually means VLAN
+		// isolation, not a bug.
+		if m.routedSweep {
+			m.routedSweep = false
+			if !msg.cancelled {
+				m.view = viewTopology
+				m.mapDirty = true
+				m.rebuildTable()
+				m.refreshActiveView()
+				if n := m.routedHostCount(); n > 0 {
+					m.notice = fmt.Sprintf("found %d host(s) on routed subnet(s)", n)
+				} else {
+					m.notice = "no routed subnets responded (VLAN isolation, or none exist)"
+				}
+			}
+		}
 		if m.watch {
 			m.watchLeft = int(m.watchEvery.Seconds())
 			cmds = append(cmds, m.watchTick())
@@ -373,16 +440,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenForm
 		m.cancel = nil
 		m.watch = false
-		return m, nil
-
-	case sudoPrimedMsg:
-		if msg.err != nil {
-			m.sudo = false
-			m.err = fmt.Errorf("sudo authentication failed")
-		} else {
-			m.sudo = true
-			m.notice = "sudo enabled — thorough ARP/SYN scans active"
-		}
 		return m, nil
 
 	case watchTickMsg:
@@ -579,8 +636,6 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case fRootScan:
 			m.rootScan = !m.rootScan
 			return m, nil
-		case fSudo:
-			return m.toggleSudo()
 		}
 	case "enter":
 		switch m.focus {
@@ -596,8 +651,6 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case fRootScan:
 			m.rootScan = !m.rootScan
 			return m, nil
-		case fSudo:
-			return m.toggleSudo()
 		case fStart:
 			return m.startScan()
 		default:
@@ -618,38 +671,6 @@ func (m Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.timeoutIn, cmd = m.timeoutIn.Update(msg)
 	}
 	return m, cmd
-}
-
-// sudoPrimedMsg reports the result of an interactive sudo authentication.
-type sudoPrimedMsg struct{ err error }
-
-// toggleSudo flips the sudo flag. Turning it on when sudo isn't already
-// authenticated suspends the TUI to run an interactive `sudo -v` on the real
-// terminal (the only place a password prompt is visible), then resumes.
-func (m Model) toggleSudo() (tea.Model, tea.Cmd) {
-	if scan.IsRoot() {
-		m.sudo = false
-		m.notice = "already running as root — sudo not needed"
-		return m, nil
-	}
-	if m.sudo {
-		m.sudo = false
-		return m, nil
-	}
-	if !scan.SudoAvailable() {
-		m.err = fmt.Errorf("sudo not found on PATH")
-		return m, nil
-	}
-	if scan.SudoPrimed() {
-		m.sudo = true
-		return m, nil
-	}
-	// suspend alt-screen, prompt for the password, resume
-	prime := exec.Command("sudo", "-v")
-	prime.Stdin, prime.Stdout, prime.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return m, tea.ExecProcess(prime, func(err error) tea.Msg {
-		return sudoPrimedMsg{err: err}
-	})
 }
 
 func (m Model) focusIsTextField() bool {
@@ -712,7 +733,6 @@ func (m Model) startScan() (tea.Model, tea.Cmd) {
 		showMac:     m.showMac,
 		showVendors: m.showVend,
 		rootScan:    m.rootScan,
-		sudo:        m.sudo,
 		concurrency: concur,
 		hostTimeout: time.Duration(tmo) * time.Second,
 	})
@@ -722,14 +742,40 @@ func (m Model) startScan() (tea.Model, tea.Cmd) {
 func (m Model) startWithParams(p scanParams) (tea.Model, tea.Cmd) {
 	m.params = p
 	m.rows = nil
+	m.derived = nil
+	m.pendingRows = nil
+	m.renderScheduled = false
 	m.diff = nil
 	m.failed = 0
+	m.timing = ""
+	m.scanError = ""
 	m.events, m.cancel = runScan(p)
 	m.screen = screenRunning
 	m.phase = "discover"
 	m.phaseDone, m.phaseTotal = 0, 0
 	m.rebuildTable()
 	return m, tea.Batch(m.spin.Tick, listen(m.events))
+}
+
+func compactScanError(s string) string {
+	// Runner errors put the actionable tool output after "stderr:". Prefer it
+	// over the generic "exit status 1" and flatten it for the status bar.
+	if _, tail, ok := strings.Cut(s, "stderr:"); ok {
+		stderr, stdout, hasStdout := strings.Cut(tail, "stdout:")
+		switch {
+		case strings.TrimSpace(stderr) != "":
+			s = stderr
+		case hasStdout && strings.TrimSpace(stdout) != "":
+			s = stdout
+		}
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	const maxRunes = 180
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		s = string(runes[:maxRunes-1]) + "…"
+	}
+	return s
 }
 
 // ----- RUNNING -----
@@ -766,7 +812,7 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.syncFocus()
 	case "t":
 		m.view = (m.view + 1) % resultViewCount
-		m.rebuildTable()
+		m.refreshActiveView()
 		return m, nil
 	case "/":
 		m.filterIn.Focus()
@@ -787,6 +833,14 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.sortBy = (m.sortBy + 1) % sortKeyCount
 		m.rebuildTable()
+		return m, nil
+	case "S":
+		// Sweep sibling subnets: probe routed /24 candidates (VLANs reachable
+		// through the gateway) and fold whatever answers into the map. Only
+		// meaningful in the map view.
+		if m.view == viewTopology {
+			return m.startRoutedSweep()
+		}
 		return m, nil
 	case "enter":
 		// Enter on a host runs a focused deep scan (Discover). Falls back to
@@ -878,20 +932,20 @@ func (m Model) selectedRow() *rowView {
 
 func (m *Model) buildVisible() {
 	filter := strings.ToLower(strings.TrimSpace(m.filterIn.Value()))
-	match := func(r ui.Row) bool {
+	match := func(searchText string) bool {
 		if filter == "" {
 			return true
 		}
-		hay := strings.ToLower(strings.Join(append([]string{r.IP, r.Host, r.MAC, r.Vendor, r.OS}, r.Ports...), " "))
-		return strings.Contains(hay, filter)
+		return strings.Contains(searchText, filter)
 	}
 
 	vis := make([]rowView, 0, len(m.rows)+4)
 	for _, r := range m.rows {
-		if !match(r) {
+		d := m.derivedRow(r)
+		if !match(d.searchText) {
 			continue
 		}
-		rv := rowView{row: r}
+		rv := rowView{row: r, searchText: d.searchText, risk: d.risk, ports: d.ports}
 		if d, ok := m.diff[r.IP]; ok {
 			rv.diff = d
 			rv.badge = diffBadge(d)
@@ -931,6 +985,22 @@ func (m *Model) buildVisible() {
 	}
 	sort.SliceStable(vis, func(i, j int) bool { return less(vis[i], vis[j]) })
 	m.visible = vis
+}
+
+func (m *Model) derivedRow(r ui.Row) rowDerived {
+	if m.derived == nil {
+		m.derived = make(map[string]rowDerived, len(m.rows))
+	}
+	if d, ok := m.derived[r.IP]; ok {
+		return d
+	}
+	d := rowDerived{
+		searchText: strings.ToLower(strings.Join(append([]string{r.IP, r.Host, r.MAC, r.Vendor, r.OS}, r.Ports...), " ")),
+		risk:       riskGlyph(r),
+		ports:      portSummary(r),
+	}
+	m.derived[r.IP] = d
+	return d
 }
 
 func diffBadge(d config.HostDiff) string {
@@ -1001,8 +1071,11 @@ func (m *Model) rebuildTable() {
 		t.SetCursor(cursor)
 	}
 	m.tbl = t
-
-	m.refreshTree()
+	m.treeDirty = true
+	m.mapDirty = true
+	if m.screen == screenResults {
+		m.refreshActiveView()
+	}
 }
 
 // tableRows builds the table cell rows. The Discover column shows an arrow only
@@ -1028,7 +1101,7 @@ func (m Model) tableRows(cursor int) []table.Row {
 		if m.params.showMac {
 			cells = append(cells, dash(r.MAC), dash(r.Vendor))
 		}
-		cells = append(cells, up, riskGlyph(r), dash(portSummary(r)), dash(r.RTT))
+		cells = append(cells, up, rv.risk, dash(rv.ports), dash(r.RTT))
 		if hasDiff {
 			cells = append(cells, rv.badge)
 		}
@@ -1076,6 +1149,9 @@ func (m Model) treeViewportHeight() int {
 // refreshTree re-renders the tree content into the scrollable viewport and
 // sizes it to the current window, preserving the scroll position.
 func (m *Model) refreshTree() {
+	if !m.treeDirty && m.treeRdy {
+		return
+	}
 	w := m.width
 	if w == 0 {
 		w = 100
@@ -1089,11 +1165,14 @@ func (m *Model) refreshTree() {
 		m.treeVP.Height = h
 	}
 	m.treeVP.SetContent(m.treeView())
-	m.refreshMap()
+	m.treeDirty = false
 }
 
 // refreshMap re-renders the topology map into its scrollable viewport.
 func (m *Model) refreshMap() {
+	if !m.mapDirty && m.mapRdy {
+		return
+	}
 	w := m.width
 	if w == 0 {
 		w = 100
@@ -1106,7 +1185,20 @@ func (m *Model) refreshMap() {
 		m.mapVP.Width = w
 		m.mapVP.Height = h
 	}
-	m.mapVP.SetContent(m.topologyView())
+	m.topology = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
+	m.mapVP.SetContent(m.renderTopology(m.topology))
+	m.mapDirty = false
+}
+
+// refreshActiveView renders only the visible expensive view. Hidden tree and
+// topology content stays dirty until the user switches to it.
+func (m *Model) refreshActiveView() {
+	switch m.view {
+	case viewTree:
+		m.refreshTree()
+	case viewTopology:
+		m.refreshMap()
+	}
 }
 
 // shortHostname returns this machine's hostname without any domain suffix.

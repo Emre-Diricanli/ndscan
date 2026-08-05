@@ -14,6 +14,7 @@ import (
 	"github.com/jedib0t/go-pretty/v6/text"
 
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
@@ -335,7 +336,10 @@ func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showM
 		}
 	}
 	b, _ := json.MarshalIndent(rows, "", "  ")
-	return os.WriteFile(path, b, 0644)
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return err
+	}
+	return userenv.Chown(path)
 }
 
 // ====== TREE (detailed labels) ======

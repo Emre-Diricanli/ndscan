@@ -23,8 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/Emre-Diricanli/ndscan/main/install.
 - **Rich reports** — `--report results.md` or `--report report.html` with exposure/risk findings.
 - **Multiple export formats** — JSON, CSV, Markdown, HTML (from both CLI and TUI).
 - **Built-in risk intelligence** — surfaces potentially dangerous open services.
-- **Flexible presets** — `quick`, `default`, `udp`, `deep` (or specify custom ports).
-- **Sudo / privileged mode** support for better ARP and SYN scan results.
+- **Flexible presets** — `quick`, `smart` (two-stage), `default`, `udp`, `deep` (or specify custom ports).
+- **Automatic privileged mode** — ndscan relaunches through `sudo` for complete local discovery.
 
 ---
 
@@ -87,7 +87,7 @@ Make sure `$(go env GOPATH)/bin` (or `$GOBIN`) is in your `PATH`.
 - `nmap` installed on any machine you want to scan **from** (local or the SSH jump host)
   - macOS: `brew install nmap`
   - Linux: `sudo apt install nmap` / `sudo dnf install nmap` etc.
-- For best ARP/MAC/SYN scan results on local scans: use the `--sudo` flag (or run as root)
+- ndscan requests `sudo` automatically at startup so local discovery has the privileges it needs.
 
 ### For maintainers: releases and versioning
 
@@ -113,6 +113,10 @@ ndscan
 # or
 ndscan tui
 ```
+
+ndscan requests administrator authentication once at startup and then runs its
+local discovery and scan engine with root privileges. Profiles and exports are
+still stored under the invoking user's home and returned to that user's ownership.
 
 Run a quick scan from the command line:
 
@@ -194,7 +198,7 @@ ndscan scan admin@scanner.internal 192.168.50.0/24 --json results.json
 **Privileged scan (SYN + ARP)**
 
 ```bash
-ndscan scan 192.168.1.0/24 --sudo --show-mac --show-vendors
+ndscan scan 192.168.1.0/24 --root-scan --show-mac --show-vendors
 ```
 
 ---
@@ -224,13 +228,12 @@ Reports include:
 |---------------------|------------------------------------------------------------------|
 | `-tb`               | Shortcut for `--view table`                                      |
 | `-tr`               | Shortcut for `--view tree`                                       |
-| `-P, --preset`      | Scan preset: `quick` (default), `default`, `udp`, `deep`         |
+| `-P, --preset`      | Scan preset: `quick` (default), `smart`, `default`, `udp`, `deep`|
 | `--discover`        | Only list live hosts (skip the port scan) — fastest             |
 | `-p, --ports`       | Custom ports (e.g. `22,80,443` or `1-1024`)                      |
 | `--view`            | Force view: `table` or `tree`                                    |
 | `--show-mac`        | Include MAC addresses (L2 only)                                  |
 | `--show-vendors`    | Include vendor names (requires `--show-mac`)                     |
-| `--sudo`            | Run local nmap via sudo (better ARP, SYN scans, MAC discovery)   |
 | `--root-scan`       | Use SYN scan (`-sS`) — requires root on the scanning machine     |
 | `-j, --json`        | Write results to a JSON file                                     |
 | `--report`          | Write Markdown or HTML report (format from file extension)       |

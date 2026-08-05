@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
@@ -20,21 +21,28 @@ const (
 	glyphScanned = "◆" // segment was scanned
 	glyphUnknown = "○" // segment attached but not scanned
 	glyphRisk    = "⚠"
+	glyphRouted  = "⇢" // segment reached through the gateway, not attached
 )
 
 // topologyView renders the network map: every network this machine is attached
 // to, the gateway, and the hosts found on each.
 func (m Model) topologyView() string {
-	locals := m.netLocals
-	gw := m.netGateway
+	return m.renderTopology(topology.Build(m.topologyRows(), m.netLocals, m.netGateway))
+}
 
+func (m Model) topologyRows() []ui.Row {
 	rows := make([]ui.Row, 0, len(m.visible))
 	for _, rv := range m.visible {
 		if !rv.gone {
 			rows = append(rows, rv.row)
 		}
 	}
-	tm := topology.Build(rows, locals, gw)
+	return rows
+}
+
+func (m Model) renderTopology(tm topology.Map) string {
+	locals := m.netLocals
+	gw := m.netGateway
 
 	if len(tm.Segments) == 0 {
 		return hintStyle.Render("  No networks detected. Run a scan to populate the map.")
@@ -43,8 +51,10 @@ func (m Model) topologyView() string {
 	var b strings.Builder
 	// Legend makes the glyph vocabulary self-explanatory without opening help.
 	b.WriteString("  " + hintStyle.Render(fmt.Sprintf(
-		"%s this machine   %s gateway   %s host   %s risk",
-		glyphSelf, glyphGateway, glyphHost, glyphRisk)) + "\n\n")
+		"%s this machine   %s gateway   %s host   %s routed   %s risk",
+		glyphSelf, glyphGateway, glyphHost, glyphRouted, glyphRisk)) + "\n")
+	b.WriteString("  " + hintStyle.Render("press ") + keyStyle.Render("S") +
+		hintStyle.Render(" to sweep sibling subnets (VLANs beyond your own)") + "\n\n")
 
 	self := selfLabel(locals)
 	b.WriteString("  " + accentText.Bold(true).Render(glyphSelf+" "+self) + "\n")
@@ -63,13 +73,11 @@ func (m Model) topologyView() string {
 // firstUnscannedNetwork returns the CIDR of the first attached network the
 // current results don't cover, for the map's "press s to scan" affordance.
 func (m Model) firstUnscannedNetwork() (string, bool) {
-	rows := make([]ui.Row, 0, len(m.visible))
-	for _, rv := range m.visible {
-		if !rv.gone {
-			rows = append(rows, rv.row)
-		}
+	tm := m.topology
+	if m.mapDirty {
+		tm = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
 	}
-	for _, seg := range topology.Build(rows, m.netLocals, m.netGateway).Segments {
+	for _, seg := range tm.Segments {
 		// Only offer networks this machine is actually attached to; synthetic
 		// segments from remote scans have no interface and aren't ours to scan.
 		// Skip /32s: a point-to-point tunnel address is not a scannable range.
@@ -78,6 +86,79 @@ func (m Model) firstUnscannedNetwork() (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// startRoutedSweep launches a scan that covers the attached networks plus the
+// bounded set of sibling /24 candidates (VLANs reachable through the gateway).
+// Whatever answers folds onto the map as routed segments. If nothing plausible
+// can be probed, it leaves a notice instead of starting an empty scan.
+func (m Model) startRoutedSweep() (tea.Model, tea.Cmd) {
+	extra := parseSiblingExtras(m.targetsIn.Value())
+	candidates := netinfo.SiblingCandidates(m.netLocals, extra)
+	if len(candidates) == 0 {
+		m.notice = "no sibling subnets to probe (need an attached IPv4 /24)"
+		return m, nil
+	}
+
+	// Scan the attached networks together with the candidates, so the existing
+	// hosts and any newly-found VLAN hosts land on one coherent map.
+	targets := make([]string, 0, len(m.netLocals)+len(candidates))
+	for _, l := range m.netLocals {
+		if strings.HasSuffix(l.CIDR, "/32") {
+			continue // point-to-point tunnel: nothing to sweep
+		}
+		targets = append(targets, l.CIDR)
+	}
+	targets = append(targets, candidates...)
+
+	p := m.params
+	p.sshTarget = "" // routed sweep is always from this machine
+	p.targets = targets
+	if p.preset == "" {
+		p.preset = "quick"
+	}
+	m.routedSweep = true
+	m.notice = fmt.Sprintf("sweeping %d sibling subnet(s) via %s…", len(candidates), dashOr(m.netGateway.IP, "gateway"))
+	return m.startWithParams(p)
+}
+
+// routedHostCount returns how many hosts landed on routed (non-attached)
+// segments in the current map — the payoff of a sibling sweep.
+func (m Model) routedHostCount() int {
+	tm := m.topology
+	if m.mapDirty {
+		tm = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
+	}
+	n := 0
+	for _, seg := range tm.Segments {
+		if !seg.Attached() {
+			n += seg.HostCount()
+		}
+	}
+	return n
+}
+
+// parseSiblingExtras pulls any explicit CIDR/subnet tokens out of the targets
+// field so a user can name an extra VLAN (e.g. "192.168.100.0/24") and have the
+// sweep include it. The leading user@host SSH token, if any, is ignored.
+func parseSiblingExtras(raw string) []string {
+	fields := strings.Fields(raw)
+	var out []string
+	for _, f := range fields {
+		if strings.Contains(f, "@") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// dashOr returns s, or the fallback when s is empty.
+func dashOr(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // selfLabel names this machine for the root of the map.
@@ -106,10 +187,19 @@ func (m Model) renderSegment(seg topology.Segment, last bool, gw netinfo.Gateway
 		cont = "  "
 	}
 
-	// Segment header: interface, CIDR, and scan state.
-	head := hintStyle.Render("  "+elbow+" ") + labelFocusedStyle.Render(seg.CIDR)
-	if seg.Interface != "" {
+	// Segment header: interface (or routed-via), CIDR, and scan state. A dashed
+	// connector on routed segments signals "reached through the gateway", not
+	// "directly attached".
+	segElbow := elbow
+	if seg.RoutedVia != "" {
+		segElbow = strings.Replace(elbow, "─", "┈", 1) // ├┈ / └┈
+	}
+	head := hintStyle.Render("  "+segElbow+" ") + labelFocusedStyle.Render(seg.CIDR)
+	switch {
+	case seg.Interface != "":
 		head += hintStyle.Render("  " + seg.Interface)
+	case seg.RoutedVia != "":
+		head += "  " + accent2Style.Render(glyphRouted+" via "+seg.RoutedVia)
 	}
 	if seg.NotScanned {
 		head += "  " + hintStyle.Render(glyphUnknown+" not scanned")

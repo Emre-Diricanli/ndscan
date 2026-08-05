@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
 
 // ExportDir returns the directory exports are written to for a given time:
@@ -13,8 +15,8 @@ import (
 func ExportDir(at time.Time) string {
 	base := os.Getenv("NDSCAN_EXPORT_DIR")
 	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
+		home := userenv.Home()
+		if home == "" {
 			home = "."
 		}
 		base = filepath.Join(home, "Downloads", "ndscan")
@@ -33,6 +35,8 @@ func ExportPath(at time.Time, format string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+	_ = userenv.Chown(filepath.Dir(dir))
+	_ = userenv.Chown(dir)
 	stamp := at.Format("150405")
 	path := filepath.Join(dir, fmt.Sprintf("ndscan-%s.%s", stamp, format))
 	// Bounded probe: give up and reuse the base name rather than spin forever

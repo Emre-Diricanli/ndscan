@@ -18,6 +18,13 @@ import (
 
 func keyRunes(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
+func TestCompactScanErrorPrefersStderr(t *testing.T) {
+	got := compactScanError("nmap failed: exit status 1\nstderr: nmap: illegal option -- x\nTry --help")
+	if got != "nmap: illegal option -- x Try --help" {
+		t.Fatalf("compactScanError = %q", got)
+	}
+}
+
 func typeString(m tea.Model, s string) tea.Model {
 	for _, r := range s {
 		m, _ = m.Update(keyRunes(string(r)))

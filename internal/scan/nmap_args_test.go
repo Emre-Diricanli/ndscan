@@ -7,11 +7,43 @@ import (
 	"time"
 )
 
+type scriptedRunner struct {
+	calls [][]string
+	outs  [][]byte
+}
+
+func (r *scriptedRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, append([]string(nil), args...))
+	out := r.outs[0]
+	r.outs = r.outs[1:]
+	return out, nil
+}
+
 type fakeRunner struct {
 	bin  string
 	args []string
 	out  []byte
 	err  error
+}
+
+func TestSmartPresetScansOpenPortsInTwoStages(t *testing.T) {
+	first := []byte(`<nmaprun><host><status state="up"/><address addr="192.0.2.1" addrtype="ipv4"/><ports>` +
+		`<port protocol="tcp" portid="443"><state state="open"/></port>` +
+		`<port protocol="tcp" portid="22"><state state="open"/></port></ports></host></nmaprun>`)
+	final := []byte(`<nmaprun></nmaprun>`)
+	runner := &scriptedRunner{outs: [][]byte{first, final}}
+	_, err := scanMany(context.Background(), []string{"192.0.2.1"}, Config{Preset: "smart", HostTimeout: 20 * time.Second}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("calls=%d, want two stages", len(runner.calls))
+	}
+	wantFirst := []string{"-oX", "-", "-Pn", "-sT", "-T4", "--top-ports", "100", "--host-timeout", "20s", "--max-retries", "0", "--min-rate", "1000", "192.0.2.1"}
+	wantSecond := []string{"-oX", "-", "-Pn", "-sT", "-T4", "-A", "-p", "22,443", "--host-timeout", "20s", "--max-retries", "2", "--min-rate", "200", "192.0.2.1"}
+	if !reflect.DeepEqual(runner.calls[0], wantFirst) || !reflect.DeepEqual(runner.calls[1], wantSecond) {
+		t.Fatalf("unexpected smart argv:\nfirst: %#v\nsecond: %#v", runner.calls[0], runner.calls[1])
+	}
 }
 
 func (r *fakeRunner) Run(_ context.Context, bin string, args ...string) ([]byte, error) {

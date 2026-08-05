@@ -11,6 +11,7 @@ import (
 
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
 
 // export writes the currently visible rows (excluding synthetic GONE entries)
@@ -26,6 +27,9 @@ func (m Model) export(format string) string {
 	now := time.Now()
 	path, err := report.ExportPath(now, format)
 	if err != nil {
+		return "export failed: " + err.Error()
+	}
+	if err := userenv.Chown(path); err != nil {
 		return "export failed: " + err.Error()
 	}
 

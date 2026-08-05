@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -26,7 +27,6 @@ type scanParams struct {
 	showMac     bool
 	showVendors bool
 	rootScan    bool
-	sudo        bool
 	concurrency int
 	hostTimeout time.Duration
 }
@@ -50,6 +50,15 @@ type doneMsg struct {
 	elapsed   time.Duration
 	cancelled bool
 	diff      map[string]config.HostDiff
+	timings   phaseTimings
+	firstErr  error
+	fallbacks int
+}
+
+type phaseTimings struct {
+	discovery  time.Duration
+	enrichment time.Duration
+	ports      time.Duration
 }
 
 type errMsg struct{ err error }
@@ -67,6 +76,9 @@ func nmapAvailable(sshTarget string) bool {
 	if sshTarget != "" {
 		return true
 	}
+	if os.Getenv("NDSCAN_NMAP_PATH") != "" {
+		return true
+	}
 	_, err := exec.LookPath("nmap")
 	return err == nil
 }
@@ -81,11 +93,14 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		defer close(ch)
 		defer cancel()
 		start := time.Now()
+		var timings phaseTimings
+		var firstScanErr error
+		fallbacks := 0
 		var runner scan.Runner
 		if p.sshTarget != "" {
 			runner = scan.NewRunner(p.sshTarget)
 		} else {
-			runner = scan.NewLocalRunner(p.sudo)
+			runner = scan.NewLocalRunner()
 		}
 
 		finish := func(rows []ui.Row, failed int, cancelled bool) {
@@ -95,7 +110,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 				cur = append(cur, config.HostSnapshot{IP: r.IP, Host: r.Host, Ports: r.Ports})
 			}
 			var diff map[string]config.HostDiff
-			if !cancelled { // don't diff or overwrite history with partial results
+			if !cancelled && failed == 0 { // failed/partial scans must not poison history
 				diff = config.Diff(prev, cur)
 				_ = config.SaveHistory(p.targets, p.ports, p.preset, cur)
 			}
@@ -105,11 +120,39 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 				elapsed:   time.Since(start),
 				cancelled: cancelled,
 				diff:      diff,
+				timings:   timings,
+				firstErr:  firstScanErr,
+				fallbacks: fallbacks,
 			}
 		}
 
 		ch <- phaseMsg{phase: "discover"}
-		live, err := scan.HostDiscovery(ctx, p.targets, runner)
+		discoveryStart := time.Now()
+		nmapMACWorthwhile := p.sshTarget != "" || scan.IsRoot()
+		var live []string
+		var discoveredMACs map[string]string
+		var err error
+		switch {
+		case scan.NativeDiscoverySupported(runner):
+			// Native ARP + TCP sweep: no nmap, no root, and roughly 15-20x
+			// faster than `nmap -sn` on a LAN because the timeout policy is
+			// ours. Only valid locally — over SSH the probes would originate
+			// from the wrong machine.
+			live, discoveredMACs, err = scan.NativeDiscovery(ctx, p.targets, runner,
+				func(done, total int) {
+					// Non-blocking: the sweep fans out across thousands of
+					// goroutines, and a full channel (or a cancelled scan whose
+					// reader has stopped) must never stall them.
+					select {
+					case ch <- phaseMsg{phase: "discover", done: done, total: total}:
+					default:
+					}
+				})
+		case p.showMac && nmapMACWorthwhile:
+			live, discoveredMACs, err = scan.HostDiscoveryWithMACs(ctx, p.targets, runner)
+		default:
+			live, err = scan.HostDiscovery(ctx, p.targets, runner)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				finish(nil, 0, true)
@@ -118,9 +161,18 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			ch <- errMsg{err}
 			return
 		}
+		// Native discovery reports cancellation by returning early rather than
+		// by erroring, so check the context directly — otherwise a cancelled
+		// scan would be reported as a completed one.
+		if ctx.Err() != nil {
+			finish(nil, 0, true)
+			return
+		}
+		timings.discovery = time.Since(discoveryStart)
 
 		// ARP-cache fallback: recover neighbors and MACs that unprivileged
 		// nmap misses. Always read it — MACs are free and require no root.
+		enrichmentStart := time.Now()
 		arpMap := scan.ARPCache(ctx, runner)
 		live = scan.MergeARPHosts(live, p.targets, arpMap)
 
@@ -136,13 +188,9 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		// A local unprivileged nmap pass just duplicates the ARP data at the
 		// cost of a whole extra sweep, so we skip it.
 		macMap := map[string]string{}
-		nmapMACWorthwhile := p.sshTarget != "" || p.sudo || scan.IsRoot()
 		if p.showMac && nmapMACWorthwhile {
-			ch <- phaseMsg{phase: "mac"}
-			if nmapMACs, _ := scan.DiscoverMACs(ctx, live, runner); nmapMACs != nil {
-				for ip, mac := range nmapMACs {
-					macMap[ip] = mac
-				}
+			for ip, mac := range discoveredMACs {
+				macMap[ip] = mac
 			}
 		}
 		for ip, mac := range arpMap {
@@ -155,6 +203,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		if p.showMac && p.showVendors {
 			oui = vendor.LoadDefault()
 		}
+		timings.enrichment = time.Since(enrichmentStart)
 
 		// Stream each host's parsed rows as its scan completes.
 		var mu sync.Mutex
@@ -168,29 +217,59 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			HostTimeout:    p.hostTimeout,
 			DisableVendors: !(p.showMac && p.showVendors),
 			NeedMAC:        p.showMac,
+			BatchSize:      16,
+			DiscardResults: true,
 			Progress: func(done, total int) {
 				ch <- phaseMsg{phase: "scan", done: done, total: total}
 			},
 			OnResult: func(r scan.HostResult) {
-				mu.Lock()
-				defer mu.Unlock()
 				if r.Err != nil {
+					mu.Lock()
 					if ctx.Err() == nil {
-						failed++
+						failed += maxInt(1, len(r.Targets))
+						if firstScanErr == nil {
+							firstScanErr = r.Err
+						}
 					}
+					mu.Unlock()
 					return
+				}
+				if r.Fallback {
+					mu.Lock()
+					fallbacks += maxInt(1, len(r.Targets))
+					mu.Unlock()
 				}
 				rows := ui.BuildRows([]scan.HostResult{r}, oui, p.showMac, p.showVendors, macMap)
 				if len(rows) == 0 {
 					return
 				}
+				mu.Lock()
 				streamed = append(streamed, rows...)
+				mu.Unlock()
 				ch <- hostRowMsg{rows: rows}
 			},
 		}
 		ch <- phaseMsg{phase: "scan", done: 0, total: len(live)}
 
-		_, err = scan.ScanHosts(ctx, live, cfg, runner)
+		portStart := time.Now()
+		if scan.NativePortScanViable(cfg, runner) {
+			// Native connect scan: ~70x faster than shelling out to nmap for
+			// the same port set, because every probe runs concurrently under one
+			// timeout policy. Results are emitted through the same OnResult
+			// callback so rows still stream in as hosts complete.
+			native := scan.NativePortScan(ctx, live, cfg, func(done, total int) {
+				select {
+				case ch <- phaseMsg{phase: "scan", done: done, total: total}:
+				default:
+				}
+			})
+			for _, r := range native {
+				cfg.OnResult(r)
+			}
+		} else {
+			_, err = scan.ScanHosts(ctx, live, cfg, runner)
+		}
+		timings.ports = time.Since(portStart)
 		mu.Lock()
 		rows := append([]ui.Row(nil), streamed...)
 		nFailed := failed

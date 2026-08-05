@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
 
 // Settings mirrors the TUI form fields.
@@ -21,7 +24,6 @@ type Settings struct {
 	ShowMac     bool   `json:"show_mac"`
 	ShowVendors bool   `json:"show_vendors"`
 	RootScan    bool   `json:"root_scan"`
-	Sudo        bool   `json:"sudo"`
 	Concurrency string `json:"concurrency"`
 	HostTimeout string `json:"host_timeout"`
 }
@@ -42,6 +44,9 @@ func dir() string {
 	// NDSCAN_CONFIG_DIR overrides the location (used by tests).
 	if d := os.Getenv("NDSCAN_CONFIG_DIR"); d != "" {
 		return d
+	}
+	if d := os.Getenv("NDSCAN_USER_CONFIG_DIR"); d != "" {
+		return filepath.Join(d, "ndscan")
 	}
 	if d, err := os.UserConfigDir(); err == nil {
 		return filepath.Join(d, "ndscan")
@@ -69,11 +74,12 @@ func Save(f File) error {
 	if err := os.MkdirAll(dir(), 0o755); err != nil {
 		return err
 	}
+	_ = userenv.Chown(dir())
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(), b, 0o644)
+	return writeIfChanged(configPath(), b, 0o644)
 }
 
 // SaveLast persists the most recently used settings.
@@ -149,11 +155,53 @@ func SaveHistory(targets []string, ports, preset string, snaps []HostSnapshot) e
 	if err := os.MkdirAll(historyDir(), 0o755); err != nil {
 		return err
 	}
+	_ = userenv.Chown(historyDir())
 	b, err := json.MarshalIndent(snaps, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(historyPath(targets, ports, preset), b, 0o644)
+	return writeIfChanged(historyPath(targets, ports, preset), b, 0o644)
+}
+
+// writeIfChanged avoids watch-mode disk churn and replaces files atomically,
+// so an interrupted write cannot leave config or history as truncated JSON.
+func writeIfChanged(path string, data []byte, perm os.FileMode) error {
+	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".ndscan-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := userenv.Chown(tmpPath); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // ----- diff -----

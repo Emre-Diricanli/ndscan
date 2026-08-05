@@ -6,8 +6,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
-
-	"github.com/Emre-Diricanli/ndscan/internal/scan"
 )
 
 func (m Model) View() string {
@@ -86,7 +84,7 @@ func (m Model) helpPanel() string {
 		"  tab / ↑↓        move between fields",
 		"  ← →             change preset",
 		"  space / enter   toggle checkbox",
-		"  Use sudo        elevate for full discovery (prompts once)",
+		"  ndscan starts with sudo automatically for full discovery",
 		"  ctrl+s          save form as profile",
 		"  ctrl+p          load / manage profiles",
 		"  enter on Start  begin scan",
@@ -116,8 +114,12 @@ func (m Model) helpPanel() string {
 		hintStyle.Render("  Shows every network this machine is attached to, the"),
 		hintStyle.Render("  default gateway, and the hosts found on each. Networks"),
 		hintStyle.Render("  you haven't scanned are marked — press s to scan one."),
-		hintStyle.Render("  It reads interfaces and the routing table only, so it"),
-		hintStyle.Render("  can't see subnets beyond the gateway."),
+		hintStyle.Render("  Attached networks come from interfaces + the routing"),
+		hintStyle.Render("  table (passive). Press ") + keyStyle.Render("S") +
+			hintStyle.Render(" to actively sweep sibling"),
+		hintStyle.Render("  subnets (VLANs beyond your own) via the gateway;"),
+		hintStyle.Render("  found ones appear nested, marked ") + accent2Style.Render(glyphRouted+" via"),
+		hintStyle.Render("  <gateway>. Silence there usually means VLAN isolation."),
 		"",
 		hintStyle.Render("Δ column shows changes vs the previous scan of the"),
 		hintStyle.Render("same targets: NEW host, GONE host, +/-port."),
@@ -282,13 +284,8 @@ func (m Model) viewForm() string {
 	field(fShowMac, "Show MAC", checkbox(m.showMac), "from ARP cache (no root) + nmap")
 	field(fShowVendors, "Show vendors", checkbox(m.showVend), "needs Show MAC")
 
-	section("PRIVILEGE")
-	field(fRootScan, "SYN scan", checkbox(m.rootScan), "-sS, needs root/sudo")
-	sudoHint := "thorough ARP + SYN scan via sudo"
-	if scan.IsRoot() {
-		sudoHint = "already root — not needed"
-	}
-	field(fSudo, "Use sudo", checkbox(m.sudo || scan.IsRoot()), sudoHint)
+	section("SCAN TYPE")
+	field(fRootScan, "SYN scan", checkbox(m.rootScan), "-sS privileged scan")
 
 	section("PERFORMANCE")
 	field(fConcurrency, "Concurrency", m.concurIn.View(), "parallel hosts")
@@ -302,15 +299,6 @@ func (m Model) viewForm() string {
 		startBtn = buttonFocusedStyle.Render("▶ Start scan")
 	}
 	b.WriteString(cursor + startBtn + "\n")
-
-	// advisory when an unprivileged local scan will under-report
-	if !scan.IsRoot() && !m.sudo {
-		b.WriteString("\n  " + warnStyle.Render("⚠ not root: ") +
-			hintStyle.Render("MACs come from the ARP cache; for full host discovery"))
-		b.WriteString("\n    " + hintStyle.Render("and SYN scans, toggle ") +
-			accentText.Render("Use sudo") + hintStyle.Render(" or run ") +
-			accentText.Render("sudo ndscan") + "\n")
-	}
 
 	if m.err != nil {
 		b.WriteString("\n  " + errStyle.Render("✖ "+m.err.Error()) + "\n")
@@ -455,8 +443,14 @@ func (m Model) viewResults() string {
 	}
 
 	summary := okStyle.Render("● ") + valueStyle.Render(m.summary)
+	if m.timing != "" {
+		summary += "\n  " + hintStyle.Render(m.timing)
+	}
 	if m.failed > 0 {
 		summary += warnStyle.Render(fmt.Sprintf("  (%d host scan failures)", m.failed))
+		if m.scanError != "" {
+			summary += "\n  " + errStyle.Render("first error: "+m.scanError)
+		}
 	}
 	if d := m.diffSummary(); d != "" {
 		summary += "\n  " + warnStyle.Render("Δ "+d)
@@ -485,22 +479,26 @@ func (m Model) viewResults() string {
 	}
 	statusLine := "  " + strings.Join(status, hintStyle.Render("  ·  "))
 
-	// The sort key is meaningless in the map, where "s" scans instead.
-	sortOrScan := [2]string{"s", "sort"}
-	if m.view == viewTopology {
-		sortOrScan = [2]string{"s", "scan next network"}
+	// In the map, "s" scans the next attached network and "S" sweeps siblings;
+	// elsewhere "s" is the sort key.
+	hints := []([2]string){
+		{"enter", "discover"},
+		{"t", "view [" + m.view.String() + "]"},
+		{"/", "filter"},
 	}
-	help := helpStyle.Render(keyHint(
-		[2]string{"enter", "discover"},
-		[2]string{"t", "view [" + m.view.String() + "]"},
-		[2]string{"/", "filter"},
-		sortOrScan,
+	if m.view == viewTopology {
+		hints = append(hints, [2]string{"s", "scan next"}, [2]string{"S", "sweep siblings"})
+	} else {
+		hints = append(hints, [2]string{"s", "sort"})
+	}
+	hints = append(hints,
 		[2]string{"e/c/m/h", "export"},
 		[2]string{"w", "watch"},
 		[2]string{"r", "rescan"},
 		[2]string{"?", "help"},
 		[2]string{"q", "quit"},
-	))
+	)
+	help := helpStyle.Render(keyHint(hints...))
 
 	return "\n" + m.header(m.view.String()) + "\n\n" + body + "\n" + statusLine + "\n\n  " + summary + "\n" + help
 }

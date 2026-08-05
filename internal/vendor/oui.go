@@ -7,6 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+
+	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
 
 type DB map[string]string
@@ -27,11 +30,21 @@ var nmapPrefixPaths = []string{
 	"/opt/local/share/nmap/nmap-mac-prefixes",    // MacPorts
 }
 
+var (
+	defaultOnce sync.Once
+	defaultDB   DB
+)
+
 // LoadDefault returns the OUI database, preferring (in order): a user override
 // at ~/.ndscan/oui.txt, nmap's bundled prefix file, then a tiny built-in
 // sample. The parser handles both "AABBCC Vendor" and "AA:BB:CC\tVendor" forms.
 func LoadDefault() DB {
-	home, _ := os.UserHomeDir()
+	defaultOnce.Do(func() { defaultDB = loadDefault() })
+	return defaultDB
+}
+
+func loadDefault() DB {
+	home := userenv.Home()
 	if b, err := os.ReadFile(filepath.Join(home, ".ndscan", "oui.txt")); err == nil {
 		return parse(bytes.NewReader(b))
 	}
@@ -55,7 +68,11 @@ func nmapPrefixDBPaths() []string {
 
 // nmapDataDir parses `nmap --version` for its compiled-in data directory.
 func nmapDataDir() string {
-	out, err := exec.Command("nmap", "--version").Output()
+	name := "nmap"
+	if path := os.Getenv("NDSCAN_NMAP_PATH"); path != "" {
+		name = path
+	}
+	out, err := exec.Command(name, "--version").Output()
 	if err != nil {
 		return ""
 	}

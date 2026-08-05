@@ -60,6 +60,8 @@ var (
 
 	// sectionStyle heads a group of related fields or rows.
 	sectionStyle = lipgloss.NewStyle().Foreground(accent2).Bold(true)
+	// accent2Style is secondary emphasis (routed-via labels, etc.).
+	accent2Style = lipgloss.NewStyle().Foreground(accent2)
 	// dividerStyle draws the thin rules that separate regions.
 	dividerStyle = lipgloss.NewStyle().Foreground(faint)
 	// badgeStyle is an inverse chip, for counts and states.

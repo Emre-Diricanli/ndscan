@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -15,13 +16,7 @@ type Runner interface {
 
 // ----- Local runner -----
 
-type LocalRunner struct {
-	// Sudo, when true, prefixes commands with `sudo -n` so nmap can use ARP
-	// host discovery, SYN scans, and report MACs. Requires sudo to already be
-	// authenticated (see PrimeSudo); -n never prompts, so an unprimed sudo
-	// fails fast rather than hanging the UI.
-	Sudo bool
-}
+type LocalRunner struct{}
 
 // NewRunner returns a local runner (optionally elevated) or an SSH runner.
 func NewRunner(sshTarget string) Runner {
@@ -31,24 +26,39 @@ func NewRunner(sshTarget string) Runner {
 	return &SSHRunner{Target: sshTarget}
 }
 
-// NewLocalRunner returns a local runner that elevates via sudo when requested.
-func NewLocalRunner(sudo bool) Runner { return LocalRunner{Sudo: sudo} }
+func NewLocalRunner() Runner { return LocalRunner{} }
 
 func (r LocalRunner) Run(ctx context.Context, bin string, args ...string) ([]byte, error) {
+	if bin == "nmap" {
+		if path := os.Getenv("NDSCAN_NMAP_PATH"); path != "" {
+			bin = path
+		}
+	}
+	// Startup authenticates sudo once. Execute every local probe through its
+	// non-interactive path as a final privilege boundary; this guarantees tools
+	// such as nmap see a real root execution context on macOS without another
+	// prompt, even when the elevated Go launcher retains unusual credentials.
 	name := bin
-	full := args
-	if r.Sudo {
+	commandArgs := args
+	if os.Getenv("NDSCAN_ELEVATED") == "1" {
 		name = "sudo"
-		full = append([]string{"-n", bin}, args...)
+		commandArgs = append([]string{"-n", "--", bin}, args...)
 	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, name, full...)
+	cmd := exec.CommandContext(ctx, name, commandArgs...)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s failed: %v\nstderr: %s", bin, err, errb.String())
+		return nil, fmt.Errorf("%s failed: %v\nstderr: %s\nstdout: %s", bin, err, errb.String(), out.String())
 	}
 	return out.Bytes(), nil
+}
+
+func nmapExecutable() (string, error) {
+	if path := os.Getenv("NDSCAN_NMAP_PATH"); path != "" {
+		return path, nil
+	}
+	return exec.LookPath("nmap")
 }
 
 // ----- SSH runner -----
@@ -66,12 +76,23 @@ func (r *SSHRunner) Run(ctx context.Context, bin string, args ...string) ([]byte
 	sshArgs := []string{
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=60",
+		"-o", "ControlPath=/tmp/ndscan-ssh-%C",
 		"--",
 		r.Target,
 		remoteCommand(bin, args...),
 	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+	name := "ssh"
+	commandArgs := sshArgs
+	// The scanner runs as root, but remote authentication should continue to
+	// use the invoking user's SSH config and keys rather than root's identity.
+	if user := os.Getenv("SUDO_USER"); os.Geteuid() == 0 && user != "" && user != "root" {
+		name = "sudo"
+		commandArgs = append([]string{"-H", "-u", user, "--", "ssh"}, sshArgs...)
+	}
+	cmd := exec.CommandContext(ctx, name, commandArgs...)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
