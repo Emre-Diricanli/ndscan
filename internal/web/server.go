@@ -31,6 +31,7 @@ type Server struct {
 	lastScan *time.Time
 	topo     *topology.Map
 	cancel   context.CancelFunc
+	watch    watchState
 
 	bus *eventBus
 }
@@ -49,6 +50,7 @@ func (s *Server) Handler(addr string) http.Handler {
 	mux.HandleFunc("GET /api/topology", s.handleTopology)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
+	mux.HandleFunc("POST /api/watch", s.handleWatch)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.Handle("/", frontendHandler())
 	return guard(mux, addr)
@@ -65,11 +67,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 type stateResponse struct {
-	Version  string       `json:"version"`
-	Scanning bool         `json:"scanning"`
-	Targets  []string     `json:"targets"`
-	LastScan *time.Time   `json:"lastScan"`
-	Topology *topologyDTO `json:"topology"`
+	Version  string        `json:"version"`
+	Scanning bool          `json:"scanning"`
+	Targets  []string      `json:"targets"`
+	LastScan *time.Time    `json:"lastScan"`
+	Topology *topologyDTO  `json:"topology"`
+	Watch    watchResponse `json:"watch"`
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +91,13 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if s.topo != nil {
 		d := toTopologyDTO(*s.topo)
 		resp.Topology = &d
+	}
+	resp.Watch = watchResponse{
+		Enabled:     s.watch.enabled,
+		IntervalSec: int(s.watch.interval.Seconds()),
+	}
+	if s.watch.enabled {
+		resp.Watch.NextAt = s.watch.nextAt.UTC().Format(time.RFC3339)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -124,9 +134,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	if preset == "" {
 		preset = "quick"
 	}
-	switch preset {
-	case "quick", "default", "udp", "deep":
-	default:
+	if !validPreset(preset) {
 		writeErr(w, http.StatusBadRequest, "invalid preset "+preset)
 		return
 	}
