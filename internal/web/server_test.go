@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -262,5 +264,121 @@ func TestFrontend_RespondsWithoutEmbeddedApp(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET / = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestExport(t *testing.T) {
+	now := time.Date(2026, 8, 5, 19, 54, 21, 0, time.UTC)
+	cases := []struct {
+		format, contentType, contains string
+	}{
+		{"json", "application/json", `"ip": "192.0.2.1"`},
+		{"csv", "text/csv", "ip,hostname,mac,vendor,os,up,ports"},
+		{"md", "text/markdown", "# Network scan"},
+		{"html", "text/html", "<!doctype html>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.format, func(t *testing.T) {
+			s := NewServer("test")
+			s.lastScan = &now
+			s.targets = []string{"192.0.2.0/24"}
+			s.preset = "quick"
+			s.rows = []ui.Row{{IP: "192.0.2.1", Host: "host", Up: true, Ports: []string{"22/tcp ssh"}}}
+			srv := startServer(t, s)
+			resp, err := http.Get(srv.URL + "/api/export?format=" + tc.format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d: %s", resp.StatusCode, body)
+			}
+			if !strings.HasPrefix(resp.Header.Get("Content-Type"), tc.contentType) {
+				t.Errorf("content-type = %q", resp.Header.Get("Content-Type"))
+			}
+			if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="ndscan-20260805-195421.`+tc.format+`"` {
+				t.Errorf("content-disposition = %q", got)
+			}
+			if !strings.Contains(string(body), tc.contains) {
+				t.Errorf("body missing %q: %s", tc.contains, body)
+			}
+		})
+	}
+}
+
+func TestExportErrors(t *testing.T) {
+	cases := []struct {
+		name, path string
+		status     int
+	}{
+		{"no scan", "/api/export?format=json", http.StatusConflict},
+		{"missing format", "/api/export", http.StatusBadRequest},
+		{"bad format", "/api/export?format=pdf", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			resp, err := http.Get(srv.URL + tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.status)
+			}
+		})
+	}
+}
+
+func TestHistory(t *testing.T) {
+	s := NewServer("test")
+	s.hasPrevious = true
+	s.previous = []config.HostSnapshot{{IP: "192.0.2.1", Ports: []string{"22/tcp ssh"}}}
+	s.diff = map[string]config.HostDiff{"192.0.2.1": {PortsOpened: []string{"443"}, PortsClosed: []string{"22"}}, "192.0.2.2": {New: true}}
+	srv := startServer(t, s)
+	resp, err := http.Get(srv.URL + "/api/history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got historyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasPrevious || len(got.Previous) != 1 {
+		t.Fatalf("history = %+v", got)
+	}
+	if !got.Diff["192.0.2.2"].New || got.Diff["192.0.2.1"].PortsOpened[0] != "443" {
+		t.Errorf("diff = %+v", got.Diff)
+	}
+}
+
+func TestFinishScanPersistsAndDiffsHistory(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	targets := []string{"192.0.2.1"}
+	s := NewServer("test")
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", time.Now(), false)
+	if got := config.LoadHistory(targets, "", "quick"); len(got) != 1 {
+		t.Fatalf("saved history = %+v", got)
+	}
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", time.Now(), false)
+	if !s.hasPrevious || s.diff["192.0.2.1"].PortsOpened[0] != "443" || s.diff["192.0.2.1"].PortsClosed[0] != "22" {
+		t.Errorf("history state: hasPrevious=%v diff=%+v", s.hasPrevious, s.diff)
+	}
+}
+
+func TestDiscoverRejectsNonIPs(t *testing.T) {
+	cases := []string{"router.local", "192.0.2.0/24", "--script=evil", "127.0.0.1;id", ""}
+	for _, ip := range cases {
+		t.Run(ip, func(t *testing.T) {
+			srv := newTestServer(t)
+			body, _ := json.Marshal(map[string]string{"ip": ip})
+			resp := postJSON(t, srv, "/api/discover", string(body))
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+		})
 	}
 }
