@@ -874,67 +874,78 @@ function buildGraph(topology) {
   return { nodes, edges };
 }
 
-function seedPositions() {
-  // Deterministic-ish seed: self at center, others on a ring.
-  const w = svg.clientWidth || 800, h = svg.clientHeight || 500;
-  const cx = w / 2, cy = h / 2;
-  const ring = Math.min(w, h) * 0.35;
-  let i = 0;
-  for (const n of G.nodes) {
-    if (n.kind === "self") { n.x = cx; n.y = cy; }
-    else {
-      const a = (i / Math.max(1, G.nodes.length - 1)) * Math.PI * 2;
-      n.x = cx + Math.cos(a) * ring * (0.6 + 0.4 * Math.random());
-      n.y = cy + Math.sin(a) * ring * (0.6 + 0.4 * Math.random());
-      i++;
+// Hierarchical tree layout (UniFi-style): parents sit above their children,
+// children are spread horizontally under them. This mirrors how the network is
+// actually structured — and how the CLI's tree view prints it — so the drawing
+// carries meaning that a force-directed ball of nodes does not.
+//
+// Uses the classic tidy-tree approach: walk the tree bottom-up assigning each
+// leaf the next free horizontal slot, then place each parent at the midpoint of
+// its children. No physics, so the result is stable and deterministic — the
+// same scan always draws the same picture.
+const LAYOUT = { levelGap: 120, leafGap: 104, topPad: 56 };
+
+function buildTree() {
+  // Index children by parent from the edge list produced by buildGraph.
+  const kids = new Map();
+  const hasParent = new Set();
+  for (const e of G.edges) {
+    if (!kids.has(e.a.id)) kids.set(e.a.id, []);
+    kids.get(e.a.id).push(e.b);
+    hasParent.add(e.b.id);
+  }
+  const roots = G.nodes.filter((n) => !hasParent.has(n.id));
+  return { kids, roots };
+}
+
+function layoutTree() {
+  if (!G.nodes.length) return;
+  const { kids, roots } = buildTree();
+
+  let cursor = 0;              // next free leaf slot
+  const seen = new Set();      // guards against cycles in malformed data
+
+  // Depth-first: leaves claim slots left to right, parents centre over theirs.
+  function place(node, depth) {
+    if (seen.has(node.id)) return node.x;
+    seen.add(node.id);
+    node.y = LAYOUT.topPad + depth * LAYOUT.levelGap;
+    node.depth = depth;
+
+    const children = (kids.get(node.id) || []).filter((c) => !seen.has(c.id));
+    if (!children.length) {
+      node._slot = cursor;
+      node.x = cursor * LAYOUT.leafGap;
+      cursor++;
+      return node.x;
     }
-    n.vx = 0; n.vy = 0; n.fx = null; n.fy = null;
+    let first = null, last = null;
+    for (const c of children) {
+      const cx = place(c, depth + 1);
+      if (first === null) first = cx;
+      last = cx;
+    }
+    node.x = (first + last) / 2;
+    return node.x;
+  }
+
+  for (const r of roots) place(r, 0);
+  // Any node unreachable from a root (shouldn't happen) still gets a slot.
+  for (const n of G.nodes) {
+    if (!seen.has(n.id)) place(n, 0);
+  }
+
+  // Centre the drawing horizontally in the viewport.
+  const xs = G.nodes.map((n) => n.x);
+  const mid = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const cx = (svg.clientWidth || 900) / 2;
+  for (const n of G.nodes) {
+    n.x += cx - mid;
+    n.fx = null; n.fy = null;
   }
 }
 
 function tick() {
-  if (G.alpha > 0.005) {
-    const nodes = G.nodes, edges = G.edges;
-    const w = svg.clientWidth || 800, h = svg.clientHeight || 500;
-    const k = G.alpha;
-
-    // Repulsion (all pairs — networks are small).
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i], b = nodes[j];
-        let dx = b.x - a.x, dy = b.y - a.y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
-        const f = Math.min(8, 2600 / d2) * k;
-        const d = Math.sqrt(d2);
-        const fx = (dx / d) * f, fy = (dy / d) * f;
-        a.vx -= fx; a.vy -= fy;
-        b.vx += fx; b.vy += fy;
-      }
-    }
-    // Springs along edges.
-    for (const e of edges) {
-      const rest = e.routed ? 150 : 110;
-      let dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
-      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const f = (d - rest) * 0.02 * k;
-      const fx = (dx / d) * f, fy = (dy / d) * f;
-      e.a.vx += fx; e.a.vy += fy;
-      e.b.vx -= fx; e.b.vy -= fy;
-    }
-    // Weak centering gravity.
-    for (const n of nodes) {
-      n.vx += (w / 2 - n.x) * 0.004 * k;
-      n.vy += (h / 2 - n.y) * 0.004 * k;
-    }
-    // Integrate with damping.
-    for (const n of nodes) {
-      if (n.fx != null) { n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0; continue; }
-      n.vx *= 0.85; n.vy *= 0.85;
-      n.x += n.vx; n.y += n.vy;
-    }
-    G.alpha *= 0.985;
-  }
   paintGraph();
   requestAnimationFrame(tick);
 }
@@ -949,9 +960,22 @@ function paintGraph() {
   edgesG.textContent = ""; labelsG.textContent = ""; nodesG.textContent = "";
 
   for (const e of G.edges) {
-    edgesG.appendChild(svgEl("line", {
-      x1: e.a.x, y1: e.a.y, x2: e.b.x, y2: e.b.y,
-      class: "edge" + (e.routed ? " routed" : "")
+    // Orthogonal elbow with rounded corners: down from the parent, across,
+    // then down to the child. Straight diagonals would read as a mesh; right
+    // angles read as a hierarchy.
+    const midY = (e.a.y + e.b.y) / 2;
+    const dir = e.b.x > e.a.x ? 1 : -1;
+    const r = Math.min(12, Math.abs(e.b.x - e.a.x) / 2);
+    const d = Math.abs(e.b.x - e.a.x) < 1
+      ? "M " + e.a.x + " " + e.a.y + " V " + e.b.y
+      : "M " + e.a.x + " " + e.a.y +
+        " V " + (midY - r) +
+        " Q " + e.a.x + " " + midY + " " + (e.a.x + r * dir) + " " + midY +
+        " H " + (e.b.x - r * dir) +
+        " Q " + e.b.x + " " + midY + " " + e.b.x + " " + (midY + r) +
+        " V " + e.b.y;
+    edgesG.appendChild(svgEl("path", {
+      d: d, class: "edge" + (e.routed ? " routed" : ""), fill: "none"
     }));
     if (e.label) {
       const t = svgEl("text", { x: (e.a.x + e.b.x) / 2, y: (e.a.y + e.b.y) / 2 - 4, class: "edge-label" });
@@ -970,7 +994,9 @@ function paintGraph() {
       t0.textContent = "YOU";
       g.appendChild(t0);
     }
-    const t = svgEl("text", { y: n.r + 13 });
+    // Stagger labels on the densest row so adjacent hostnames don't collide.
+    const stagger = (n.depth >= 2 && (n._slot % 2 === 1)) ? 13 : 0;
+    const t = svgEl("text", { y: n.r + 13 + stagger });
     t.textContent = n.label;
     g.appendChild(t);
     g.addEventListener("pointerdown", (ev) => startNodeDrag(ev, n));
@@ -999,8 +1025,7 @@ function renderGraph() {
   const g = buildGraph(t);
   G.nodes = g.nodes;
   G.edges = g.edges;
-  seedPositions();
-  G.alpha = 1;
+  layoutTree();
   if (!G.fitted) { G.view = { x: 0, y: 0, k: 1 }; G.fitted = true; }
 }
 
@@ -1043,7 +1068,6 @@ function startNodeDrag(ev, n) {
   ev.stopPropagation();
   const start = toGraph(ev);
   const off = { x: n.x - start.x, y: n.y - start.y };
-  G.alpha = Math.max(G.alpha, 0.3);
   const move = (e2) => {
     n._dragged = true;
     const p = toGraph(e2);
