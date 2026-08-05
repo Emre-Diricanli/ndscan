@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.goreleaser.yml
+Dockerfile*
+docker-compose*.yml
+README.md
+docs
+assets
+dist
+ndscan
+*.log
+*.md
+!go.mod
+!go.sum

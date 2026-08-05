@@ -1,0 +1,17 @@
+services:
+  ndscan:
+    build:
+      context: .
+      args:
+        VERSION: ${NDSCAN_VERSION:-dev}
+    image: ndscan:${NDSCAN_VERSION:-dev}
+    network_mode: host
+    # Host mode shares the Linux host's network namespace. Docker therefore
+    # does not support a ports: mapping here: ndscan's 127.0.0.1:8080 listener
+    # is already the host's 127.0.0.1:8080. In bridge mode the equivalent
+    # mapping would be "127.0.0.1:8080:8080", but bridge mode produces an
+    # incomplete or incorrect network map and must not be used for scanning.
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
