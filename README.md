@@ -159,6 +159,60 @@ Scan through a jump host:
 ndscan scan user@203.0.113.10 192.168.10.0/24 -tb --show-mac
 ```
 
+## Web UI in Docker (Linux only)
+
+> [!WARNING]
+> **Correct containerized network discovery requires Linux host networking.**
+> A normal bridge-network container sees its own network namespace, not the
+> host's LAN: its ARP cache may be empty and its interfaces and routes describe
+> a Docker bridge. The resulting topology can therefore be silently empty or
+> wrong. Always use `--network host` (already set in `docker-compose.yml`).
+>
+> Docker Desktop on macOS and Windows runs containers inside a Linux VM. Its
+> host networking exposes that VM's interfaces, **not the Mac or Windows host's
+> real LAN interfaces**. This container is for Linux hosts. On macOS, run the
+> native `ndscan web` binary instead.
+
+Build the image, optionally supplying the version embedded in the binary:
+
+```bash
+docker build --build-arg VERSION=0.1.0 -t ndscan:0.1.0 .
+```
+
+Run it directly on a Linux host:
+
+```bash
+docker run --rm \
+  --network host \
+  --cap-add NET_RAW \
+  --cap-add NET_ADMIN \
+  ndscan:0.1.0
+```
+
+Or use Compose (which builds the image and enables host networking):
+
+```bash
+NDSCAN_VERSION=0.1.0 docker compose up --build -d
+```
+
+Open <http://127.0.0.1:8080/> on the Linux host. With host networking there is
+no Docker port publishing step: the container's default
+`127.0.0.1:8080` listener is the host's listener. A bridge-mode port mapping
+such as `127.0.0.1:8080:8080` is intentionally not used because bridge mode
+would make scans observe the container network rather than the host LAN.
+
+The image omits `nmap` to keep the runtime small. The web UI's default fast path
+uses ndscan's native scanner and does not need it. Presets or features that
+require nmap are unavailable in this image; install and run the native binary
+if those are needed.
+
+> [!CAUTION]
+> The web UI is a remote-control surface for a network scanner. Exposing it
+> beyond loopback or a carefully controlled, trusted LAN lets other users start
+> scans of networks reachable by the host. Do not expose it to the internet,
+> and add authentication and firewall controls before changing its listen
+> address.
+
 ---
 
 ## Interactive TUI
