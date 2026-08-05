@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ndscan — network topology</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #11161d;
+    --panel-2: #161d26;
+    --border: #232c38;
+    --text: #d7dee6;
+    --muted: #8b98a5;
+    --accent: #4f8ef7;
+    --sev-high: #ef4444;
+    --sev-warn: #f59e0b;
+    --sev-info: #38bdf8;
+    --sev-none: #64748b;
+    --ok: #34d399;
+    --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 16px;
+    margin: 0;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+  header h1 .sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  #demo-badge {
+    display: none;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #1a1206;
+    background: var(--sev-warn);
+    border-radius: 4px;
+    padding: 2px 7px;
+  }
+  #demo-badge.on { display: inline-block; }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .controls input[type="text"], .controls select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 13px;
+    outline: none;
+  }
+  .controls input[type="text"] { width: 220px; }
+  .controls input[type="text"]:focus, .controls select:focus { border-color: var(--accent); }
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { accent-color: var(--accent); }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.45; cursor: default; filter: none; }
+  button.ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button.danger { background: #b3352c; }
+
+  #progress-wrap {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #progress-wrap.on { display: flex; }
+  #progress-bar {
+    flex: 1;
+    height: 6px;
+    background: var(--panel-2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  #progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.25s ease;
+  }
+  #progress-fill.indeterminate {
+    width: 30% !important;
+    animation: slide 1.2s linear infinite;
+  }
+  @keyframes slide {
+    from { margin-left: -30%; }
+    to { margin-left: 100%; }
+  }
+
+  #error-banner {
+    display: none;
+    padding: 8px 16px;
+    background: #3a1414;
+    color: var(--err);
+    border-bottom: 1px solid #5c2222;
+    font-size: 13px;
+  }
+  #error-banner.on { display: block; }
+  #error-banner button { float: right; background: none; color: var(--err); padding: 0 4px; font-weight: 400; }
+
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    grid-template-rows: minmax(420px, 58vh) auto;
+    grid-template-areas:
+      "graph panel"
+      "table table";
+    gap: 12px;
+    padding: 12px 16px;
+    min-height: calc(100% - 49px);
+  }
+  @media (max-width: 1100px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-areas: "graph" "panel" "table";
+      grid-template-rows: minmax(360px, 50vh) auto auto;
+    }
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .card h2 {
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card h2 .count { color: var(--text); }
+
+  #graph-card { grid-area: graph; position: relative; }
+  #graph { flex: 1; width: 100%; min-height: 0; display: block; cursor: grab; }
+  #graph.dragging { cursor: grabbing; }
+  .graph-overlay {
+    position: absolute;
+    inset: 44px 0 0 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: var(--muted);
+    pointer-events: none;
+    padding: 20px;
+  }
+  .graph-overlay.on { display: flex; }
+  .graph-overlay .big { font-size: 15px; margin-bottom: 6px; color: var(--text); }
+  #graph-legend {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    background: rgba(17, 22, 29, 0.9);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 11px;
+    color: var(--muted);
+    pointer-events: none;
+  }
+  #graph-legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #graph-legend .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  #graph-legend .line { width: 16px; height: 0; border-top: 2px solid var(--muted); flex: none; }
+  #graph-legend .line.dashed { border-top-style: dashed; border-color: var(--sev-warn); }
+
+  .node circle { stroke: rgba(255,255,255,0.25); stroke-width: 1.5; cursor: pointer; }
+  .node.selected circle { stroke: #fff; stroke-width: 2.5; }
+  .node text {
+    fill: var(--text);
+    font-size: 11px;
+    text-anchor: middle;
+    pointer-events: none;
+    paint-order: stroke;
+    stroke: var(--bg);
+    stroke-width: 3px;
+  }
+  .edge { stroke: #3a4756; stroke-width: 1.5; }
+  .edge.routed { stroke: var(--sev-warn); stroke-dasharray: 6 5; opacity: 0.85; }
+  .edge-label { fill: var(--muted); font-size: 10px; text-anchor: middle; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+
+  #detail-card { grid-area: panel; }
+  #detail-body { padding: 12px 14px; overflow-y: auto; font-size: 13px; }
+  #detail-body .placeholder { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 84px 1fr; gap: 3px 10px; margin-bottom: 12px; }
+  .kv dt { color: var(--muted); margin: 0; }
+  .kv dd { margin: 0; word-break: break-all; }
+  .pill {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 4px;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  .pill.high { background: rgba(239,68,68,0.18); color: var(--sev-high); }
+  .pill.warn { background: rgba(245,158,11,0.18); color: var(--sev-warn); }
+  .pill.info { background: rgba(56,189,248,0.18); color: var(--sev-info); }
+  .pill.none { background: rgba(100,116,139,0.22); color: var(--muted); }
+  table.ports { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.ports th, table.ports td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+  table.ports th { color: var(--muted); font-weight: 600; }
+  .risk { color: var(--muted); font-size: 11px; }
+
+  #table-card { grid-area: table; }
+  #table-filter {
+    margin-left: auto;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-size: 12px;
+    width: 220px;
+    outline: none;
+    text-transform: none;
+  }
+  #table-filter:focus { border-color: var(--accent); }
+  #hosts-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #hosts-table th, #hosts-table td {
+    text-align: left;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  #hosts-table th {
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    user-select: none;
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+  }
+  #hosts-table th:hover { color: var(--text); }
+  #hosts-table th .arrow { font-size: 10px; margin-left: 4px; }
+  #hosts-table tbody tr { cursor: pointer; }
+  #hosts-table tbody tr:hover { background: var(--panel-2); }
+  #hosts-table tbody tr.selected { background: rgba(79,142,247,0.12); }
+  #table-empty { padding: 18px; color: var(--muted); text-align: center; display: none; }
+  #table-wrap { overflow-x: auto; }
+  td .sev-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ndscan<span class="sub">network topology</span></h1>
+  <span id="demo-badge">demo data</span>
+  <div class="controls">
+    <input type="text" id="target-input" placeholder="target, e.g. 192.168.1.0/24" spellcheck="false">
+    <select id="preset-select" title="scan preset">
+      <option value="quick" selected>quick</option>
+      <option value="default">default</option>
+      <option value="udp">udp</option>
+      <option value="deep">deep</option>
+    </select>
+    <label class="toggle" title="fast native scanner">
+      <input type="checkbox" id="fast-toggle" checked> fast
+    </label>
+    <button id="scan-btn">Scan</button>
+    <button id="cancel-btn" class="danger" disabled>Cancel</button>
+  </div>
+</header>
+
+<div id="progress-wrap">
+  <span id="progress-label">scanning…</span>
+  <div id="progress-bar"><div id="progress-fill"></div></div>
+  <span id="progress-pct"></span>
+</div>
+
+<div id="error-banner"><span id="error-text"></span><button id="error-close" title="dismiss">✕</button></div>
+
+<main>
+  <section class="card" id="graph-card">
+    <h2>Topology</h2>
+    <svg id="graph" role="img" aria-label="network topology graph">
+      <g id="viewport">
+        <g id="edges"></g>
+        <g id="edge-labels"></g>
+        <g id="nodes"></g>
+      </g>
+    </svg>
+    <div class="graph-overlay" id="graph-empty">
+      <div>
+        <div class="big">No scan data yet</div>
+        <div>Enter a target above and press Scan to discover your network.</div>
+      </div>
+    </div>
+    <div class="graph-overlay" id="graph-none">
+      <div>
+        <div class="big">Scan found nothing</div>
+        <div>The last scan completed but discovered no hosts.</div>
+      </div>
+    </div>
+    <div id="graph-legend">
+      <div class="row"><span class="dot" style="background:var(--sev-high)"></span> high risk</div>
+      <div class="row"><span class="dot" style="background:var(--sev-warn)"></span> warning</div>
+      <div class="row"><span class="dot" style="background:var(--sev-info)"></span> info</div>
+      <div class="row"><span class="dot" style="background:var(--sev-none)"></span> no findings</div>
+      <div class="row"><span class="line"></span> attached segment</div>
+      <div class="row"><span class="line dashed"></span> routed segment</div>
+    </div>
+  </section>
+
+  <aside class="card" id="detail-card">
+    <h2>Details</h2>
+    <div id="detail-body"><div class="placeholder">Click a node in the graph or a row in the table.</div></div>
+  </aside>
+
+  <section class="card" id="table-card">
+    <h2>Hosts <span class="count" id="host-count"></span>
+      <input type="text" id="table-filter" placeholder="filter by IP, hostname, vendor, MAC…" spellcheck="false">
+    </h2>
+    <div id="table-wrap">
+      <table id="hosts-table">
+        <thead>
+          <tr>
+            <th data-key="ip">IP</th>
+            <th data-key="hostname">Hostname</th>
+            <th data-key="vendor">Vendor</th>
+            <th data-key="severity">Severity</th>
+            <th data-key="ports">Open ports</th>
+            <th data-key="rtt">RTT</th>
+          </tr>
+        </thead>
+        <tbody id="hosts-tbody"></tbody>
+      </table>
+      <div id="table-empty">No hosts to show.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Demo data — used only when the backend API is unreachable (e.g. the *
+ * page is opened straight from disk during development).              *
+ * ------------------------------------------------------------------ */
+const DEMO_DATA = {
+  version: "0.1.1-demo",
+  scanning: false,
+  targets: ["192.168.2.0/24", "10.10.20.0/24"],
+  lastScan: "2026-08-05T19:54:21Z",
+  topology: {
+    gateway: "192.168.2.1",
+    segments: [
+      {
+        cidr: "192.168.2.0/24",
+        interface: "en0",
+        selfAddr: "192.168.2.157",
+        notScanned: false,
+        routedVia: "",
+        nodes: [
+          {
+            isGateway: true, isSelf: false, severity: "warn",
+            host: {
+              ip: "192.168.2.1", hostname: "router.lan", mac: "aa:bb:cc:dd:ee:ff",
+              vendor: "Ubiquiti", os: "Linux 5.X", rtt: "3.1ms", up: true,
+              ports: [
+                { port: 22, proto: "tcp", service: "ssh", severity: "info", risk: "SSH exposed on LAN" },
+                { port: 53, proto: "tcp", service: "domain", severity: "", risk: "" },
+                { port: 443, proto: "tcp", service: "https", severity: "info", risk: "" },
+                { port: 8080, proto: "tcp", service: "http-proxy", severity: "warn", risk: "Unauthenticated admin interface" }
+              ]
+            }
+          },
+          {
+            isGateway: false, isSelf: true, severity: "",
+            host: {
+              ip: "192.168.2.157", hostname: "emres-macbook", mac: "f0:18:98:11:22:33",
+              vendor: "Apple", os: "macOS 15.X", rtt: "0.1ms", up: true, ports: []
+            }
+          },
+          {
+            isGateway: false, isSelf: false, severity: "high",
+            host: {
+              ip: "192.168.2.23", hostname: "old-nas", mac: "00:11:32:44:55:66",
+              vendor: "Synology", os: "Linux 4.X", rtt: "5.6ms", up: true,
+              ports: [
+                { port: 21, proto: "tcp", service: "ftp", severity: "high", risk: "Plaintext credentials" },
+                { port: 23, proto: "tcp", service: "telnet", severity: "high", risk: "Plaintext remote shell" },
+                { port: 5000, proto: "tcp", service: "http", severity: "warn", risk: "HTTP admin panel" },
+                { port: 5001, proto: "tcp", service: "https", severity: "info", risk: "" }
+              ]
+            }
+          },
+          {
+            isGateway: false, isSelf: false, severity: "info",
+            host: {
+              ip: "192.168.2.42", hostname: "printer", mac: "3c:52:82:77:88:99",
+              vendor: "HP", os: "", rtt: "12.4ms", up: true,
+              ports: [
+                { port: 80, proto: "tcp", service: "http", severity: "info", risk: "Embedded web server" },
+                { port: 9100, proto: "tcp", service: "jetdirect", severity: "", risk: "" }
+              ]
+            }
+          },
+          {
+            isGateway: false, isSelf: false, severity: "",
+            host: {
+              ip: "192.168.2.108", hostname: "", mac: "b8:27:eb:aa:bb:cc",
+              vendor: "Raspberry Pi Trading", os: "Linux 6.X", rtt: "8.9ms", up: true, ports: []
+            }
+          }
+        ]
+      },
+      {
+        cidr: "10.10.20.0/24",
+        interface: "",
+        selfAddr: "",
+        notScanned: false,
+        routedVia: "192.168.2.1",
+        nodes: [
+          {
+            isGateway: false, isSelf: false, severity: "warn",
+            host: {
+              ip: "10.10.20.5", hostname: "cam-01", mac: "44:d1:fa:12:34:56",
+              vendor: "Hikvision", os: "", rtt: "21.7ms", up: true,
+              ports: [
+                { port: 80, proto: "tcp", service: "http", severity: "warn", risk: "Default credentials possible" },
+                { port: 554, proto: "tcp", service: "rtsp", severity: "info", risk: "" }
+              ]
+            }
+          },
+          {
+            isGateway: false, isSelf: false, severity: "info",
+            host: {
+              ip: "10.10.20.9", hostname: "iot-hub", mac: "dc:a6:32:dd:ee:ff",
+              vendor: "Raspberry Pi Trading", os: "Linux 6.X", rtt: "18.2ms", up: true,
+              ports: [
+                { port: 1883, proto: "tcp", service: "mqtt", severity: "info", risk: "MQTT broker" }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        cidr: "172.16.5.0/24",
+        interface: "en5",
+        selfAddr: "172.16.5.2",
+        notScanned: true,
+        routedVia: "",
+        nodes: []
+      }
+    ]
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ * App state                                                           *
+ * ------------------------------------------------------------------ */
+const S = {
+  demo: false,          // true when the API is unreachable
+  scanning: false,
+  topology: null,       // last known Topology object (or null)
+  hosts: new Map(),     // ip -> Host, accumulates live `host` events
+  selectedIp: null,
+  sort: { key: "ip", dir: 1 },
+  filter: "",
+  lastScan: null
+};
+
+const $ = (id) => document.getElementById(id);
+const SEV_ORDER = { "": 0, info: 1, warn: 2, high: 3 };
+const SEV_COLOR = { "": "var(--sev-none)", info: "var(--sev-info)", warn: "var(--sev-warn)", high: "var(--sev-high)" };
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function showError(msg) {
+  $("error-text").textContent = msg;
+  $("error-banner").classList.add("on");
+}
+$("error-close").addEventListener("click", () => $("error-banner").classList.remove("on"));
+
+function setDemoMode(on) {
+  S.demo = on;
+  $("demo-badge").classList.toggle("on", on);
+}
+
+/* ------------------------------------------------------------------ *
+ * Backend API (with demo fallback)                                    *
+ * ------------------------------------------------------------------ */
+async function apiGet(path) {
+  const r = await fetch(path, { headers: { "Accept": "application/json" } });
+  if (!r.ok) throw new Error(path + " → HTTP " + r.status);
+  return r.json();
+}
+
+async function apiPost(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(data.error || ("HTTP " + r.status));
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+
+async function loadInitialState() {
+  try {
+    const st = await apiGet("/api/state");
+    setDemoMode(false);
+    applyState(st);
+  } catch (e) {
+    // No backend (file:// dev, or server down) — fall back to demo data.
+    setDemoMode(true);
+    applyState(DEMO_DATA);
+  }
+}
+
+function applyState(st) {
+  S.scanning = !!st.scanning;
+  S.topology = st.topology || null;
+  S.lastScan = st.lastScan || null;
+  S.hosts.clear();
+  if (S.topology) {
+    for (const seg of S.topology.segments || []) {
+      if (seg.notScanned) continue;
+      for (const n of seg.nodes || []) {
+        if (n.host && n.host.ip) S.hosts.set(n.host.ip, n.host);
+      }
+    }
+  }
+  if (st.targets && st.targets.length) $("target-input").value = st.targets.join(", ");
+  renderAll();
+}
+
+/* ------------------------------------------------------------------ *
+ * Live events (SSE)                                                   *
+ * ------------------------------------------------------------------ */
+let es = null;
+
+function connectEvents() {
+  if (S.demo) return; // no stream in demo mode
+  if (es) es.close();
+  es = new EventSource("/api/events");
+
+  es.addEventListener("phase", (ev) => {
+    try { onPhase(JSON.parse(ev.data)); } catch (_) {}
+  });
+  es.addEventListener("host", (ev) => {
+    try {
+      const h = JSON.parse(ev.data);
+      if (h && h.ip) {
+        S.hosts.set(h.ip, h);
+        renderTable();
+      }
+    } catch (_) {}
+  });
+  es.addEventListener("done", (ev) => {
+    let d = null;
+    try { d = JSON.parse(ev.data); } catch (_) {}
+    onScanDone(d);
+  });
+  es.addEventListener("error", (ev) => {
+    // An SSE "error" *event* carries a JSON payload; a transport failure hits onerror instead.
+    if (ev.data) {
+      try { showError(JSON.parse(ev.data).error || "scan error"); } catch (_) {}
+    }
+  });
+  es.onerror = () => {
+    // EventSource reconnects on its own; just reflect it in the UI.
+    if (S.scanning) setProgressLabel("connection lost — reconnecting…");
+  };
+}
+
+function onPhase(p) {
+  S.scanning = true;
+  updateScanButtons();
+  showProgress(true);
+  const label = p.phase ? "phase: " + p.phase : "scanning…";
+  if (typeof p.done === "number" && typeof p.total === "number" && p.total > 0) {
+    const pct = Math.min(100, Math.round((p.done / p.total) * 100));
+    setProgress(label + " — " + p.done + "/" + p.total, pct);
+  } else {
+    setProgressIndeterminate(label);
+  }
+}
+
+function onScanDone(d) {
+  S.scanning = false;
+  updateScanButtons();
+  const cancelled = d && d.cancelled;
+  const n = d && typeof d.hosts === "number" ? d.hosts : S.hosts.size;
+  const ms = d && typeof d.elapsedMs === "number" ? d.elapsedMs : 0;
+  setProgress(cancelled ? "cancelled" : "done — " + n + " hosts, " + (ms / 1000).toFixed(1) + "s", 100);
+  setTimeout(() => showProgress(false), 2500);
+  // Pull the fresh topology now that the scan finished.
+  if (!S.demo) {
+    apiGet("/api/topology").then((t) => {
+      S.topology = t || null;
+      renderGraph();
+      renderTable();
+    }).catch(() => {});
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Scan controls                                                       *
+ * ------------------------------------------------------------------ */
+function currentTargets() {
+  return $("target-input").value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function startScan() {
+  const targets = currentTargets();
+  if (!targets.length) { showError("Enter at least one scan target."); return; }
+  const body = { targets, fast: $("fast-toggle").checked, preset: $("preset-select").value };
+
+  S.hosts.clear();
+  renderTable();
+
+  if (S.demo) { runDemoScan(); return; }
+  try {
+    await apiPost("/api/scan", body);
+    S.scanning = true;
+    updateScanButtons();
+    showProgress(true);
+    setProgressIndeterminate("starting…");
+  } catch (e) {
+    if (e.status === 409) {
+      showError("A scan is already running.");
+      S.scanning = true;
+      updateScanButtons();
+    } else {
+      showError("Failed to start scan: " + e.message);
+    }
+  }
+}
+
+async function cancelScan() {
+  if (S.demo) { stopDemoScan(true); return; }
+  try {
+    await apiPost("/api/cancel");
+  } catch (e) {
+    if (e.status !== 409) showError("Failed to cancel: " + e.message);
+  }
+}
+
+function updateScanButtons() {
+  $("scan-btn").disabled = S.scanning;
+  $("cancel-btn").disabled = !S.scanning;
+}
+
+/* ------------------------------------------------------------------ *
+ * Progress bar                                                        *
+ * ------------------------------------------------------------------ */
+function showProgress(on) { $("progress-wrap").classList.toggle("on", on); }
+function setProgressLabel(t) { $("progress-label").textContent = t; }
+function setProgress(label, pct) {
+  setProgressLabel(label);
+  const fill = $("progress-fill");
+  fill.classList.remove("indeterminate");
+  fill.style.width = pct + "%";
+  $("progress-pct").textContent = pct + "%";
+}
+function setProgressIndeterminate(label) {
+  setProgressLabel(label);
+  const fill = $("progress-fill");
+  fill.classList.add("indeterminate");
+  $("progress-pct").textContent = "";
+}
+
+/* ------------------------------------------------------------------ *
+ * Demo scan simulation (only when the API is unreachable)             *
+ * ------------------------------------------------------------------ */
+let demoTimer = null;
+
+function runDemoScan() {
+  stopDemoScan(false);
+  S.scanning = true;
+  updateScanButtons();
+  showProgress(true);
+
+  // Replay the demo topology's hosts as a fake live scan.
+  const allHosts = [];
+  for (const seg of DEMO_DATA.topology.segments) {
+    if (seg.notScanned) continue;
+    for (const n of seg.nodes) if (n.host && n.host.ip) allHosts.push(n.host);
+  }
+  const total = allHosts.length * 20;
+  let done = 0, idx = 0;
+  const phases = ["discover", "resolve", "ports"];
+
+  S.topology = null; // simulate hosts streaming in before final topology
+  renderGraph();
+
+  demoTimer = setInterval(() => {
+    done += 20;
+    onPhase({ phase: phases[Math.min(phases.length - 1, Math.floor(idx / 3))], done: Math.min(done, total), total });
+    if (idx < allHosts.length) {
+      S.hosts.set(allHosts[idx].ip, allHosts[idx]);
+      renderTable();
+      idx++;
+    }
+    if (idx >= allHosts.length) {
+      stopDemoScan(false);
+      S.topology = DEMO_DATA.topology;
+      renderGraph();
+      renderTable();
+      onScanDone({ hosts: allHosts.length, openPorts: 14, elapsedMs: 2400, cancelled: false });
+    }
+  }, 350);
+}
+
+function stopDemoScan(cancelled) {
+  if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+  if (cancelled) {
+    S.scanning = false;
+    updateScanButtons();
+    S.topology = DEMO_DATA.topology;
+    renderGraph();
+    renderTable();
+    onScanDone({ hosts: S.hosts.size, openPorts: 0, elapsedMs: 0, cancelled: true });
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Topology graph — hand-rolled force layout on SVG                    *
+ * ------------------------------------------------------------------ */
+const svg = $("graph");
+const NS = "http://www.w3.org/2000/svg";
+const G = {
+  nodes: [],      // {id,label,kind,severity,host,x,y,vx,vy,fx,fy,r}
+  edges: [],      // {a,b,routed,label}
+  alpha: 1,
+  view: { x: 0, y: 0, k: 1 },
+  fitted: false
+};
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function findNode(topology, pred) {
+  for (const seg of topology.segments || []) {
+    for (const n of seg.nodes || []) if (pred(n, seg)) return n;
+  }
+  return null;
+}
+
+function buildGraph(topology) {
+  const nodes = [], edges = [];
+  const byId = new Map();
+  const add = (n) => { nodes.push(n); byId.set(n.id, n); return n; };
+
+  const gwIp = topology.gateway || "";
+  const segs = topology.segments || [];
+
+  // The scanning machine: prefer the isSelf node, else synthesize one from selfAddr.
+  let selfN = findNode(topology, (n) => n.isSelf);
+  let selfId;
+  if (selfN && selfN.host) {
+    selfId = selfN.host.ip;
+    add({ id: selfId, label: selfN.host.hostname || selfN.host.ip, kind: "self", severity: selfN.severity || "", host: selfN.host, r: 16 });
+  } else {
+    const seg = segs.find((s) => s.selfAddr);
+    selfId = seg ? seg.selfAddr : "self";
+    add({ id: selfId, label: "this machine", kind: "self", severity: "", host: seg ? { ip: seg.selfAddr } : null, r: 16 });
+  }
+  const selfNode = byId.get(selfId);
+
+  // Gateway node (may live inside a segment's node list).
+  let gwNode = null;
+  const gwN = gwIp ? findNode(topology, (n) => n.isGateway || (n.host && n.host.ip === gwIp)) : null;
+  if (gwN && gwN.host) {
+    gwNode = add({ id: gwN.host.ip, label: gwN.host.hostname || gwN.host.ip, kind: "gateway", severity: gwN.severity || "", host: gwN.host, r: 14 });
+  } else if (gwIp) {
+    gwNode = add({ id: gwIp, label: gwIp, kind: "gateway", severity: "", host: { ip: gwIp }, r: 14 });
+  }
+  if (gwNode && selfNode) edges.push({ a: selfNode, b: gwNode, routed: false });
+
+  for (const seg of segs) {
+    const routed = !!seg.routedVia;
+
+    if (seg.notScanned) {
+      const ph = add({
+        id: "seg:" + seg.cidr, label: seg.cidr + " — attached, not scanned",
+        kind: "unknown", severity: "", host: null, r: 10
+      });
+      edges.push({ a: selfNode, b: ph, routed: false, label: seg.interface || "" });
+      continue;
+    }
+
+    // Attachment point for this segment's hosts: gateway if routed or if the
+    // gateway lives in this segment, otherwise this machine.
+    const gwInSeg = gwNode && (seg.nodes || []).some((n) => n.host && n.host.ip === gwNode.id);
+    const parent = (routed || gwInSeg) && gwNode ? gwNode : selfNode;
+
+    for (const n of seg.nodes || []) {
+      if (!n.host || !n.host.ip) continue;
+      if (byId.has(n.host.ip)) continue; // self / gateway already added
+      const gn = add({
+        id: n.host.ip, label: n.host.hostname || n.host.ip,
+        kind: "host", severity: n.severity || "", host: n.host, r: 10
+      });
+      edges.push({ a: parent, b: gn, routed, label: routed ? "via " + seg.routedVia : "" });
+    }
+  }
+
+  return { nodes, edges };
+}
+
+function seedPositions() {
+  // Deterministic-ish seed: self at center, others on a ring.
+  const w = svg.clientWidth || 800, h = svg.clientHeight || 500;
+  const cx = w / 2, cy = h / 2;
+  const ring = Math.min(w, h) * 0.35;
+  let i = 0;
+  for (const n of G.nodes) {
+    if (n.kind === "self") { n.x = cx; n.y = cy; }
+    else {
+      const a = (i / Math.max(1, G.nodes.length - 1)) * Math.PI * 2;
+      n.x = cx + Math.cos(a) * ring * (0.6 + 0.4 * Math.random());
+      n.y = cy + Math.sin(a) * ring * (0.6 + 0.4 * Math.random());
+      i++;
+    }
+    n.vx = 0; n.vy = 0; n.fx = null; n.fy = null;
+  }
+}
+
+function tick() {
+  if (G.alpha > 0.005) {
+    const nodes = G.nodes, edges = G.edges;
+    const w = svg.clientWidth || 800, h = svg.clientHeight || 500;
+    const k = G.alpha;
+
+    // Repulsion (all pairs — networks are small).
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+        const f = Math.min(8, 2600 / d2) * k;
+        const d = Math.sqrt(d2);
+        const fx = (dx / d) * f, fy = (dy / d) * f;
+        a.vx -= fx; a.vy -= fy;
+        b.vx += fx; b.vy += fy;
+      }
+    }
+    // Springs along edges.
+    for (const e of edges) {
+      const rest = e.routed ? 150 : 110;
+      let dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
+      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const f = (d - rest) * 0.02 * k;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      e.a.vx += fx; e.a.vy += fy;
+      e.b.vx -= fx; e.b.vy -= fy;
+    }
+    // Weak centering gravity.
+    for (const n of nodes) {
+      n.vx += (w / 2 - n.x) * 0.004 * k;
+      n.vy += (h / 2 - n.y) * 0.004 * k;
+    }
+    // Integrate with damping.
+    for (const n of nodes) {
+      if (n.fx != null) { n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0; continue; }
+      n.vx *= 0.85; n.vy *= 0.85;
+      n.x += n.vx; n.y += n.vy;
+    }
+    G.alpha *= 0.985;
+  }
+  paintGraph();
+  requestAnimationFrame(tick);
+}
+
+function nodeFill(n) {
+  if (n.kind === "unknown") return "#2a3341";
+  return SEV_COLOR[n.severity] || "var(--sev-none)";
+}
+
+function paintGraph() {
+  const edgesG = $("edges"), labelsG = $("edge-labels"), nodesG = $("nodes");
+  edgesG.textContent = ""; labelsG.textContent = ""; nodesG.textContent = "";
+
+  for (const e of G.edges) {
+    edgesG.appendChild(svgEl("line", {
+      x1: e.a.x, y1: e.a.y, x2: e.b.x, y2: e.b.y,
+      class: "edge" + (e.routed ? " routed" : "")
+    }));
+    if (e.label) {
+      const t = svgEl("text", { x: (e.a.x + e.b.x) / 2, y: (e.a.y + e.b.y) / 2 - 4, class: "edge-label" });
+      t.textContent = e.label;
+      labelsG.appendChild(t);
+    }
+  }
+  for (const n of G.nodes) {
+    const g = svgEl("g", { class: "node" + (S.selectedIp && n.host && n.host.ip === S.selectedIp ? " selected" : ""), transform: "translate(" + n.x + "," + n.y + ")" });
+    const c = svgEl("circle", { r: n.r, fill: nodeFill(n) });
+    if (n.kind === "gateway") c.setAttribute("stroke-width", "3");
+    if (n.kind === "unknown") { c.setAttribute("stroke-dasharray", "4 3"); c.setAttribute("stroke", "var(--muted)"); }
+    g.appendChild(c);
+    if (n.kind === "self") {
+      const t0 = svgEl("text", { y: 3.5, style: "font-size:9px;font-weight:700" });
+      t0.textContent = "YOU";
+      g.appendChild(t0);
+    }
+    const t = svgEl("text", { y: n.r + 13 });
+    t.textContent = n.label;
+    g.appendChild(t);
+    g.addEventListener("pointerdown", (ev) => startNodeDrag(ev, n));
+    g.addEventListener("click", () => { if (!n._dragged) selectNode(n); n._dragged = false; });
+    nodesG.appendChild(g);
+  }
+  applyView();
+}
+
+function applyView() {
+  $("viewport").setAttribute("transform",
+    "translate(" + G.view.x + "," + G.view.y + ") scale(" + G.view.k + ")");
+}
+
+function renderGraph() {
+  const t = S.topology;
+  const hasSegs = t && (t.segments || []).length > 0;
+  const hasHosts = S.hosts.size > 0;
+
+  $("graph-empty").classList.toggle("on", !t);
+  $("graph-none").classList.toggle("on", !!t && !hasSegs || (!!t && hasSegs && !hasHosts && !S.scanning &&
+    (t.segments || []).every((s) => s.notScanned || !(s.nodes || []).length)));
+
+  if (!t) { G.nodes = []; G.edges = []; paintGraph(); return; }
+
+  const g = buildGraph(t);
+  G.nodes = g.nodes;
+  G.edges = g.edges;
+  seedPositions();
+  G.alpha = 1;
+  if (!G.fitted) { G.view = { x: 0, y: 0, k: 1 }; G.fitted = true; }
+}
+
+/* --- pan / zoom / drag ------------------------------------------- */
+function toGraph(ev) {
+  const r = svg.getBoundingClientRect();
+  return {
+    x: (ev.clientX - r.left - G.view.x) / G.view.k,
+    y: (ev.clientY - r.top - G.view.y) / G.view.k
+  };
+}
+
+let panDrag = null;
+svg.addEventListener("pointerdown", (ev) => {
+  if (ev.target !== svg) return; // node drags handle themselves
+  panDrag = { x: ev.clientX, y: ev.clientY, vx: G.view.x, vy: G.view.y };
+  svg.setPointerCapture(ev.pointerId);
+  svg.classList.add("dragging");
+});
+svg.addEventListener("pointermove", (ev) => {
+  if (!panDrag) return;
+  G.view.x = panDrag.vx + (ev.clientX - panDrag.x);
+  G.view.y = panDrag.vy + (ev.clientY - panDrag.y);
+  applyView();
+});
+svg.addEventListener("pointerup", () => { panDrag = null; svg.classList.remove("dragging"); });
+svg.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const r = svg.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const k2 = Math.min(4, Math.max(0.25, G.view.k * factor));
+  G.view.x = mx - ((mx - G.view.x) / G.view.k) * k2;
+  G.view.y = my - ((my - G.view.y) / G.view.k) * k2;
+  G.view.k = k2;
+  applyView();
+}, { passive: false });
+
+function startNodeDrag(ev, n) {
+  ev.stopPropagation();
+  const start = toGraph(ev);
+  const off = { x: n.x - start.x, y: n.y - start.y };
+  G.alpha = Math.max(G.alpha, 0.3);
+  const move = (e2) => {
+    n._dragged = true;
+    const p = toGraph(e2);
+    n.fx = p.x + off.x; n.fy = p.y + off.y;
+  };
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    n.fx = null; n.fy = null;
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
+/* ------------------------------------------------------------------ *
+ * Detail panel                                                        *
+ * ------------------------------------------------------------------ */
+function selectNode(n) {
+  if (!n) return;
+  if (n.kind === "unknown") {
+    S.selectedIp = null;
+    $("detail-body").innerHTML =
+      '<div class="placeholder">' + esc(n.label) +
+      "<br><br>This segment is attached to this machine but was not covered by the scan, so its contents are unknown.</div>";
+    renderTable();
+    return;
+  }
+  if (n.host && n.host.ip) {
+    S.selectedIp = n.host.ip;
+    renderDetail(n.host, n.kind);
+    renderTable();
+  }
+}
+
+function renderDetail(h, kind) {
+  const sev = worstSeverity(h);
+  const rows = [
+    ["IP", esc(h.ip)],
+    ["Hostname", esc(h.hostname) || "—"],
+    ["MAC", esc(h.mac) || "—"],
+    ["Vendor", esc(h.vendor) || "—"],
+    ["OS", esc(h.os) || "—"],
+    ["RTT", esc(h.rtt) || "—"],
+    ["Role", kind === "self" ? "this machine" : kind === "gateway" ? "gateway" : "host"],
+    ["Severity", '<span class="pill ' + (sev || "none") + '">' + (sev || "none") + "</span>"]
+  ];
+  let html = '<dl class="kv">';
+  for (const [k, v] of rows) html += "<dt>" + k + "</dt><dd>" + v + "</dd>";
+  html += "</dl>";
+
+  const ports = h.ports || [];
+  if (ports.length) {
+    html += '<table class="ports"><thead><tr><th>Port</th><th>Service</th><th>Severity</th></tr></thead><tbody>';
+    for (const p of ports) {
+      html += "<tr><td>" + esc(p.port) + "/" + esc(p.proto || "tcp") + "</td><td>" +
+        esc(p.service || "?") +
+        (p.risk ? '<div class="risk">' + esc(p.risk) + "</div>" : "") +
+        '</td><td><span class="pill ' + (p.severity || "none") + '">' + (p.severity || "none") + "</span></td></tr>";
+    }
+    html += "</tbody></table>";
+  } else {
+    html += '<div class="placeholder">No open ports found.</div>';
+  }
+  $("detail-body").innerHTML = html;
+}
+
+function worstSeverity(h) {
+  let worst = "";
+  for (const p of h.ports || []) {
+    if ((SEV_ORDER[p.severity || ""] || 0) > (SEV_ORDER[worst] || 0)) worst = p.severity;
+  }
+  return worst;
+}
+
+/* ------------------------------------------------------------------ *
+ * Host table                                                          *
+ * ------------------------------------------------------------------ */
+function ipKey(ip) {
+  return String(ip).split(".").reduce((acc, o) => acc * 256 + (parseInt(o, 10) || 0), 0);
+}
+function rttKey(rtt) {
+  const m = /([\d.]+)/.exec(rtt || "");
+  return m ? parseFloat(m[1]) : Infinity;
+}
+
+function hostSeverity(ip) {
+  // Severity from topology nodes when available, else derived from ports.
+  if (S.topology) {
+    for (const seg of S.topology.segments || []) {
+      for (const n of seg.nodes || []) {
+        if (n.host && n.host.ip === ip) return n.severity || "";
+      }
+    }
+  }
+  const h = S.hosts.get(ip);
+  return h ? worstSeverity(h) : "";
+}
+
+function renderTable() {
+  const tbody = $("hosts-tbody");
+  tbody.textContent = "";
+
+  const filter = S.filter.toLowerCase();
+  let rows = Array.from(S.hosts.values()).filter((h) => {
+    if (!filter) return true;
+    return [h.ip, h.hostname, h.vendor, h.mac].some((v) => (v || "").toLowerCase().includes(filter));
+  });
+
+  const { key, dir } = S.sort;
+  rows.sort((a, b) => {
+    let cmp = 0;
+    switch (key) {
+      case "ip": cmp = ipKey(a.ip) - ipKey(b.ip); break;
+      case "hostname": cmp = (a.hostname || "").localeCompare(b.hostname || ""); break;
+      case "vendor": cmp = (a.vendor || "").localeCompare(b.vendor || ""); break;
+      case "severity": cmp = (SEV_ORDER[hostSeverity(a.ip)] || 0) - (SEV_ORDER[hostSeverity(b.ip)] || 0); break;
+      case "ports": cmp = (a.ports || []).length - (b.ports || []).length; break;
+      case "rtt": cmp = rttKey(a.rtt) - rttKey(b.rtt); break;
+    }
+    return cmp * dir || ipKey(a.ip) - ipKey(b.ip);
+  });
+
+  for (const h of rows) {
+    const sev = hostSeverity(h.ip);
+    const tr = document.createElement("tr");
+    if (h.ip === S.selectedIp) tr.className = "selected";
+    const ports = (h.ports || []).map((p) => p.port + "/" + (p.service || p.proto || "tcp")).join(", ");
+    tr.innerHTML =
+      "<td>" + esc(h.ip) + "</td>" +
+      "<td>" + (esc(h.hostname) || "—") + "</td>" +
+      "<td>" + (esc(h.vendor) || "—") + "</td>" +
+      '<td><span class="sev-dot" style="background:' + (SEV_COLOR[sev] || "var(--sev-none)") + '"></span>' + (sev || "none") + "</td>" +
+      "<td>" + (esc(ports) || "—") + "</td>" +
+      "<td>" + (esc(h.rtt) || "—") + "</td>";
+    tr.addEventListener("click", () => {
+      const gn = G.nodes.find((n) => n.host && n.host.ip === h.ip);
+      if (gn) selectNode(gn);
+      else { S.selectedIp = h.ip; renderDetail(h, "host"); renderTable(); }
+    });
+    tbody.appendChild(tr);
+  }
+
+  $("table-empty").style.display = rows.length ? "none" : "block";
+  $("table-empty").textContent = S.hosts.size
+    ? "No hosts match the filter."
+    : (S.lastScan ? "Last scan found no hosts." : "No hosts yet — run a scan.");
+  $("host-count").textContent = S.hosts.size ? "(" + S.hosts.size + ")" : "";
+
+  // Sort indicators.
+  document.querySelectorAll("#hosts-table th").forEach((th) => {
+    const k = th.getAttribute("data-key");
+    th.innerHTML = th.textContent.replace(/[▲▼]/g, "") +
+      (k === S.sort.key ? '<span class="arrow">' + (S.sort.dir > 0 ? "▲" : "▼") + "</span>" : "");
+  });
+}
+
+document.querySelectorAll("#hosts-table th").forEach((th) => {
+  th.addEventListener("click", () => {
+    const k = th.getAttribute("data-key");
+    if (S.sort.key === k) S.sort.dir *= -1;
+    else S.sort = { key: k, dir: 1 };
+    renderTable();
+  });
+});
+$("table-filter").addEventListener("input", (ev) => { S.filter = ev.target.value; renderTable(); });
+
+/* ------------------------------------------------------------------ *
+ * Wiring + init                                                       *
+ * ------------------------------------------------------------------ */
+$("scan-btn").addEventListener("click", startScan);
+$("cancel-btn").addEventListener("click", cancelScan);
+$("target-input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startScan(); });
+
+function renderAll() {
+  updateScanButtons();
+  renderGraph();
+  renderTable();
+}
+
+requestAnimationFrame(tick);
+loadInitialState().then(() => { if (!S.demo) connectEvents(); });
+</script>
+</body>
+</html>
