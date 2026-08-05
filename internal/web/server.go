@@ -26,6 +26,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
 // Server holds the scan state shared between HTTP handlers.
@@ -44,13 +45,18 @@ type Server struct {
 	hasPrevious bool
 	cancel      context.CancelFunc
 	watch       watchState
+	oui         vendor.DB
 
 	bus *eventBus
 }
 
 // NewServer returns a Server ready to be mounted with Handler.
+//
+// The OUI database is loaded once here rather than per scan: it holds ~39k
+// prefixes, and resolving vendor names is the difference between a map of bare
+// IPs and one that tells you a host is a Ubiquiti AP or an Apple laptop.
 func NewServer(version string) *Server {
-	return &Server{version: version, bus: newEventBus()}
+	return &Server{version: version, bus: newEventBus(), oui: vendor.LoadDefault()}
 }
 
 // Handler returns the HTTP routes: the JSON API plus the embedded frontend,
@@ -229,7 +235,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	rows := ui.BuildRows(results, nil, true, false, scan.ARPCache(ctx, runner))
+	rows := ui.BuildRows(results, s.oui, true, true, scan.ARPCache(ctx, runner))
 	if len(rows) == 0 {
 		writeErr(w, http.StatusNotFound, "host did not return a scan result")
 		return
@@ -362,7 +368,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		}
 	}
 
-	rows := ui.BuildRows(results, nil, true, false, macs)
+	rows := ui.BuildRows(results, s.oui, true, true, macs)
 	for _, row := range rows {
 		s.bus.publish("host", toHostDTO(row))
 	}

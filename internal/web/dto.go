@@ -3,6 +3,7 @@ package web
 import (
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
 // The types here are the wire format defined in docs/web-api-contract.md.
@@ -26,14 +27,20 @@ type portDTO struct {
 }
 
 type hostDTO struct {
-	IP       string    `json:"ip"`
-	Hostname string    `json:"hostname,omitempty"`
-	MAC      string    `json:"mac,omitempty"`
-	Vendor   string    `json:"vendor,omitempty"`
-	OS       string    `json:"os,omitempty"`
-	RTT      string    `json:"rtt,omitempty"`
-	Up       bool      `json:"up"`
-	Ports    []portDTO `json:"ports,omitempty"`
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname,omitempty"`
+	MAC      string `json:"mac,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	// MACKind explains an empty Vendor: "randomized" means the host uses a
+	// privacy MAC and no vendor exists to look up, which is different from a
+	// lookup that simply failed.
+	MACKind    string    `json:"macKind,omitempty"`
+	OS         string    `json:"os,omitempty"`
+	OSAccuracy int       `json:"osAccuracy,omitempty"` // 0-100 confidence
+	OSCPE      string    `json:"osCpe,omitempty"`
+	RTT        string    `json:"rtt,omitempty"`
+	Up         bool      `json:"up"`
+	Ports      []portDTO `json:"ports,omitempty"`
 }
 
 type nodeDTO struct {
@@ -60,7 +67,14 @@ type topologyDTO struct {
 func toHostDTO(r ui.Row) hostDTO {
 	h := hostDTO{
 		IP: r.IP, Hostname: r.Host, MAC: r.MAC, Vendor: r.Vendor,
-		OS: r.OS, RTT: r.RTT, Up: r.Up,
+		OS: r.OS, OSAccuracy: r.OSAccuracy, OSCPE: r.OSCPE,
+		RTT: r.RTT, Up: r.Up,
+	}
+	if r.MAC != "" {
+		h.MACKind = string(vendor.Classify(r.MAC))
+		if h.Vendor == "" {
+			h.Vendor = vendor.Describe(nil, r.MAC)
+		}
 	}
 	for _, p := range r.PortDetails {
 		h.Ports = append(h.Ports, portDTO{
