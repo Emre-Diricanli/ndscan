@@ -253,17 +253,16 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		if scan.NativePortScanViable(cfg, runner) {
 			// Native connect scan: ~70x faster than shelling out to nmap for
 			// the same port set, because every probe runs concurrently under one
-			// timeout policy. Results are emitted through the same OnResult
-			// callback so rows still stream in as hosts complete.
-			native := scan.NativePortScan(ctx, live, cfg, func(done, total int) {
+			// timeout policy. cfg.OnResult fires as each host finishes, so rows
+			// appear while the slowest addresses are still timing out — the
+			// returned slice is deliberately discarded, since consuming it would
+			// mean waiting for exactly that laggard before drawing anything.
+			scan.NativePortScan(ctx, live, cfg, func(done, total int) {
 				select {
 				case ch <- phaseMsg{phase: "scan", done: done, total: total}:
 				default:
 				}
 			})
-			for _, r := range native {
-				cfg.OnResult(r)
-			}
 		} else {
 			_, err = scan.ScanHosts(ctx, live, cfg, runner)
 		}

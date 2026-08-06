@@ -50,6 +50,18 @@ type PortConfig struct {
 	// Progress, if set, is called as hosts complete. May be called from
 	// multiple goroutines.
 	Progress func(done, total int)
+	// OnResult, if set, is called with each host's result the moment that host
+	// finishes probing, rather than making callers wait for the whole scan.
+	//
+	// This is what makes a scan *feel* instant: the first hosts on a LAN answer
+	// in milliseconds, while the slowest addresses spend the full timeout being
+	// unreachable. Without it, a sub-second scan still shows an empty screen
+	// until its slowest member gives up.
+	//
+	// Called from multiple goroutines, so it must be safe for concurrent use.
+	// The returned slice still contains every result, so callers that don't care
+	// about latency can ignore this entirely.
+	OnResult func(PortResult)
 }
 
 // ScanPorts probes the given hosts for open TCP ports using plain connects.
@@ -124,7 +136,20 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 			mu.Lock()
 			done++
 			d := done
+			// Sort under the same lock that guards the map: this host's probe
+			// goroutines have all finished, so the slice is stable now, and
+			// sorting here means the streamed result and the returned one are
+			// identical rather than merely equivalent.
+			ports := byHost[ip]
+			sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
+			byHost[ip] = ports
 			mu.Unlock()
+
+			if cfg.OnResult != nil {
+				// Hand out a copy. The caller may retain this across the rest of
+				// the scan, and the shared map must not be readable through it.
+				cfg.OnResult(PortResult{IP: ip, Ports: append([]OpenPort(nil), ports...)})
+			}
 			if cfg.Progress != nil {
 				cfg.Progress(d, len(hosts))
 			}
@@ -134,9 +159,7 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 
 	out := make([]PortResult, 0, len(hosts))
 	for _, ip := range hosts {
-		ports := byHost[ip]
-		sort.Slice(ports, func(i, j int) bool { return ports[i].Port < ports[j].Port })
-		out = append(out, PortResult{IP: ip, Ports: ports})
+		out = append(out, PortResult{IP: ip, Ports: byHost[ip]})
 	}
 	return out
 }

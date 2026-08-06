@@ -20,11 +20,13 @@ package sweep
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -71,6 +73,15 @@ type Config struct {
 	// Progress, if set, is called as probing advances. May be called from
 	// multiple goroutines.
 	Progress func(done, total int)
+	// Attached marks the targets as being on a directly-connected segment,
+	// which unlocks two shortcuts that are only sound at L2 (see stagedSweep):
+	// treating a TCP refusal as proof of liveness, and re-reading the ARP cache
+	// after probing. Off by default — the conservative reading is that we don't
+	// know what's between us and the target.
+	Attached bool
+	// OnResult, if set, is called with each host as it is discovered rather than
+	// only at the end. Called from multiple goroutines.
+	OnResult func(Result)
 }
 
 // Result is one discovered host.
@@ -85,6 +96,10 @@ type Result struct {
 	// OpenPort is a port observed open during discovery, or 0. It is a free
 	// hint for the later port scan, not a complete list.
 	OpenPort int
+	// Refused is true when the host was found only because it actively reset a
+	// connection. It is alive, but nothing in the probe set was listening — so
+	// an empty port list for this host is a real finding, not a missed scan.
+	Refused bool
 }
 
 const (
@@ -130,13 +145,28 @@ func Run(ctx context.Context, targets []string, cfg Config) []Result {
 		}
 	}
 
-	// 2. TCP connect sweep over the remaining space.
+	// ARP hits are known before a single packet is sent, so stream them first.
+	if cfg.OnResult != nil {
+		for _, r := range hosts {
+			cfg.OnResult(*r)
+		}
+	}
+
+	// 2. Staged TCP connect sweep over the remaining space.
 	if !cfg.SkipTCP && len(addrs) > 0 {
-		for _, hit := range tcpSweep(ctx, addrs, cfg) {
+		for _, hit := range stagedSweep(ctx, addrs, cfg) {
 			r := get(hit.ip)
 			r.ViaTCP = true
 			if r.OpenPort == 0 {
 				r.OpenPort = hit.port
+			}
+			// A refusal proves the host exists but tells us nothing about which
+			// ports are open, so it must not be recorded as an open-port hint.
+			if hit.refused {
+				r.Refused = true
+			}
+			if cfg.OnResult != nil && !r.ViaARP {
+				cfg.OnResult(*r) // ARP hosts already streamed above
 			}
 		}
 	}
@@ -168,28 +198,106 @@ func withDefaults(cfg Config) Config {
 type hit struct {
 	ip   string
 	port int
+	// refused is true when the address answered with a TCP reset rather than an
+	// accepted connection. Something is there; no port is open.
+	refused bool
 }
 
-// tcpSweep probes every (address, port) pair, returning the first open port
-// seen per address. It stops early if the context is cancelled.
-func tcpSweep(ctx context.Context, addrs []string, cfg Config) []hit {
+// stagedSweep probes addresses in rounds instead of scheduling every
+// (address, port) pair upfront.
+//
+// The old approach queued len(addrs)*len(Ports) probes — on a /16 that is about
+// a million connect attempts, and no amount of concurrency tuning makes a
+// million timeouts fast. Almost all of that work is wasted: the overwhelming
+// majority of addresses in a real network are empty, and the ones that aren't
+// usually answer on the first port tried.
+//
+// So: probe one high-yield port across every address first. Addresses that
+// answer are done. Only the still-silent remainder pays for the rest of the port
+// list. On a quiet network this collapses the probe count from
+// addresses x ports to roughly one per address.
+func stagedSweep(ctx context.Context, addrs []string, cfg Config) []hit {
+	s := &sweepState{
+		cfg:      cfg,
+		answered: make(map[string]bool, len(addrs)),
+		dialer:   &net.Dialer{Timeout: cfg.Timeout},
+		// The denominator is the worst case (every address staying silent
+		// through every port). Progress therefore only ever runs ahead of
+		// schedule, which is the honest direction for a bar to be wrong in — it
+		// never stalls at 99% waiting for work that was already skipped.
+		total: len(addrs) * len(cfg.Ports),
+	}
+
+	// Round 1 is a barrier, and it is the one that pays for itself: for the cost
+	// of a single port it eliminates most live addresses from every later probe.
+	//
+	// The remaining ports are deliberately NOT run as further barriers. Each
+	// barrier costs the full timeout of its slowest member, so sixteen sequential
+	// rounds would floor discovery at 16 x timeout — measured at 4.94s on a /24
+	// that finishes in ~1.2s otherwise, i.e. four times *worse* than probing
+	// everything at once. So the survivors go through the remaining ports
+	// concurrently, and the tail costs one timeout rather than fifteen.
+	pending := addrs
+	if len(cfg.Ports) > 0 && ctx.Err() == nil {
+		pending = s.probe(ctx, pending, cfg.Ports[:1])
+		if len(cfg.Ports) > 1 && len(pending) > 0 && ctx.Err() == nil {
+			pending = s.probe(ctx, pending, cfg.Ports[1:])
+		}
+	}
+
+	// Every probe above, answered or not, forced an ARP resolution for its
+	// destination on the local segment. The cache is therefore materially warmer
+	// than it was at the start of the scan, and re-reading it is free — no
+	// packets, microseconds. This is the only way we see a host that ignored
+	// every port we tried but did reply at L2.
+	if cfg.Attached && cfg.ARP != nil && ctx.Err() == nil && len(pending) > 0 {
+		still := make(map[string]bool, len(pending))
+		for _, ip := range pending {
+			still[ip] = true
+		}
+		for ip := range cfg.ARP(ctx) {
+			if !still[ip] {
+				continue
+			}
+			s.mu.Lock()
+			if !s.answered[ip] {
+				s.answered[ip] = true
+				s.hits = append(s.hits, hit{ip: ip})
+			}
+			s.mu.Unlock()
+		}
+	}
+
+	// Progress is reported against a worst-case denominator, so a scan that
+	// short-circuited early would otherwise leave the bar short of full.
+	if cfg.Progress != nil && ctx.Err() == nil {
+		cfg.Progress(s.total, s.total)
+	}
+	return s.hits
+}
+
+// sweepState is the shared bookkeeping for one staged sweep.
+type sweepState struct {
+	cfg      Config
+	dialer   *net.Dialer
+	total    int
+	mu       sync.Mutex
+	hits     []hit
+	done     int
+	answered map[string]bool
+}
+
+// probe dials every (address, port) pair concurrently and returns the addresses
+// that never answered. Probes against an address that has already answered are
+// skipped, so passing the full port list here still costs only one round-trip
+// per live host.
+func (s *sweepState) probe(ctx context.Context, addrs []string, ports []int) []string {
 	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		hits  []hit
-		done  int
-		total = len(addrs) * len(cfg.Ports)
-		sem   = make(chan struct{}, cfg.Concurrency)
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, s.cfg.Concurrency)
 	)
-
-	// Once an address answers, further probes to it are wasted work.
-	answered := make(map[string]bool, len(addrs))
-	var ansMu sync.RWMutex
-
-	dialer := &net.Dialer{Timeout: cfg.Timeout}
-
 	for _, ip := range addrs {
-		for _, port := range cfg.Ports {
+		for _, port := range ports {
 			if ctx.Err() != nil {
 				break
 			}
@@ -203,41 +311,77 @@ func tcpSweep(ctx context.Context, addrs []string, cfg Config) []hit {
 			go func(ip string, port int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-
-				ansMu.RLock()
-				skip := answered[ip]
-				ansMu.RUnlock()
-				if skip || ctx.Err() != nil {
-					mu.Lock()
-					done++
-					mu.Unlock()
-					return
-				}
-
-				addr := net.JoinHostPort(ip, strconv.Itoa(port))
-				conn, err := dialer.DialContext(ctx, "tcp", addr)
-				if err == nil {
-					conn.Close()
-					ansMu.Lock()
-					answered[ip] = true
-					ansMu.Unlock()
-					mu.Lock()
-					hits = append(hits, hit{ip: ip, port: port})
-					mu.Unlock()
-				}
-
-				mu.Lock()
-				done++
-				d := done
-				mu.Unlock()
-				if cfg.Progress != nil {
-					cfg.Progress(d, total)
-				}
+				s.dial(ctx, ip, port)
 			}(ip, port)
 		}
 	}
 	wg.Wait()
-	return hits
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := make([]string, 0, len(addrs))
+	for _, ip := range addrs {
+		if !s.answered[ip] {
+			remaining = append(remaining, ip)
+		}
+	}
+	return remaining
+}
+
+// dial performs one probe and records what it proved.
+func (s *sweepState) dial(ctx context.Context, ip string, port int) {
+	s.mu.Lock()
+	skip := s.answered[ip]
+	s.mu.Unlock()
+	if skip || ctx.Err() != nil {
+		s.advance()
+		return
+	}
+
+	conn, err := s.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	switch {
+	case err == nil:
+		conn.Close()
+		s.record(hit{ip: ip, port: port})
+	case s.cfg.Attached && isRefused(err):
+		// A reset means a TCP stack replied. On a directly-attached segment that
+		// stack belongs to the host itself, so this is solid proof of liveness
+		// even though nothing is listening — and it catches hosts that would
+		// otherwise be invisible for having no open port in our probe set.
+		//
+		// Off-segment we can't claim that: the reset may equally have come from a
+		// firewall answering on behalf of an address where nothing exists. Hence
+		// the Attached gate.
+		s.record(hit{ip: ip, refused: true})
+	}
+	s.advance()
+}
+
+// record marks an address alive, keeping only the first proof per address.
+func (s *sweepState) record(h hit) {
+	s.mu.Lock()
+	if !s.answered[h.ip] {
+		s.answered[h.ip] = true
+		s.hits = append(s.hits, h)
+	}
+	s.mu.Unlock()
+}
+
+func (s *sweepState) advance() {
+	s.mu.Lock()
+	s.done++
+	d := s.done
+	s.mu.Unlock()
+	if s.cfg.Progress != nil {
+		s.cfg.Progress(d, s.total)
+	}
+}
+
+// isRefused reports whether a dial failed because the target actively refused
+// the connection, as opposed to timing out or being unreachable. Only a refusal
+// proves a TCP stack is listening at that address.
+func isRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // expandTargets turns CIDRs and bare addresses into the list of host addresses

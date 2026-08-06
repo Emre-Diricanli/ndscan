@@ -21,12 +21,28 @@ import (
 //
 // progress may be nil. When set it is called from multiple goroutines as hosts
 // complete, so it must be safe for concurrent use.
+//
+// cfg.OnResult, when set, receives each host the instant it finishes probing
+// rather than after every host has. Callers should prefer it over the returned
+// slice: the slice can only be complete once the slowest unreachable address has
+// burned its full timeout, whereas a responsive LAN host streams in
+// milliseconds. The returned slice is still complete, for callers that only want
+// the final answer.
 func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress func(done, total int)) []HostResult {
 	ports := parsePortSpec(cfg.Ports)
+
+	var onResult func(sweep.PortResult)
+	if cfg.OnResult != nil {
+		onResult = func(r sweep.PortResult) {
+			cfg.OnResult(HostResult{IP: r.IP, XMLBytes: syntheticXML(r)})
+		}
+	}
+
 	results := sweep.ScanPorts(ctx, hosts, sweep.PortConfig{
 		Ports:       ports,
 		Concurrency: cfg.Concurrency * 32, // per-host workers -> per-probe workers
 		Progress:    progress,
+		OnResult:    onResult,
 	})
 
 	out := make([]HostResult, 0, len(results))
