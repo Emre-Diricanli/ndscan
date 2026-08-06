@@ -475,7 +475,17 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, star
 	}
 	prev := config.LoadHistory(targets, "", preset)
 	diff := config.Diff(prev, cur)
-	_ = config.SaveHistory(targets, "", preset, cur)
+	// A failed save is not fatal to this scan, but it silently disables change
+	// detection for every future one — the next scan finds no previous snapshot
+	// and reports nothing as new. That is indistinguishable from "nothing
+	// changed", so it has to be said out loud. Running the server once under
+	// sudo is enough to leave a root-owned history directory behind and make
+	// every later unprivileged run fail this way.
+	if err := config.SaveHistory(targets, "", preset, cur); err != nil {
+		s.bus.publish("warning", map[string]string{
+			"warning": "scan history could not be saved, so changes since this scan will not be detected: " + err.Error(),
+		})
+	}
 
 	s.mu.Lock()
 	s.topo = &m

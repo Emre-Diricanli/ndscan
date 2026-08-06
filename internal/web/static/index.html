@@ -774,6 +774,12 @@ function connectEvents() {
       try { showError(JSON.parse(ev.data).error || "scan error"); } catch (_) {}
     }
   });
+  es.addEventListener("warning", (ev) => {
+    // The scan itself succeeded; something around it did not. Shown in the same
+    // banner because a degraded result the user doesn't know about is worse
+    // than a noisy one.
+    try { showError(JSON.parse(ev.data).warning || "scan warning"); } catch (_) {}
+  });
   es.onerror = () => {
     // EventSource reconnects on its own; just reflect it in the UI.
     if (S.scanning) setProgressLabel("connection lost — reconnecting…");
