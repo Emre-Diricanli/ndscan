@@ -321,6 +321,35 @@
   #table-empty { padding: 18px; color: var(--muted); text-align: center; display: none; }
   #table-wrap { overflow-x: auto; }
   td .sev-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; }
+
+  #changes-summary {
+    display: none;
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  #changes-summary.on { display: block; }
+  #changes-summary .n { color: var(--text); font-weight: 600; }
+  #changed-toggle-wrap { text-transform: none; letter-spacing: normal; font-size: 12px; }
+  .chg {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 1px 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    margin-left: 6px;
+    vertical-align: baseline;
+  }
+  .chg.new { background: rgba(52,211,153,0.16); color: var(--ok); }
+  .chg.gone { background: rgba(100,116,139,0.22); color: var(--muted); }
+  .chg-ports { font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .chg-ports.open { color: var(--ok); }
+  .chg-ports.closed { color: var(--err); }
+  #hosts-table tbody tr.gone { cursor: default; opacity: 0.6; }
+  #hosts-table tbody tr.gone:hover { background: none; }
 </style>
 </head>
 <body>
@@ -396,7 +425,11 @@
   <section class="card" id="table-card">
     <h2>Hosts <span class="count" id="host-count"></span>
       <input type="text" id="table-filter" placeholder="filter by IP, hostname, vendor, MAC…" spellcheck="false">
+      <label class="toggle" id="changed-toggle-wrap" title="show only hosts that changed since the previous scan">
+        <input type="checkbox" id="changed-only"> changed only
+      </label>
     </h2>
+    <div id="changes-summary"></div>
     <div id="table-wrap">
       <table id="hosts-table">
         <thead>
@@ -545,6 +578,8 @@ const S = {
   collapsed: new Set(), // node ids whose subtree is folded away
   sort: { key: "ip", dir: 1 },
   filter: "",
+  changedOnly: false,   // table shows only hosts present in the diff
+  history: null,        // last /api/history response (hasPrevious/previous/diff)
   lastScan: null
 };
 
@@ -597,6 +632,8 @@ async function loadInitialState() {
     const st = await apiGet("/api/state");
     setDemoMode(false);
     applyState(st);
+    // A reload after a scan should still show what changed.
+    fetchHistory();
   } catch (e) {
     // No backend (file:// dev, or server down) — fall back to demo data.
     setDemoMode(true);
@@ -688,6 +725,7 @@ function onScanDone(d) {
       renderGraph();
       renderTable();
     }).catch(() => {});
+    fetchHistory();
   }
 }
 
@@ -1508,6 +1546,7 @@ function renderTable() {
 
   const filter = S.filter.toLowerCase();
   let rows = Array.from(S.hosts.values()).filter((h) => {
+    if (S.changedOnly && !diffEntry(h.ip)) return false;
     if (!filter) return true;
     return [h.ip, h.hostname, h.vendor, h.mac].some((v) => (v || "").toLowerCase().includes(filter));
   });
@@ -1531,12 +1570,13 @@ function renderTable() {
     const tr = document.createElement("tr");
     if (h.ip === S.selectedIp) tr.className = "selected";
     const ports = (h.ports || []).map((p) => p.port + "/" + (p.service || p.proto || "tcp")).join(", ");
+    const d = diffEntry(h.ip);
     tr.innerHTML =
-      "<td>" + esc(h.ip) + "</td>" +
+      "<td>" + esc(h.ip) + (d && d.new ? '<span class="chg new">new</span>' : "") + "</td>" +
       "<td>" + (esc(h.hostname) || "—") + "</td>" +
       "<td>" + (esc(h.vendor) || "—") + "</td>" +
       '<td><span class="sev-dot" style="background:' + (SEV_COLOR[sev] || "var(--sev-none)") + '"></span>' + (sev || "none") + "</td>" +
-      "<td>" + (esc(ports) || "—") + "</td>" +
+      "<td>" + (esc(ports) || "—") + (d ? portChangeHtml(d) : "") + "</td>" +
       "<td>" + (esc(h.rtt) || "—") + "</td>";
     tr.addEventListener("click", () => {
       const gn = G.nodes.find((n) => n.host && n.host.ip === h.ip);
@@ -1556,7 +1596,29 @@ function renderTable() {
     tbody.appendChild(tr);
   }
 
-  $("table-empty").style.display = rows.length ? "none" : "block";
+  // Gone hosts never appear in the current scan results, so without these
+  // rows a disappearance would be invisible. They get their data from the
+  // previous snapshot, not from S.hosts.
+  let goneRows = goneHosts();
+  if (filter) {
+    goneRows = goneRows.filter((g) =>
+      [g.ip, g.host && g.host.host].some((v) => (v || "").toLowerCase().includes(filter)));
+  }
+  for (const g of goneRows) {
+    const prevPorts = g.host && g.host.ports ? g.host.ports.join(", ") : "";
+    const tr = document.createElement("tr");
+    tr.className = "gone";
+    tr.innerHTML =
+      "<td><s>" + esc(g.ip) + "</s>" + '<span class="chg gone">gone</span></td>' +
+      "<td>" + (g.host && g.host.host ? "<s>" + esc(g.host.host) + "</s>" : "—") + "</td>" +
+      "<td>—</td>" +
+      "<td>—</td>" +
+      "<td>" + (prevPorts ? "<s>" + esc(prevPorts) + "</s>" : "—") + "</td>" +
+      "<td>—</td>";
+    tbody.appendChild(tr);
+  }
+
+  $("table-empty").style.display = rows.length || goneRows.length ? "none" : "block";
   $("table-empty").textContent = S.hosts.size
     ? "No hosts match the filter."
     : (S.lastScan ? "Last scan found no hosts." : "No hosts yet — run a scan.");
@@ -1581,12 +1643,82 @@ document.querySelectorAll("#hosts-table th").forEach((th) => {
 $("table-filter").addEventListener("input", (ev) => { S.filter = ev.target.value; renderTable(); });
 
 /* ------------------------------------------------------------------ *
+ * Scan-to-scan changes — the backend diffs every scan against the     *
+ * previous one; this surfaces that diff in the table.                 *
+ * ------------------------------------------------------------------ */
+async function fetchHistory() {
+  if (S.demo) return;
+  try {
+    S.history = await apiGet("/api/history");
+  } catch (_) {
+    // History is best-effort; the table must keep working without it.
+    S.history = null;
+  }
+  renderChangesSummary();
+  renderTable();
+}
+
+function diffEntry(ip) {
+  return (S.history && S.history.hasPrevious && S.history.diff) ? S.history.diff[ip] : undefined;
+}
+
+function goneHosts() {
+  if (!S.history || !S.history.hasPrevious || !S.history.diff) return [];
+  const prev = {};
+  for (const h of S.history.previous || []) prev[h.ip] = h;
+  const out = [];
+  for (const ip in S.history.diff) {
+    const d = S.history.diff[ip];
+    if (d && d.gone && !S.hosts.has(ip)) out.push({ ip: ip, host: prev[ip] || null });
+  }
+  out.sort((a, b) => ipKey(a.ip) - ipKey(b.ip));
+  return out;
+}
+
+function portChangeHtml(d) {
+  let s = "";
+  const opened = d.portsOpened || [], closed = d.portsClosed || [];
+  if (opened.length) {
+    s += '<span class="chg-ports open" title="opened: ' + esc(opened.join(", ")) + '">+' + opened.length + "</span>";
+  }
+  if (closed.length) {
+    s += '<span class="chg-ports closed" title="closed: ' + esc(closed.join(", ")) + '">−' + closed.length + "</span>";
+  }
+  return s;
+}
+
+function renderChangesSummary() {
+  const el = $("changes-summary");
+  const diff = (S.history && S.history.hasPrevious && S.history.diff) || {};
+  let nNew = 0, nGone = 0, nOpen = 0, nClosed = 0;
+  for (const ip in diff) {
+    const d = diff[ip] || {};
+    if (d.new) nNew++;
+    if (d.gone) nGone++;
+    nOpen += (d.portsOpened || []).length;
+    nClosed += (d.portsClosed || []).length;
+  }
+  const parts = [];
+  if (nNew) parts.push(nNew + " new");
+  if (nGone) parts.push(nGone + " gone");
+  if (nOpen) parts.push(nOpen + (nOpen === 1 ? " port opened" : " ports opened"));
+  if (nClosed) parts.push(nClosed + (nClosed === 1 ? " port closed" : " ports closed"));
+  // A first-ever scan has nothing to compare against, so showing "0 changes"
+  // would be pure noise — the banner stays hidden until there is a real diff.
+  el.classList.toggle("on", parts.length > 0);
+  el.innerHTML = parts.length
+    ? "since last scan: " + parts.map((p) => '<span class="n">' + esc(p) + "</span>").join(" · ")
+    : "";
+}
+
+/* ------------------------------------------------------------------ *
  * Wiring + init                                                       *
  * ------------------------------------------------------------------ */
 $("scan-btn").addEventListener("click", startScan);
 $("cancel-btn").addEventListener("click", cancelScan);
 $("target-input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startScan(); });
 $("fit-btn").addEventListener("click", () => fitToNodes(G.nodes));
+$("changed-only").addEventListener("change", (ev) => { S.changedOnly = ev.target.checked; renderTable(); });
 
 document.addEventListener("keydown", (ev) => {
   const ae = document.activeElement;
