@@ -185,6 +185,13 @@ Otherwise, nmap runs locally.`,
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			defer cancel()
 
+			// Reject a malformed port spec before any probing happens. Left to
+			// the scanners it would surface as an empty result table, which
+			// reads as "nothing was open" rather than "we never looked".
+			if err := scan.ValidatePorts(ports); err != nil {
+				return err
+			}
+
 			cfg := scan.Config{
 				Preset:         preset,      // quick|default|udp|deep
 				Ports:          ports,       // "22,80,443" or "1-1024"

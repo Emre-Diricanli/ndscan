@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -360,11 +361,11 @@ func TestFinishScanPersistsAndDiffsHistory(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	targets := []string{"192.0.2.1"}
 	s := NewServer("test")
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", time.Now(), false, netSnapshot{})
-	if got := config.LoadHistory(targets, "", "quick"); len(got) != 1 {
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+	if got := config.LoadHistory(config.ScanKey{Targets: targets, Ports: s.portsFor("quick"), Preset: "quick"}); len(got) != 1 {
 		t.Fatalf("saved history = %+v", got)
 	}
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", time.Now(), false, netSnapshot{})
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
 	if !s.hasPrevious || s.diff["192.0.2.1"].PortsOpened[0] != "443" || s.diff["192.0.2.1"].PortsClosed[0] != "22" {
 		t.Errorf("history state: hasPrevious=%v diff=%+v", s.hasPrevious, s.diff)
 	}
@@ -382,5 +383,67 @@ func TestDiscoverRejectsNonIPs(t *testing.T) {
 				t.Errorf("status = %d, want 400", resp.StatusCode)
 			}
 		})
+	}
+}
+
+// Cancelling a scan used to write its (empty) results as the new baseline, so
+// the next scan reported the entire network as new. This is the regression that
+// test exists for: the web saved unconditionally while the TUI did not.
+func TestFinishScanDoesNotPersistIncompleteRuns(t *testing.T) {
+	targets := []string{"192.0.2.1"}
+	good := []ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}
+	key := config.ScanKey{Targets: targets, Ports: "preset:quick", Preset: "quick"}
+
+	cases := []struct {
+		name    string
+		rows    []ui.Row
+		outcome scanOutcome
+	}{
+		{"cancelled with no results", nil, scanOutcome{cancelled: true}},
+		{"cancelled with partial results", good, scanOutcome{cancelled: true}},
+		{"hosts failed to scan", good, scanOutcome{failed: 2}},
+		{"knowingly partial", good, scanOutcome{partial: true}},
+		// Finding nothing is nearly always a lost network, not an empty one.
+		{"found nothing", nil, scanOutcome{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+			s := NewServer("test")
+
+			// Establish a good baseline first, so the test proves the bad run is
+			// rejected rather than merely that nothing was ever written.
+			s.finishScan(good, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+			base := config.LoadHistory(key)
+			if len(base) != 1 {
+				t.Fatalf("baseline not established: %+v", base)
+			}
+
+			s.finishScan(tc.rows, targets, "quick", false, time.Now(), tc.outcome, netSnapshot{})
+
+			if got := config.LoadHistory(key); !reflect.DeepEqual(got, base) {
+				t.Errorf("incomplete run overwrote the baseline: %+v", got)
+			}
+			if len(s.diff) != 0 {
+				t.Errorf("incomplete run produced a diff: %+v", s.diff)
+			}
+		})
+	}
+}
+
+// The fast native sweep and an nmap scan find different hosts, so they must not
+// be compared against each other.
+func TestFinishScanSeparatesFastAndNmapHistory(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	targets := []string{"192.0.2.1"}
+	s := NewServer("test")
+
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+	s.finishScan([]ui.Row{{IP: "192.0.2.9", Up: true}}, targets, "quick", true, time.Now(), scanOutcome{}, netSnapshot{})
+
+	// The fast run is the first of its kind, so it has no previous scan to
+	// compare against and must not report the nmap run's host as departed.
+	if len(s.diff) != 0 {
+		t.Errorf("fast scan diffed against nmap history: %+v", s.diff)
 	}
 }

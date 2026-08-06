@@ -148,19 +148,25 @@ func (s *Server) watchLoop(ctx context.Context, gen int) {
 
 		s.mu.RLock()
 		stale := s.watch.gen != gen || !s.watch.enabled
-		busy := s.scanning
 		s.mu.RUnlock()
 		if stale {
 			return
 		}
-		if !busy {
-			scanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-			s.mu.Lock()
-			s.scanning = true
-			s.cancel = cancel
-			s.mu.Unlock()
+		// startScan owns the idle-to-scanning transition, so a manual request
+		// cannot enter between a separate watch check and state update.
+		//
+		// It starts the scan in its own goroutine, but the interval is meant to
+		// be the gap *between* scans: scheduling the next tick while this one is
+		// still running would let a scan slower than the interval be woken every
+		// interval, each wake bouncing off the busy check. Waiting keeps the
+		// documented "skipped rather than queued" behaviour.
+		if done, started := s.startScanDone(st.targets, st.preset, st.fast); started {
 			s.bus.publish("watch", map[string]any{"enabled": true, "rescanning": true})
-			s.runScan(scanCtx, cancel, st.targets, st.preset, st.fast)
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+			}
 		}
 
 		s.mu.Lock()
@@ -177,7 +183,7 @@ func (s *Server) watchLoop(ctx context.Context, gen int) {
 
 func validPreset(p string) bool {
 	switch p {
-	case "quick", "default", "udp", "deep":
+	case "quick", "smart", "default", "udp", "deep":
 		return true
 	}
 	return false

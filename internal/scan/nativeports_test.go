@@ -7,26 +7,36 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Emre-Diricanli/ndscan/internal/sweep"
 )
 
 func TestParsePortSpec(t *testing.T) {
 	cases := []struct {
-		spec string
-		want []int
+		spec    string
+		want    []int
+		wantErr bool
 	}{
-		{"", nil},
-		{"22", []int{22}},
-		{"22,80,443", []int{22, 80, 443}},
-		{"80-83", []int{80, 81, 82, 83}},
-		{"22,80-82", []int{22, 80, 81, 82}},
-		{"22, 80 , 443", []int{22, 80, 443}},
-		{"22,22,22", []int{22}}, // de-duplicated
-		{"0,70000,-5", nil},     // out of range
-		{"junk", nil},           // unparseable
-		{"100-50", nil},         // inverted range
+		{"", nil, false},
+		{"22", []int{22}, false},
+		{"22,80,443", []int{22, 80, 443}, false},
+		{"80-83", []int{80, 81, 82, 83}, false},
+		{"22,80-82", []int{22, 80, 81, 82}, false},
+		{"22, 80 , 443", []int{22, 80, 443}, false},
+		{"22,22,22", []int{22}, false}, // de-duplicated
+		{"0", nil, true},
+		{"70000", nil, true},
+		{"-5", nil, true},
+		{"junk", nil, true},
+		{"22,junk", nil, true},
+		{"100-50", nil, true},
 	}
 	for _, c := range cases {
-		got := parsePortSpec(c.spec)
+		got, err := parsePortSpec(c.spec)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parsePortSpec(%q) error = %v, wantErr %v", c.spec, err, c.wantErr)
+			continue
+		}
 		if len(got) != len(c.want) {
 			t.Errorf("parsePortSpec(%q) = %v, want %v", c.spec, got, c.want)
 			continue
@@ -37,6 +47,75 @@ func TestParsePortSpec(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+func TestNativePortScan_PropagatesIncompleteSignal(t *testing.T) {
+	original := scanNativePorts
+	t.Cleanup(func() { scanNativePorts = original })
+	scanNativePorts = func(_ context.Context, _ []string, cfg sweep.PortConfig) []sweep.PortResult {
+		cfg.OnIncomplete(17)
+		return []sweep.PortResult{{IP: "192.0.2.1"}}
+	}
+
+	results := NativePortScan(context.Background(), []string{"192.0.2.1"}, Config{Ports: "22"}, nil)
+
+	// The scanned host keeps its results: exhaustion means its port list is a
+	// floor, not that the host went unscanned. The run-level shortfall arrives
+	// as a separate entry so callers counting per-host failures do not throw
+	// away results that are incomplete but valid.
+	var scanned, incomplete int
+	var incompleteErr error
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			incomplete++
+			incompleteErr = r.Err
+		case r.IP == "192.0.2.1":
+			scanned++
+		}
+	}
+	if scanned != 1 {
+		t.Errorf("scanned host results = %d, want 1 (host must not be marked failed)", scanned)
+	}
+	if incomplete != 1 {
+		t.Fatalf("incomplete markers = %d, want exactly 1: %+v", incomplete, results)
+	}
+	if !strings.Contains(incompleteErr.Error(), "17 probes") {
+		t.Errorf("incomplete error = %q, want skipped probe count", incompleteErr)
+	}
+}
+
+// A run that completes fully must not manufacture a phantom failure entry.
+func TestNativePortScan_NoIncompleteMarkerWhenComplete(t *testing.T) {
+	original := scanNativePorts
+	t.Cleanup(func() { scanNativePorts = original })
+	scanNativePorts = func(_ context.Context, _ []string, _ sweep.PortConfig) []sweep.PortResult {
+		return []sweep.PortResult{{IP: "192.0.2.1"}}
+	}
+
+	for _, r := range NativePortScan(context.Background(), []string{"192.0.2.1"}, Config{Ports: "22"}, nil) {
+		if r.Err != nil {
+			t.Errorf("complete scan produced an error result: %v", r.Err)
+		}
+	}
+}
+
+func TestNativePortScan_InvalidPortsFailClosed(t *testing.T) {
+	called := false
+	original := scanNativePorts
+	t.Cleanup(func() { scanNativePorts = original })
+	scanNativePorts = func(context.Context, []string, sweep.PortConfig) []sweep.PortResult {
+		called = true
+		return nil
+	}
+
+	results := NativePortScan(context.Background(), []string{"192.0.2.1"}, Config{Ports: "22,banana"}, nil)
+	if called {
+		t.Fatal("malformed port input reached the sweep")
+	}
+	if len(results) != 1 || results[0].Err == nil || !strings.Contains(results[0].Err.Error(), "banana") {
+		t.Fatalf("results = %+v, want an error naming banana", results)
 	}
 }
 
@@ -151,5 +230,32 @@ func TestNativePortScan_ProgressReported(t *testing.T) {
 	}
 	if maxDone == 0 {
 		t.Error("progress never reported")
+	}
+}
+
+// ValidatePorts is what the front ends call before a scan starts. An empty spec
+// must stay valid — it means "use the preset's ports" — while anything the
+// parser would reject has to be caught here rather than after the scan runs.
+func TestValidatePorts(t *testing.T) {
+	cases := []struct {
+		spec    string
+		wantErr bool
+	}{
+		{"", false},
+		{"22", false},
+		{"22,80,443", false},
+		{"1-1024", false},
+		{"22,1000-1010", false},
+		{"banana", true},
+		{"22,banana", true},
+		{"99999", true},
+		{"0", true},
+		{"100-50", true},
+		{"22,,80", true},
+	}
+	for _, c := range cases {
+		if err := ValidatePorts(c.spec); (err != nil) != c.wantErr {
+			t.Errorf("ValidatePorts(%q) error = %v, wantErr %v", c.spec, err, c.wantErr)
+		}
 	}
 }

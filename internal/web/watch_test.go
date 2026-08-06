@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,6 +16,48 @@ func decodeWatch(t *testing.T, resp *http.Response) watchResponse {
 		t.Fatalf("decode watch response: %v", err)
 	}
 	return w
+}
+
+func TestWatchAndManualScan_OnlyOneAdmitted(t *testing.T) {
+	s := NewServer("test")
+	s.mu.Lock()
+
+	start := make(chan struct{})
+	admitted := make(chan bool, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		_, ok := s.startScanDone([]string{"127.0.0.1"}, "quick", true)
+		admitted <- ok
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		admitted <- s.startScan([]string{"127.0.0.1"}, "quick", true)
+	}()
+	ready.Wait()
+	close(start)
+	s.mu.Unlock()
+
+	winners := 0
+	for range 2 {
+		if <-admitted {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("admitted %d concurrent scans, want exactly one", winners)
+	}
+	s.mu.Lock()
+	cancel := s.cancel
+	running := s.scanning
+	s.mu.Unlock()
+	if !running || cancel == nil {
+		t.Fatal("winning scan did not retain its cancellation state")
+	}
+	cancel()
 }
 
 func TestWatch_EnableAndDisable(t *testing.T) {
@@ -139,7 +182,7 @@ func TestState_IncludesWatchStatus(t *testing.T) {
 }
 
 func TestValidPreset(t *testing.T) {
-	for _, p := range []string{"quick", "default", "udp", "deep"} {
+	for _, p := range []string{"quick", "smart", "default", "udp", "deep"} {
 		if !validPreset(p) {
 			t.Errorf("validPreset(%q) = false", p)
 		}

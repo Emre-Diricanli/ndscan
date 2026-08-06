@@ -348,10 +348,22 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 // check and state change under one lock prevents manual and routed requests
 // from racing each other into two concurrent scans.
 func (s *Server) startScan(targets []string, preset string, fast bool) bool {
+	_, started := s.startScanDone(targets, preset, fast)
+	return started
+}
+
+// startScanDone is startScan plus a channel closed when the scan finishes.
+//
+// Watch mode needs that signal: its interval is the gap *between* scans, so it
+// has to wait for one run to end before timing the next. It must not reproduce
+// the check-and-set to get it — a second copy of that transition is exactly how
+// a manual scan used to slip in beside a watch scan and overwrite the cancel
+// function — so the single transition lives here and hands back the signal.
+func (s *Server) startScanDone(targets []string, preset string, fast bool) (<-chan struct{}, bool) {
 	s.mu.Lock()
 	if s.scanning {
 		s.mu.Unlock()
-		return false
+		return nil, false
 	}
 	// Detached from the request context: the scan must outlive the POST that
 	// started it, since progress is delivered separately over SSE.
@@ -361,8 +373,12 @@ func (s *Server) startScan(targets []string, preset string, fast bool) bool {
 	s.cancel = cancel
 	s.mu.Unlock()
 
-	go s.runScan(ctx, cancel, targets, preset, fast)
-	return true
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runScan(ctx, cancel, targets, preset, fast)
+	}()
+	return done, true
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -418,7 +434,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		return
 	}
 	if ctx.Err() != nil {
-		s.finishScan(nil, targets, preset, start, true, netSnapshot{locals: locals, gateway: gateway})
+		s.finishScan(nil, targets, preset, fast, start, scanOutcome{cancelled: true}, netSnapshot{locals: locals, gateway: gateway})
 		return
 	}
 
@@ -440,11 +456,23 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	// moment it resolves, rather than after the slowest address in the scan has
 	// finished timing out. It fires from worker goroutines, so the row slice
 	// needs the mutex.
+	//
+	// ScanHosts reports a per-batch failure through HostResult.Err rather than
+	// through its returned error, so a run can lose hosts and still look like it
+	// succeeded. Counting them here is what lets the outcome say "partial"
+	// instead of quietly presenting a short list as the whole network.
 	var (
-		mu   sync.Mutex
-		rows []ui.Row
+		mu     sync.Mutex
+		rows   []ui.Row
+		failed int
 	)
 	cfg.OnResult = func(r scan.HostResult) {
+		if r.Err != nil {
+			mu.Lock()
+			failed++
+			mu.Unlock()
+			return
+		}
 		built := ui.BuildRows([]scan.HostResult{r}, s.oui, true, true, macs)
 		if len(built) == 0 {
 			return
@@ -468,6 +496,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 
 	mu.Lock()
 	final := append([]ui.Row(nil), rows...)
+	failedHosts := failed
 	mu.Unlock()
 	sort.Slice(final, func(i, j int) bool { return ui.IPLess(final[i].IP, final[j].IP) })
 
@@ -480,7 +509,9 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 			s.bus.publish("host", toHostDTO(row))
 		}
 	}
-	s.finishScan(final, targets, preset, start, ctx.Err() != nil, netSnapshot{locals: locals, gateway: gateway})
+	s.finishScan(final, targets, preset, fast, start,
+		scanOutcome{cancelled: ctx.Err() != nil, failed: failedHosts},
+		netSnapshot{locals: locals, gateway: gateway})
 }
 
 // rowIPs collects the addresses from a row set, for lookups keyed by IP.
@@ -492,8 +523,26 @@ func rowIPs(rows []ui.Row) []string {
 	return out
 }
 
+// scanOutcome describes how a scan run terminated, which decides whether its
+// results may become the baseline that later scans are compared against.
+//
+// A bare "cancelled" flag was not enough: a run can also finish having failed
+// on some of its hosts, and those results are just as unsafe to persist. The
+// counts travel with the rows so the decision is made from what actually
+// happened rather than inferred at the point of saving.
+type scanOutcome struct {
+	cancelled bool
+	failed    int  // hosts whose scan returned an error
+	partial   bool // the scan knowingly did not probe everything it was asked to
+}
+
+// eligible reports whether this run may be written as the new baseline.
+func (o scanOutcome) eligible(hosts int) bool {
+	return !o.partial && config.SaveEligible(o.cancelled, o.failed, hosts)
+}
+
 // finishScan stores the resulting topology and announces completion.
-func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, start time.Time, cancelled bool, net netSnapshot) {
+func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, fast bool, start time.Time, outcome scanOutcome, net netSnapshot) {
 	m := topology.Build(rows, topology.Input{
 		Locals:  net.locals,
 		Gateway: net.gateway,
@@ -504,9 +553,30 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, star
 	now := time.Now()
 	cur := make([]config.HostSnapshot, 0, len(rows))
 	for _, row := range rows {
-		cur = append(cur, config.HostSnapshot{IP: row.IP, Host: row.Host, Ports: row.Ports})
+		cur = append(cur, config.HostSnapshot{IP: row.IP, Host: row.Host, Up: row.Up, Ports: row.Ports})
 	}
-	prev := config.LoadHistory(targets, "", preset)
+	// The key must describe everything that changes what a scan could find.
+	// Ports was previously passed as "" here while the TUI passed the real
+	// value, so the two front ends silently kept separate baselines and neither
+	// could see the other's history.
+	key := config.ScanKey{Targets: targets, Ports: s.portsFor(preset), Preset: preset, Fast: fast}
+	prev := config.LoadHistory(key)
+
+	// An incomplete run is indistinguishable from a network where everything
+	// vanished. Diffing it would report the whole network as gone, and saving it
+	// would make the *next* scan report the whole network as new — one
+	// cancellation corrupting change detection twice over.
+	if !outcome.eligible(len(cur)) {
+		s.mu.Lock()
+		s.topo = &m
+		s.lastScan = &now
+		s.rows = append([]ui.Row(nil), rows...)
+		s.preset = preset
+		s.mu.Unlock()
+		s.publishDone(rows, start, outcome)
+		return
+	}
+
 	diff := config.Diff(prev, cur)
 	// A failed save is not fatal to this scan, but it silently disables change
 	// detection for every future one — the next scan finds no previous snapshot
@@ -514,7 +584,7 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, star
 	// changed", so it has to be said out loud. Running the server once under
 	// sudo is enough to leave a root-owned history directory behind and make
 	// every later unprivileged run fail this way.
-	if err := config.SaveHistory(targets, "", preset, cur); err != nil {
+	if err := config.SaveHistory(key, cur); err != nil {
 		s.bus.publish("warning", map[string]string{
 			"warning": "scan history could not be saved, so changes since this scan will not be detected: " + err.Error(),
 		})
@@ -530,6 +600,13 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, star
 	s.diff = diff
 	s.mu.Unlock()
 
+	s.publishDone(rows, start, outcome)
+}
+
+// publishDone announces the end of a scan. It reports how the run terminated so
+// the UI can distinguish "no changes" from "we did not look properly" — the two
+// are identical on screen otherwise, and only one of them is good news.
+func (s *Server) publishDone(rows []ui.Row, start time.Time, outcome scanOutcome) {
 	openPorts := 0
 	for _, r := range rows {
 		openPorts += len(r.PortDetails)
@@ -538,9 +615,22 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, star
 		"hosts":     len(rows),
 		"openPorts": openPorts,
 		"elapsedMs": time.Since(start).Milliseconds(),
-		"cancelled": cancelled,
+		"cancelled": outcome.cancelled,
+		"failed":    outcome.failed,
+		"partial":   outcome.partial,
+		// Change detection is only meaningful when this run was trustworthy
+		// enough to become the new baseline. Saying so explicitly stops the UI
+		// presenting a cancelled scan's empty diff as "nothing changed".
+		"comparable": outcome.eligible(len(rows)),
 	})
 }
+
+// portsFor returns the port specification a preset implies. The web UI does not
+// expose a free-form port box, so the preset is the whole of the port selection
+// — but it still has to enter the history key, because a quick scan and a deep
+// scan of the same network legitimately find different ports and must not be
+// compared against each other.
+func (s *Server) portsFor(preset string) string { return "preset:" + preset }
 
 // ListenAndServe starts the HTTP server on addr until ctx is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {

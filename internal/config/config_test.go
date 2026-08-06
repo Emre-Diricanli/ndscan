@@ -51,7 +51,7 @@ func TestHistoryAndDiff(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 
 	targets := []string{"192.168.1.0/24"}
-	if got := LoadHistory(targets, "", "quick"); got != nil {
+	if got := LoadHistory(ScanKey{Targets: targets, Preset: "quick"}); got != nil {
 		t.Fatalf("expected nil history, got %v", got)
 	}
 
@@ -59,14 +59,14 @@ func TestHistoryAndDiff(t *testing.T) {
 		{IP: "192.168.1.1", Ports: []string{"80/tcp http", "53/udp dns"}},
 		{IP: "192.168.1.5", Ports: []string{"22/tcp ssh"}},
 	}
-	if err := SaveHistory(targets, "", "quick", prev); err != nil {
+	if err := SaveHistory(ScanKey{Targets: targets, Preset: "quick"}, prev); err != nil {
 		t.Fatal(err)
 	}
-	if got := LoadHistory(targets, "", "quick"); !reflect.DeepEqual(got, prev) {
+	if got := LoadHistory(ScanKey{Targets: targets, Preset: "quick"}); !reflect.DeepEqual(got, prev) {
 		t.Fatalf("history roundtrip mismatch: %v vs %v", got, prev)
 	}
 	// different signature -> separate history
-	if got := LoadHistory(targets, "22", "quick"); got != nil {
+	if got := LoadHistory(ScanKey{Targets: targets, Ports: "22", Preset: "quick"}); got != nil {
 		t.Fatalf("ports should change the history key")
 	}
 
@@ -94,5 +94,104 @@ func TestHistoryAndDiff(t *testing.T) {
 	// first scan -> nil
 	if d := Diff(nil, cur); d != nil {
 		t.Errorf("nil prev should produce nil diff")
+	}
+}
+
+// The scan signature must separate runs that could not have found the same
+// things. Before ScanKey these were positional arguments and the web front end
+// silently passed "" for Ports, so it and the TUI kept separate baselines
+// forever without either noticing.
+func TestScanKeySeparatesIncomparableScans(t *testing.T) {
+	base := ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "22", Preset: "quick"}
+	cases := []struct {
+		name string
+		key  ScanKey
+		same bool
+	}{
+		{"identical", ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "22", Preset: "quick"}, true},
+		{"target order only", ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "22", Preset: "quick"}, true},
+		{"different ports", ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "443", Preset: "quick"}, false},
+		{"different preset", ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "22", Preset: "deep"}, false},
+		{"fast vs nmap", ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "22", Preset: "quick", Fast: true}, false},
+		{"different target", ScanKey{Targets: []string{"198.51.100.0/24"}, Ports: "22", Preset: "quick"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := historyKey(tc.key) == historyKey(base); got != tc.same {
+				t.Errorf("same=%v, want %v", got, tc.same)
+			}
+		})
+	}
+}
+
+// Target order is a presentation detail, not part of the scan's identity.
+func TestScanKeyIgnoresTargetOrder(t *testing.T) {
+	a := ScanKey{Targets: []string{"192.0.2.0/24", "198.51.100.0/24"}, Preset: "quick"}
+	b := ScanKey{Targets: []string{"198.51.100.0/24", "192.0.2.0/24"}, Preset: "quick"}
+	if historyKey(a) != historyKey(b) {
+		t.Error("target order changed the scan signature")
+	}
+}
+
+func TestSaveEligible(t *testing.T) {
+	cases := []struct {
+		name      string
+		cancelled bool
+		failed    int
+		hosts     int
+		want      bool
+	}{
+		{"clean scan with results", false, 0, 3, true},
+		{"cancelled", true, 0, 3, false},
+		{"host failures", false, 2, 3, false},
+		{"cancelled and failed", true, 1, 3, false},
+		// Zero hosts is nearly always a dropped VPN or roamed Wi-Fi rather than
+		// an empty network. Saving it discards a good baseline for a useless one.
+		{"found nothing", false, 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SaveEligible(tc.cancelled, tc.failed, tc.hosts); got != tc.want {
+				t.Errorf("SaveEligible(%v,%d,%d) = %v, want %v", tc.cancelled, tc.failed, tc.hosts, got, tc.want)
+			}
+		})
+	}
+}
+
+// A host that went offline is a departure, not a machine that closed every
+// port. Reporting the latter hides the event the user actually cares about.
+func TestDiffTreatsDownHostAsGone(t *testing.T) {
+	prev := []HostSnapshot{
+		{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}},
+		{IP: "192.0.2.2", Up: true, Ports: []string{"80/tcp http"}},
+	}
+	cur := []HostSnapshot{
+		{IP: "192.0.2.1", Up: false},
+		{IP: "192.0.2.2", Up: true, Ports: []string{"80/tcp http"}},
+	}
+
+	d := Diff(prev, cur)
+	if !d["192.0.2.1"].Gone {
+		t.Errorf("down host should diff as Gone, got %+v", d["192.0.2.1"])
+	}
+	if len(d["192.0.2.1"].PortsClosed) != 0 {
+		t.Errorf("a departed host should not also report closed ports: %+v", d["192.0.2.1"])
+	}
+}
+
+// Snapshots written before HostSnapshot carried Up decode with Up=false
+// everywhere. Read literally that is "the whole network vanished", which would
+// fire a false alarm for every user on their first run after upgrading.
+func TestDiffToleratesPreUpSnapshots(t *testing.T) {
+	prev := []HostSnapshot{
+		{IP: "192.0.2.1", Ports: []string{"22/tcp ssh"}},
+		{IP: "192.0.2.2", Ports: []string{"80/tcp http"}},
+	}
+	cur := []HostSnapshot{
+		{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}},
+		{IP: "192.0.2.2", Up: true, Ports: []string{"80/tcp http"}},
+	}
+	for ip, d := range Diff(prev, cur) {
+		t.Errorf("legacy snapshot produced a spurious change for %s: %+v", ip, d)
 	}
 }
