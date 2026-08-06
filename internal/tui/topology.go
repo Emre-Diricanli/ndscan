@@ -93,6 +93,15 @@ func (m Model) firstUnscannedNetwork() (string, bool) {
 // Whatever answers folds onto the map as routed segments. If nothing plausible
 // can be probed, it leaves a notice instead of starting an empty scan.
 func (m Model) startRoutedSweep() (tea.Model, tea.Cmd) {
+	// Re-read the interfaces rather than trusting the snapshot taken at
+	// startup. A long-lived TUI outlives Wi-Fi changes and VPN connections, and
+	// deriving siblings from a network we already left would sweep the old
+	// neighbourhood — probing subnets we are no longer anywhere near.
+	if m.localsFn != nil {
+		if fresh := m.localsFn(); len(fresh) > 0 {
+			m.netLocals = fresh
+		}
+	}
 	extra := parseSiblingExtras(m.targetsIn.Value())
 	candidates := netinfo.SiblingCandidates(m.netLocals, extra)
 	if len(candidates) == 0 {

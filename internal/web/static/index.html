@@ -273,6 +273,11 @@
   }
   .suggest-chip:hover { border-color: var(--accent); color: var(--accent); }
   .suggest-chip .iface { color: var(--muted); margin-left: 5px; }
+  #stale-note { color: var(--muted); margin-left: 4px; }
+  #stale-note button {
+    background: none; border: none; padding: 0; font: inherit;
+    color: var(--accent); cursor: pointer; text-decoration: underline;
+  }
   .badge-c { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; }
   .badge-t { fill: #fff; font-size: 9px; font-weight: 700; text-anchor: middle; pointer-events: none; }
   .graph-tools { margin-left: auto; display: flex; gap: 6px; }
@@ -412,7 +417,7 @@
   </div>
 </header>
 
-<div id="suggest-bar"><span class="suggest-label">your networks:</span><span id="suggest-list"></span></div>
+<div id="suggest-bar"><span class="suggest-label">your networks:</span><span id="suggest-list"></span><span id="stale-note"></span></div>
 
 <div id="progress-wrap">
   <span id="progress-label">scanning…</span>
@@ -623,6 +628,7 @@ const S = {
   changedOnly: false,   // table shows only hosts present in the diff
   history: null,        // last /api/history response (hasPrevious/previous/diff)
   lastScan: null,
+  staleTarget: null,   // previous target dropped because we left that network
   hasScan: false,
   watch: { enabled: false, intervalSec: 60, nextAt: null, rescanning: false }
 };
@@ -700,16 +706,95 @@ function applyState(st) {
       }
     }
   }
-  if (st.targets && st.targets.length) {
-    $("target-input").value = st.targets.join(", ");
-  } else if (st.suggested && st.suggested.length) {
-    // First run: the scanner already knows which networks this machine is on,
-    // so prefill rather than making the user look up their own subnet. Only
-    // when there is no prior target — a returning user's choice always wins.
-    $("target-input").value = st.suggested[0].cidr;
-  }
+  applyTargetPrefill(st);
   renderSuggestions(st.suggested || []);
   renderAll();
+}
+
+/* Decide what the target box should say on load.
+ *
+ * The previous target usually deserves to win — someone who scanned a specific
+ * range wants it back. But a laptop that changed Wi-Fi or dropped a VPN comes
+ * back to a box naming a network it can no longer reach, and pressing Scan then
+ * returns nothing. That reads as a broken scanner, not a stale field.
+ *
+ * The signal that separates the two is whether the old target was *local*: a
+ * range that used to be one of our subnets and no longer is has gone stale, so
+ * we replace it. A target that was never local (deliberately scanning a routed
+ * range from here) is intentional and is kept. */
+function applyTargetPrefill(st) {
+  const box = $("target-input");
+  const suggested = st.suggested || [];
+  const targets = st.targets || [];
+
+  if (!targets.length) {
+    if (suggested.length) box.value = suggested[0].cidr;
+    return;
+  }
+  if (!suggested.length) {
+    box.value = targets.join(", "); // nothing current to compare against
+    return;
+  }
+
+  const onCurrent = targets.some((t) => suggested.some((s) => cidrsOverlap(t, s.cidr)));
+  if (onCurrent || !targets.some(looksLikePrivateNet)) {
+    box.value = targets.join(", ");
+    return;
+  }
+  // Stale: a private range that matches none of our current networks.
+  box.value = suggested[0].cidr;
+  S.staleTarget = targets.join(", ");
+  renderStaleNote();
+}
+
+/* Say that we replaced the previous target, and offer it back. Swapping it
+   silently would be the same surprise as silently keeping it — the user should
+   know the box changed and be able to undo it in one click. */
+function renderStaleNote() {
+  const el = $("stale-note");
+  el.textContent = "";
+  if (!S.staleTarget) return;
+  el.appendChild(document.createTextNode("· last scan used " + S.staleTarget + " — "));
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = "use it again";
+  b.addEventListener("click", () => {
+    $("target-input").value = S.staleTarget;
+    S.staleTarget = null;
+    renderStaleNote();
+  });
+  el.appendChild(b);
+}
+
+/* Parse "a.b.c.d/len" into a numeric base and mask. Returns null for anything
+   that isn't a plain IPv4 CIDR — hostnames and v6 simply don't participate. */
+function parseCidr(s) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:\/(\d+))?$/.exec(String(s).trim());
+  if (!m) return null;
+  const octets = [+m[1], +m[2], +m[3], +m[4]];
+  if (octets.some((o) => o > 255)) return null;
+  const bits = m[5] === undefined ? 32 : +m[5];
+  if (bits > 32) return null;
+  const addr = ((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3];
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return { base: (addr & mask) >>> 0, mask: mask };
+}
+
+/* Two ranges overlap when either contains the other's network address. */
+function cidrsOverlap(a, b) {
+  const x = parseCidr(a), y = parseCidr(b);
+  if (!x || !y) return false;
+  const shared = (x.mask & y.mask) >>> 0;
+  return ((x.base & shared) >>> 0) === ((y.base & shared) >>> 0);
+}
+
+/* RFC1918 ranges are the ones a machine plausibly *was* attached to and has
+   since left. A public target was never ours, so it can't have gone stale. */
+function looksLikePrivateNet(s) {
+  const p = parseCidr(s);
+  if (!p) return false;
+  const a = p.base >>> 24, b = (p.base >>> 16) & 0xff;
+  return a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
 }
 
 /* Render one clickable chip per attached network. With a single network the

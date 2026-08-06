@@ -173,6 +173,10 @@ type Model struct {
 	// no probing — so the map can render before any scan has run.
 	netLocals  []netinfo.Network
 	netGateway netinfo.Gateway
+	// localsFn re-reads the interface table. The sweep calls it instead of
+	// trusting the startup snapshot, since the machine may have roamed since;
+	// tests substitute it to control what networks appear attached.
+	localsFn func() []netinfo.Network
 	mapVP      viewport.Model // scrollable container for the map view
 	mapRdy     bool
 	mapDirty   bool
@@ -232,6 +236,7 @@ func New(version string) Model {
 	// the map show attached networks even before the first scan.
 	m.netLocals = netinfo.Locals()
 	m.netGateway = netinfo.DefaultGateway()
+	m.localsFn = netinfo.Locals
 
 	cf := config.Load()
 	m.profiles = cf.Profiles

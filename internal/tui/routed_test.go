@@ -84,6 +84,9 @@ func TestStartRoutedSweep_NoCandidatesLeavesNotice(t *testing.T) {
 	m.screen = screenResults
 	m.view = viewTopology
 	m.netLocals = []netinfo.Network{{Interface: "utun8", CIDR: "100.127.245.23/32", Addr: "100.127.245.23"}}
+	// The sweep re-reads the interface table, so pin it to this machine's
+	// stubbed networks rather than whatever the test host really has.
+	m.localsFn = func() []netinfo.Network { return m.netLocals }
 	m.targetsIn.SetValue("") // New() prefills the real local CIDR; clear it
 	m.rebuildTable()
 
@@ -128,5 +131,36 @@ func TestSKey_TriggersSweepOnlyInMap(t *testing.T) {
 	next, _ = m.updateResults(keyRunes("S"))
 	if next.(Model).routedSweep {
 		t.Error("S outside the map must not start a sweep")
+	}
+}
+
+// A TUI left open across a Wi-Fi change must sweep the network it is on now,
+// not the one it started on. Deriving candidates from the startup snapshot
+// would probe a neighbourhood the machine already left.
+func TestStartRoutedSweep_RefreshesLocalsBeforeDerivingCandidates(t *testing.T) {
+	m := routedModel(t, ui.Row{IP: "192.168.2.10", Up: true})
+	m.netLocals = []netinfo.Network{{Interface: "en0", CIDR: "192.168.1.0/24", Addr: "192.168.1.50"}}
+	// The machine has since moved to 192.168.9.x.
+	m.localsFn = func() []netinfo.Network {
+		return []netinfo.Network{{Interface: "en0", CIDR: "192.168.9.0/24", Addr: "192.168.9.50"}}
+	}
+	m.targetsIn.SetValue("")
+
+	next, cmd := m.startRoutedSweep()
+	if cmd == nil {
+		t.Fatal("sweep should start")
+	}
+	got := next.(Model).params.targets
+	if len(got) == 0 || got[0] != "192.168.9.0/24" {
+		t.Errorf("targets = %v; the attached network must be the one we are on now", got)
+	}
+	// Candidates are derived around the *current* third octet, so .7/.8/.10/.11
+	// appear only if the refresh took effect. (192.168.1.0/24 is deliberately
+	// not asserted absent: it is a plausible sibling of .9 in its own right.)
+	joined := strings.Join(got, " ")
+	for _, want := range []string{"192.168.8.0/24", "192.168.10.0/24"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("targets %q missing %s — candidates were derived from the stale network", joined, want)
+		}
 	}
 }
