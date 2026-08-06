@@ -150,6 +150,7 @@ func BuildRows(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, m
 			rows[i].Vendor = vendor.Lookup(db, rows[i].MAC, "")
 		}
 	}
+	ApplyHostnames(rows, hostnames)
 	return rows
 }
 
@@ -170,6 +171,23 @@ func ApplyHostnames(rows []Row, names map[string]string) {
 		}
 	}
 }
+
+// hostnames is consulted by BuildRows so every CLI renderer — table, tree,
+// report, JSON — shows the same names without each of the four having to
+// thread an extra parameter through. A nil map (the default) leaves behaviour
+// exactly as it was.
+//
+// This is deliberately for the one-shot CLI only. The TUI and web server are
+// long-lived and scan repeatedly, so a process-global would leak one scan's
+// names into the next; those callers use ApplyHostnames on their own row slice
+// instead. Two mechanisms, not duplication: the lifetime differs.
+var hostnames map[string]string
+
+// SetHostnames registers reverse-DNS results for the current scan. Call it
+// after the scan and before rendering. Not safe for concurrent use with
+// rendering, which is fine for its one caller: the CLI resolves once, then
+// prints. Long-running callers should use ApplyHostnames instead.
+func SetHostnames(names map[string]string) { hostnames = names }
 
 // PortNumber exposes the "22/tcp ssh" -> "22" reduction for table-style views.
 func PortNumber(label string) string { return extractPortNumber(label) }

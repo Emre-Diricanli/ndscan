@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Emre-Diricanli/ndscan/internal/enrich"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
@@ -282,6 +283,13 @@ Otherwise, nmap runs locally.`,
 			if showMac && showVendors {
 				oui = vendor.LoadDefault()
 			}
+
+			// Reverse-DNS enrichment. The native fast path never asks a
+			// resolver, so without this the hostname column is empty for
+			// exactly the scans users run most. Bounded internally, and
+			// registered once here so the table, tree, report, and JSON all
+			// render the same names.
+			ui.SetHostnames(enrich.LookupPTR(ctx, hostIPs(results), enrich.Config{}))
 
 			// 4) output
 			// --report and --json are independent: passing both writes both.
@@ -561,4 +569,15 @@ func looksLikeSSHTarget(s string) bool {
 		return false
 	}
 	return true
+}
+
+// hostIPs collects the addresses from a result set, for lookups keyed by IP.
+func hostIPs(res []scan.HostResult) []string {
+	out := make([]string, 0, len(res))
+	for _, r := range res {
+		if r.IP != "" {
+			out = append(out, r.IP)
+		}
+	}
+	return out
 }
