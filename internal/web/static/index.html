@@ -237,6 +237,11 @@
   .edge { stroke: #3a4756; stroke-width: 1.5; }
   .edge.routed { stroke: var(--sev-warn); stroke-dasharray: 6 5; opacity: 0.85; }
   .edge.hl { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
+  .muted-note { color: var(--muted); font-style: italic; font-size: 12px; }
+  .detail-actions { padding: 10px 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .detail-actions button { background: var(--accent); color: #06202b; border: 0; border-radius: 6px;
+    padding: 6px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+  .detail-actions button:disabled { opacity: .55; cursor: default; }
   .edge-label { fill: var(--muted); font-size: 10px; text-anchor: middle; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
 
   #graph { user-select: none; -webkit-user-select: none; }
@@ -887,7 +892,8 @@ function buildGraph(topology) {
       if (byId.has(n.host.ip)) continue; // self / gateway already added
       hosts.push(add({
         id: n.host.ip, label: n.host.hostname || n.host.ip,
-        kind: "host", severity: n.severity || "", host: n.host, r: 10
+        kind: "host", severity: n.severity || "", host: n.host, r: 10,
+        routedVia: seg.routedVia || "", segCidr: seg.cidr
       }));
     }
     if (!hosts.length) continue;
@@ -1372,19 +1378,36 @@ function selectNode(n) {
   }
   if (n.host && n.host.ip) {
     S.selectedIp = n.host.ip;
-    renderDetail(n.host, n.kind);
+    renderDetail(n.host, n.kind, n);
     renderTable();
     paintGraph();
   }
 }
 
-function renderDetail(h, kind) {
+function renderDetail(h, kind, node) {
   const sev = worstSeverity(h);
+  const routedVia = node && node.routedVia;
+
+  // A missing MAC/vendor is usually a property of the network, not a failure:
+  // ARP does not cross a router, so hosts on a routed subnet never expose a
+  // hardware address to us. Saying that is far more useful than "—".
+  const macCell = h.mac
+    ? esc(h.mac)
+    : routedVia
+      ? '<span class="muted-note">unavailable — routed via ' + esc(routedVia) +
+        ' (ARP is link-local)</span>'
+      : '<span class="muted-note">—</span>';
+  const vendorCell = h.vendor
+    ? esc(h.vendor)
+    : routedVia
+      ? '<span class="muted-note">needs a MAC; none on a routed subnet</span>'
+      : '<span class="muted-note">—</span>';
+
   const rows = [
     ["IP", esc(h.ip)],
     ["Hostname", esc(h.hostname) || "—"],
-    ["MAC", esc(h.mac) || "—"],
-    ["Vendor", esc(h.vendor) || "—"],
+    ["MAC", macCell],
+    ["Vendor", vendorCell],
     ["OS", esc(h.os) || "—"],
     ["RTT", esc(h.rtt) || "—"],
     ["Role", kind === "self" ? "this machine" : kind === "gateway" ? "gateway" : "host"],
@@ -1393,6 +1416,10 @@ function renderDetail(h, kind) {
   let html = '<dl class="kv">';
   for (const [k, v] of rows) html += "<dt>" + k + "</dt><dd>" + v + "</dd>";
   html += "</dl>";
+
+  html += '<div class="detail-actions">' +
+    '<button id="discover-btn" data-ip="' + esc(h.ip) + '">Deep scan this host</button>' +
+    '<span id="discover-status" class="muted-note"></span></div>';
 
   const ports = h.ports || [];
   if (ports.length) {
@@ -1408,6 +1435,39 @@ function renderDetail(h, kind) {
     html += '<div class="placeholder">No open ports found.</div>';
   }
   $("detail-body").innerHTML = html;
+
+  const btn = $("discover-btn");
+  if (btn) btn.addEventListener("click", () => runDiscover(btn.dataset.ip));
+}
+
+// runDiscover asks the backend to deep-scan one host (nmap -A: service
+// versions, OS, TLS certs). Slower than the fast sweep, so it stays on demand.
+async function runDiscover(ip) {
+  const btn = $("discover-btn"), status = $("discover-status");
+  if (!btn) return;
+  btn.disabled = true;
+  status.textContent = "deep scanning… this takes ~30s";
+  try {
+    const r = await fetch("/api/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip: ip })
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      status.textContent = "failed: " + (e.error || r.status);
+      btn.disabled = false;
+      return;
+    }
+    const host = await r.json();
+    S.hosts.set(host.ip, host);
+    // Refresh the panel from the enriched result, keeping routed context.
+    renderDetail(host, "host", G.nodes.find((n) => n.id === host.ip));
+    renderTable();
+  } catch (err) {
+    status.textContent = "failed: " + err;
+    btn.disabled = false;
+  }
 }
 
 function worstSeverity(h) {
@@ -1490,7 +1550,7 @@ function renderTable() {
         if (changed) { prefsSoon(); layoutTree(); }
         selectNode(gn);
       } else {
-        S.selectedIp = h.ip; renderDetail(h, "host"); renderTable(); paintGraph();
+        S.selectedIp = h.ip; renderDetail(h, "host", G.nodes.find((n) => n.id === h.ip)); renderTable(); paintGraph();
       }
     });
     tbody.appendChild(tr);
