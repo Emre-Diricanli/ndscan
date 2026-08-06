@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
@@ -62,6 +63,56 @@ func (p PortInfo) VersionLabel() string {
 	return strings.Join(parts, " ")
 }
 
+// stripControls removes C0/C1 control characters and ANSI escape sequences
+// from a network-derived string before it reaches the user's terminal. A
+// hostile service banner or PTR record can otherwise inject escapes that
+// clear the screen or forge output. Printable text — including legitimate
+// non-ASCII UTF-8 — passes through byte-for-byte.
+func stripControls(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	// state: 0 = normal, 1 = saw ESC (next char is the introducer),
+	// 2 = inside a CSI sequence, swallowing through its final byte.
+	state := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch state {
+		case 1:
+			if r == '[' {
+				state = 2
+			} else {
+				state = 0 // two-byte escape (ESC + one char) fully swallowed
+			}
+		case 2:
+			// A CSI sequence ends at its final byte (0x40–0x7E); everything
+			// before that is parameters.
+			if r >= 0x40 && r <= 0x7E {
+				state = 0
+			}
+		default:
+			switch {
+			case r == 0x1B: // ESC
+				state = 1
+			case r == 0x9B: // C1 CSI
+				state = 2
+			case r == utf8.RuneError && size == 1:
+				// Invalid UTF-8 byte: a terminal may still interpret a
+				// stray C1 byte (raw 0x9B is CSI), so drop it rather than
+				// pass it through.
+				if s[i] == 0x9B {
+					state = 2
+				}
+			case unicode.IsControl(r):
+				// drop C0/C1 control characters
+			default:
+				b.WriteString(s[i : i+size])
+			}
+		}
+		i += size
+	}
+	return b.String()
+}
+
 func flatten(res []scan.HostResult) []Row {
 	out := make([]Row, 0, len(res))
 	for _, r := range res {
@@ -83,25 +134,28 @@ func flatten(res []scan.HostResult) []Row {
 					row.MAC = a.Addr
 				}
 			}
+			// Everything parsed from nmap XML is controlled by the scanned
+			// host, so this is the single boundary where terminal escapes
+			// are stripped before strings enter any rendered row.
 			if len(h.Hostnames.Names) > 0 {
-				row.Host = h.Hostnames.Names[0].Name
+				row.Host = stripControls(h.Hostnames.Names[0].Name)
 			}
 			if osd := h.BestOSDetail(); osd != nil {
-				row.OS = osd.Name
+				row.OS = stripControls(osd.Name)
 				row.OSAccuracy = osd.Accuracy
-				row.OSCPE = osd.CPE
+				row.OSCPE = stripControls(osd.CPE)
 			}
 			if rtt := h.RTT(); rtt > 0 {
 				row.RTT = formatRTT(rtt)
 			}
 			for _, p := range h.Ports.List {
 				if p.State.State == "open" {
-					label := fmt.Sprintf("%d/%s %s", p.PortID, p.Protocol, p.Service.Name)
+					label := fmt.Sprintf("%d/%s %s", p.PortID, p.Protocol, stripControls(p.Service.Name))
 					if p.Service.Product != "" {
-						label += " " + p.Service.Product
+						label += " " + stripControls(p.Service.Product)
 					}
 					if p.Service.Version != "" {
-						label += " " + p.Service.Version
+						label += " " + stripControls(p.Service.Version)
 					}
 					row.Ports = append(row.Ports, label)
 
@@ -109,18 +163,18 @@ func flatten(res []scan.HostResult) []Row {
 					pi := PortInfo{
 						Port:      p.PortID,
 						Proto:     p.Protocol,
-						Service:   p.Service.Name,
-						Product:   p.Service.Product,
-						Version:   p.Service.Version,
-						ExtraInfo: p.Service.ExtraInfo,
-						CPE:       p.Service.CPE(),
+						Service:   stripControls(p.Service.Name),
+						Product:   stripControls(p.Service.Product),
+						Version:   stripControls(p.Service.Version),
+						ExtraInfo: stripControls(p.Service.ExtraInfo),
+						CPE:       stripControls(p.Service.CPE()),
 						TLS:       p.Service.Tunnel == "ssl",
-						HTTPTitle: p.HTTPTitle(),
+						HTTPTitle: stripControls(p.HTTPTitle()),
 						Severity:  risk.Severity.String(),
 						Risk:      risk.Reason,
 					}
 					if cert := p.TLSCert(); cert != nil {
-						pi.Cert = cert.Summary()
+						pi.Cert = stripControls(cert.Summary())
 					}
 					row.PortDetails = append(row.PortDetails, pi)
 				}
@@ -167,7 +221,9 @@ func ApplyHostnames(rows []Row, names map[string]string) {
 	}
 	for i := range rows {
 		if rows[i].Host == "" {
-			rows[i].Host = names[rows[i].IP]
+			// PTR data is resolver-controlled, so it gets the same
+			// treatment as nmap-derived strings in flatten.
+			rows[i].Host = stripControls(names[rows[i].IP])
 		}
 	}
 }
