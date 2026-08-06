@@ -348,10 +348,22 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 // check and state change under one lock prevents manual and routed requests
 // from racing each other into two concurrent scans.
 func (s *Server) startScan(targets []string, preset string, fast bool) bool {
+	_, started := s.startScanDone(targets, preset, fast)
+	return started
+}
+
+// startScanDone is startScan plus a channel closed when the scan finishes.
+//
+// Watch mode needs that signal: its interval is the gap *between* scans, so it
+// has to wait for one run to end before timing the next. It must not reproduce
+// the check-and-set to get it — a second copy of that transition is exactly how
+// a manual scan used to slip in beside a watch scan and overwrite the cancel
+// function — so the single transition lives here and hands back the signal.
+func (s *Server) startScanDone(targets []string, preset string, fast bool) (<-chan struct{}, bool) {
 	s.mu.Lock()
 	if s.scanning {
 		s.mu.Unlock()
-		return false
+		return nil, false
 	}
 	// Detached from the request context: the scan must outlive the POST that
 	// started it, since progress is delivered separately over SSE.
@@ -361,8 +373,12 @@ func (s *Server) startScan(targets []string, preset string, fast bool) bool {
 	s.cancel = cancel
 	s.mu.Unlock()
 
-	go s.runScan(ctx, cancel, targets, preset, fast)
-	return true
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runScan(ctx, cancel, targets, preset, fast)
+	}()
+	return done, true
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {

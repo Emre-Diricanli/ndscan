@@ -29,7 +29,7 @@ func TestWatchAndManualScan_OnlyOneAdmitted(t *testing.T) {
 	go func() {
 		ready.Done()
 		<-start
-		_, ok := s.startWatchScan([]string{"127.0.0.1"}, "quick", true)
+		_, ok := s.startScanDone([]string{"127.0.0.1"}, "quick", true)
 		admitted <- ok
 	}()
 	go func() {
