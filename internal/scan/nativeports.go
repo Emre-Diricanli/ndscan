@@ -3,12 +3,15 @@ package scan
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/sweep"
 )
+
+var scanNativePorts = sweep.ScanPorts
 
 // NativePortScan probes open ports on the given hosts without invoking nmap,
 // returning results in the same shape the nmap path produces so every existing
@@ -29,7 +32,21 @@ import (
 // milliseconds. The returned slice is still complete, for callers that only want
 // the final answer.
 func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress func(done, total int)) []HostResult {
-	ports := parsePortSpec(cfg.Ports)
+	ports, err := parsePortSpec(cfg.Ports)
+	if err != nil {
+		out := make([]HostResult, 0, len(hosts))
+		for i, host := range hosts {
+			result := HostResult{IP: host, Err: err}
+			out = append(out, result)
+			if cfg.OnResult != nil {
+				cfg.OnResult(result)
+			}
+			if progress != nil {
+				progress(i+1, len(hosts))
+			}
+		}
+		return out
+	}
 
 	var onResult func(sweep.PortResult)
 	if cfg.OnResult != nil {
@@ -38,11 +55,15 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 		}
 	}
 
-	results := sweep.ScanPorts(ctx, hosts, sweep.PortConfig{
+	var incomplete int
+	results := scanNativePorts(ctx, hosts, sweep.PortConfig{
 		Ports:       ports,
 		Concurrency: cfg.Concurrency * 32, // per-host workers -> per-probe workers
 		Progress:    progress,
 		OnResult:    onResult,
+		OnIncomplete: func(probes int) {
+			incomplete = probes
+		},
 	})
 
 	out := make([]HostResult, 0, len(results))
@@ -51,6 +72,15 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 			IP:       r.IP,
 			XMLBytes: syntheticXML(r),
 		})
+	}
+	// Descriptor exhaustion is a property of the run, not of any one host: every
+	// host's ports are a floor rather than a full answer. Marking each result as
+	// failed would say something different and worse — that those hosts were not
+	// scanned at all — and callers that count failures would then discard a set
+	// of results that is incomplete but still entirely valid. One extra entry
+	// carries the run-level fact without libelling the individual hosts.
+	if err := incompleteError(incomplete); err != nil {
+		out = append(out, HostResult{Err: err})
 	}
 	return out
 }
@@ -79,12 +109,12 @@ func syntheticXML(r sweep.PortResult) []byte {
 }
 
 // parsePortSpec turns ndscan's port syntax ("22,80,443" or "1-1024", possibly
-// mixed) into an explicit port list. An empty or unparseable spec yields nil,
-// which makes the sweep fall back to its top-ports default.
-func parsePortSpec(spec string) []int {
+// mixed) into an explicit port list. Empty input deliberately returns nil so
+// the sweep uses its default set; malformed input must never take that path.
+func parsePortSpec(spec string) ([]int, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return nil
+		return nil, nil
 	}
 	seen := make(map[int]bool)
 	var out []int
@@ -97,29 +127,34 @@ func parsePortSpec(spec string) []int {
 	for _, part := range strings.Split(spec, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			continue
+			return nil, fmt.Errorf("invalid port token %q", part)
 		}
 		lo, hi, isRange := strings.Cut(part, "-")
 		if !isRange {
-			if p, err := strconv.Atoi(part); err == nil {
-				add(p)
+			p, err := strconv.Atoi(part)
+			if err != nil || p < 1 || p > 65535 {
+				return nil, fmt.Errorf("invalid port token %q", part)
 			}
+			add(p)
 			continue
 		}
 		start, err1 := strconv.Atoi(strings.TrimSpace(lo))
 		end, err2 := strconv.Atoi(strings.TrimSpace(hi))
-		if err1 != nil || err2 != nil || start > end {
-			continue
-		}
-		// Guard against an absurd range turning into millions of probes.
-		if end-start > 65535 {
-			continue
+		if err1 != nil || err2 != nil || start < 1 || end > 65535 || start > end {
+			return nil, fmt.Errorf("invalid port token %q", part)
 		}
 		for p := start; p <= end; p++ {
 			add(p)
 		}
 	}
-	return out
+	return out, nil
+}
+
+func incompleteError(probes int) error {
+	if probes == 0 {
+		return nil
+	}
+	return fmt.Errorf("native port scan incomplete: %d probes skipped after file descriptor exhaustion", probes)
 }
 
 // NativePortScanViable reports whether a native port scan can serve this
