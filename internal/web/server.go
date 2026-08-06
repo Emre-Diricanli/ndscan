@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/enrich"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
@@ -359,32 +361,60 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	progress := newPhaseThrottle(s.bus, "scan", 100*time.Millisecond)
 	s.bus.publish("phase", map[string]any{"phase": "scan", "done": 0, "total": len(live)})
 
-	var results []scan.HostResult
-	if fast && scan.NativePortScanViable(cfg, runner) {
-		results = scan.NativePortScan(ctx, live, cfg, progress.update)
-	} else {
-		// With DiscardResults set, ScanHosts returns nothing; results stream
-		// back through OnResult instead. It fires from worker goroutines, so
-		// appends need the mutex.
-		var mu sync.Mutex
-		cfg.OnResult = func(r scan.HostResult) {
-			mu.Lock()
-			results = append(results, r)
-			mu.Unlock()
-		}
-		cfg.Progress = progress.update
-		if _, err = scan.ScanHosts(ctx, live, cfg, runner); err != nil {
-			s.bus.publish("error", map[string]string{"error": err.Error()})
+	// Both paths stream through OnResult so a host reaches the browser the
+	// moment it resolves, rather than after the slowest address in the scan has
+	// finished timing out. It fires from worker goroutines, so the row slice
+	// needs the mutex.
+	var (
+		mu   sync.Mutex
+		rows []ui.Row
+	)
+	cfg.OnResult = func(r scan.HostResult) {
+		built := ui.BuildRows([]scan.HostResult{r}, s.oui, true, true, macs)
+		if len(built) == 0 {
 			return
 		}
+		mu.Lock()
+		rows = append(rows, built...)
+		mu.Unlock()
+		for _, row := range built {
+			s.bus.publish("host", toHostDTO(row))
+		}
+	}
+	cfg.Progress = progress.update
+
+	if fast && scan.NativePortScanViable(cfg, runner) {
+		scan.NativePortScan(ctx, live, cfg, progress.update)
+	} else if _, err = scan.ScanHosts(ctx, live, cfg, runner); err != nil {
+		s.bus.publish("error", map[string]string{"error": err.Error()})
+		return
 	}
 	progress.flush()
 
-	rows := ui.BuildRows(results, s.oui, true, true, macs)
-	for _, row := range rows {
-		s.bus.publish("host", toHostDTO(row))
+	mu.Lock()
+	final := append([]ui.Row(nil), rows...)
+	mu.Unlock()
+	sort.Slice(final, func(i, j int) bool { return ui.IPLess(final[i].IP, final[j].IP) })
+
+	// Hostnames last: rows are already on screen by now, so this only fills a
+	// column rather than delaying anything. Bounded internally, and a miss just
+	// leaves the field blank.
+	if ctx.Err() == nil {
+		ui.ApplyHostnames(final, enrich.LookupPTR(ctx, rowIPs(final), enrich.Config{}))
+		for _, row := range final {
+			s.bus.publish("host", toHostDTO(row))
+		}
 	}
-	s.finishScan(rows, targets, preset, start, ctx.Err() != nil)
+	s.finishScan(final, targets, preset, start, ctx.Err() != nil)
+}
+
+// rowIPs collects the addresses from a row set, for lookups keyed by IP.
+func rowIPs(rows []ui.Row) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.IP)
+	}
+	return out
 }
 
 // finishScan stores the resulting topology and announces completion.

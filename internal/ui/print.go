@@ -153,6 +153,24 @@ func BuildRows(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, m
 	return rows
 }
 
+// ApplyHostnames fills in hostnames the scan itself didn't learn.
+//
+// The native fast path reports no hostnames at all — it never asks a resolver —
+// which is the main reason users reach for the far slower nmap presets. A
+// reverse lookup closes most of that gap for a few milliseconds. Names already
+// present are never overwritten: nmap's own PTR result came from the scan and
+// outranks a later best-effort lookup.
+func ApplyHostnames(rows []Row, names map[string]string) {
+	if len(names) == 0 {
+		return
+	}
+	for i := range rows {
+		if rows[i].Host == "" {
+			rows[i].Host = names[rows[i].IP]
+		}
+	}
+}
+
 // PortNumber exposes the "22/tcp ssh" -> "22" reduction for table-style views.
 func PortNumber(label string) string { return extractPortNumber(label) }
 

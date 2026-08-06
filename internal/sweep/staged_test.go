@@ -39,15 +39,26 @@ func TestStagedSweep_StopsProbingAfterFirstAnswer(t *testing.T) {
 	// A port nothing listens on, to pad the port list.
 	dead := deadPort(t)
 
+	// Concurrency 1 against a port list longer than stagingThreshold puts this
+	// over the line, which is what selects the staged path — below it the sweep
+	// probes every port at once and this assertion would be vacuous.
+	ports := []int{open}
+	for i := 0; i < stagingThreshold+2; i++ {
+		ports = append(ports, dead)
+	}
 	cfg := withDefaults(Config{
-		Ports:   []int{open, dead, dead, dead},
-		Timeout: 200 * time.Millisecond,
+		Ports:       ports,
+		Timeout:     200 * time.Millisecond,
+		Concurrency: 1,
 		Progress: func(done, total int) {
 			mu.Lock()
 			probed++
 			mu.Unlock()
 		},
 	})
+	if len(ports) <= cfg.Concurrency*stagingThreshold {
+		t.Fatal("test setup no longer exceeds the staging threshold")
+	}
 
 	hits := stagedSweep(context.Background(), []string{"127.0.0.1"}, cfg)
 	if len(hits) != 1 {
@@ -63,6 +74,42 @@ func TestStagedSweep_StopsProbingAfterFirstAnswer(t *testing.T) {
 	defer mu.Unlock()
 	if probed > 2 {
 		t.Errorf("probed %d times; staging should have stopped after the first answer", probed)
+	}
+}
+
+// Small sweeps must NOT stage: everything already fits in one concurrent wave,
+// so a barrier would only add a round-trip. This is the case that regressed a
+// live /24 from ~930ms to ~1.25s when staging was unconditional.
+func TestStagedSweep_SkipsStagingWhenWorkFitsInOneWave(t *testing.T) {
+	dead := deadPort(t)
+	ports := []int{dead, dead, dead, dead}
+	addrs := []string{"127.0.0.1"}
+
+	var mu sync.Mutex
+	probes := 0
+	cfg := withDefaults(Config{
+		Ports:       ports,
+		Timeout:     150 * time.Millisecond,
+		Concurrency: 1024, // far more slots than the 4 probes needed
+		Progress: func(done, total int) {
+			mu.Lock()
+			probes++
+			mu.Unlock()
+		},
+	})
+	if len(addrs)*len(ports) > cfg.Concurrency*stagingThreshold {
+		t.Fatal("test setup no longer sits below the staging threshold")
+	}
+
+	stagedSweep(context.Background(), addrs, cfg)
+
+	// Unstaged: every port probed in one wave, so one progress call per probe
+	// plus the forced terminal call. Staging would short-circuit after round 1
+	// and report fewer.
+	mu.Lock()
+	defer mu.Unlock()
+	if probes < len(ports) {
+		t.Errorf("progress fired %d times for %d probes; small sweeps should not stage", probes, len(ports))
 	}
 }
 

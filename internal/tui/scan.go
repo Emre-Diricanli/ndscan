@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/enrich"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
@@ -280,6 +281,16 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			ch <- errMsg{err}
 			return
 		}
+
+		// Hostnames come last: the native path learns none during the scan, and
+		// resolving them up front would trade the streaming latency we just
+		// bought for a column of names. Bounded internally, so a stalled
+		// resolver cannot hold up the result.
+		//
+		// The enriched rows go out via finish rather than a second hostRowMsg —
+		// the running screen appends what it receives, so re-sending would show
+		// every host twice.
+		ui.ApplyHostnames(rows, enrich.LookupPTR(ctx, rowIPs(rows), enrich.Config{}))
 		finish(rows, nFailed, false)
 	}()
 
@@ -324,4 +335,13 @@ func localCIDR() string {
 		}
 	}
 	return ""
+}
+
+// rowIPs collects the addresses from a row set, for lookups keyed by IP.
+func rowIPs(rows []ui.Row) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.IP)
+	}
+	return out
 }

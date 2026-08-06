@@ -62,6 +62,13 @@ type PortConfig struct {
 	// The returned slice still contains every result, so callers that don't care
 	// about latency can ignore this entirely.
 	OnResult func(PortResult)
+	// OnIncomplete, if set, is called once at the end with the number of probes
+	// that could not be completed because this machine ran out of file
+	// descriptors. Those probes proved nothing, so a non-zero count means the
+	// reported ports are a floor, not the full picture — the honest response is
+	// to tell the user and suggest a lower Concurrency or a higher ulimit.
+	// Not called when nothing was starved.
+	OnIncomplete func(probes int)
 }
 
 // ScanPorts probes the given hosts for open TCP ports using plain connects.
@@ -82,7 +89,9 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 		cfg.Timeout = 400 * time.Millisecond
 	}
 	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 2048
+		// See withDefaults: the descriptor limit, not a constant, is what makes
+		// a concurrency level safe on a given machine.
+		cfg.Concurrency = fdConcurrencyBudget()
 	}
 	if cfg.Concurrency > maxConcurrency {
 		cfg.Concurrency = maxConcurrency
@@ -95,6 +104,11 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 		sem    = make(chan struct{}, cfg.Concurrency)
 		dialer = &net.Dialer{Timeout: cfg.Timeout}
 		done   int
+		// exhausted counts probes that failed because this machine ran out of
+		// descriptors. Those probes proved nothing about the remote port, so the
+		// caller has to be told the results are incomplete rather than shown a
+		// confidently short list.
+		exhausted int
 	)
 
 	// One waitgroup per host lets progress report host completion rather than
@@ -123,6 +137,16 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 					defer func() { <-sem }()
 					conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 					if err != nil {
+						// Distinguish "the port is closed" from "we ran out of
+						// file descriptors". Both arrive as a non-nil error, but
+						// only the first is a finding — treating fd exhaustion as
+						// a closed port makes the scanner quietly under-report
+						// open ports, which is worse than being slow.
+						if isResourceExhausted(err) {
+							mu.Lock()
+							exhausted++
+							mu.Unlock()
+						}
 						return
 					}
 					conn.Close()
@@ -156,6 +180,13 @@ func ScanPorts(ctx context.Context, hosts []string, cfg PortConfig) []PortResult
 		}(ip)
 	}
 	wg.Wait()
+
+	mu.Lock()
+	starved := exhausted
+	mu.Unlock()
+	if starved > 0 && cfg.OnIncomplete != nil {
+		cfg.OnIncomplete(starved)
+	}
 
 	out := make([]PortResult, 0, len(hosts))
 	for _, ip := range hosts {

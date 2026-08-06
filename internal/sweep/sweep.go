@@ -106,6 +106,13 @@ const (
 	defaultTimeout     = 300 * time.Millisecond
 	defaultConcurrency = 1024
 	maxConcurrency     = 4096
+	// stagingThreshold is how many concurrency-widths of work a sweep must have
+	// before staged probing beats probing everything at once, expressed as a
+	// multiplier on Concurrency. Below it the whole scan fits in a couple of
+	// waves and an extra barrier is pure added latency; above it the probe count
+	// dominates and staging cuts it by roughly the port-list length. A /24 with
+	// the default settings sits well under; a /16 sits far above.
+	stagingThreshold = 4
 )
 
 // Run discovers live hosts across the given CIDR targets.
@@ -187,7 +194,11 @@ func withDefaults(cfg Config) Config {
 		cfg.Timeout = defaultTimeout
 	}
 	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = defaultConcurrency
+		// Derive the default from the descriptor limit rather than assuming a
+		// constant is safe everywhere: each in-flight dial holds an fd, and a
+		// container or CI runner with a low ulimit would otherwise exhaust the
+		// table and silently mis-report open ports as closed.
+		cfg.Concurrency = fdConcurrencyBudget()
 	}
 	if cfg.Concurrency > maxConcurrency {
 		cfg.Concurrency = maxConcurrency
@@ -228,17 +239,28 @@ func stagedSweep(ctx context.Context, addrs []string, cfg Config) []hit {
 		total: len(addrs) * len(cfg.Ports),
 	}
 
-	// Round 1 is a barrier, and it is the one that pays for itself: for the cost
-	// of a single port it eliminates most live addresses from every later probe.
+	// Staging trades a round-trip for a smaller probe count, and that trade is
+	// only worth making when the probes don't fit in one concurrent wave.
 	//
-	// The remaining ports are deliberately NOT run as further barriers. Each
-	// barrier costs the full timeout of its slowest member, so sixteen sequential
-	// rounds would floor discovery at 16 x timeout — measured at 4.94s on a /24
-	// that finishes in ~1.2s otherwise, i.e. four times *worse* than probing
-	// everything at once. So the survivors go through the remaining ports
-	// concurrently, and the tail costs one timeout rather than fifteen.
+	// Below the threshold every (address, port) pair is already in flight
+	// simultaneously, so the scan costs exactly one timeout and there is nothing
+	// to save — adding a barrier just serialises two waves where one would do.
+	// Measured on a live /24: staging unconditionally cost ~1.25s against ~930ms
+	// for probing everything at once, for identical results. Above the
+	// threshold the arithmetic inverts: a /16 is ~1M probes against a few
+	// thousand concurrent slots, so probe count, not round-trips, sets the
+	// wall-clock and cutting it 16x dominates the one extra barrier.
 	pending := addrs
-	if len(cfg.Ports) > 0 && ctx.Err() == nil {
+	switch {
+	case ctx.Err() != nil || len(cfg.Ports) == 0:
+	case len(addrs)*len(cfg.Ports) <= cfg.Concurrency*stagingThreshold:
+		pending = s.probe(ctx, pending, cfg.Ports)
+	default:
+		// Round 1 eliminates most live addresses for the cost of a single port.
+		// The remaining ports are NOT a further barrier per port: each costs the
+		// full timeout of its slowest member, and sixteen of them floored
+		// discovery at 4.94s in testing. The survivors go through the rest
+		// concurrently, so the tail costs one timeout rather than fifteen.
 		pending = s.probe(ctx, pending, cfg.Ports[:1])
 		if len(cfg.Ports) > 1 && len(pending) > 0 && ctx.Err() == nil {
 			pending = s.probe(ctx, pending, cfg.Ports[1:])
