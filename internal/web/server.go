@@ -319,20 +319,23 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	}()
 
 	runner := scan.NewLocalRunner()
-	cfg := scan.Config{Preset: preset, Concurrency: 64, HostTimeout: 20 * time.Second}
+	// Batch as the TUI does: without BatchSize a non-fast scan runs one nmap
+	// process per host, up to 64 concurrent at ~10-40MB RSS each. DiscardResults
+	// keeps the raw XML from being retained after OnResult has consumed it.
+	cfg := scan.Config{Preset: preset, Concurrency: 64, HostTimeout: 20 * time.Second, BatchSize: 16, DiscardResults: true}
 
+	discover := newPhaseThrottle(s.bus, "discover", 100*time.Millisecond)
 	s.bus.publish("phase", map[string]any{"phase": "discover", "done": 0, "total": 0})
 
 	var live []string
 	var macs map[string]string
 	var err error
 	if fast && scan.NativeDiscoverySupported(runner) {
-		live, macs, err = scan.NativeDiscovery(ctx, targets, runner, func(done, total int) {
-			s.bus.publish("phase", map[string]any{"phase": "discover", "done": done, "total": total})
-		})
+		live, macs, err = scan.NativeDiscovery(ctx, targets, runner, discover.update)
 	} else {
 		live, err = scan.HostDiscovery(ctx, targets, runner)
 	}
+	discover.flush()
 	if err != nil {
 		s.bus.publish("error", map[string]string{"error": err.Error()})
 		return
@@ -353,20 +356,29 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		}
 	}
 
+	progress := newPhaseThrottle(s.bus, "scan", 100*time.Millisecond)
 	s.bus.publish("phase", map[string]any{"phase": "scan", "done": 0, "total": len(live)})
 
 	var results []scan.HostResult
 	if fast && scan.NativePortScanViable(cfg, runner) {
-		results = scan.NativePortScan(ctx, live, cfg, func(done, total int) {
-			s.bus.publish("phase", map[string]any{"phase": "scan", "done": done, "total": total})
-		})
+		results = scan.NativePortScan(ctx, live, cfg, progress.update)
 	} else {
-		results, err = scan.ScanHosts(ctx, live, cfg, runner)
-		if err != nil {
+		// With DiscardResults set, ScanHosts returns nothing; results stream
+		// back through OnResult instead. It fires from worker goroutines, so
+		// appends need the mutex.
+		var mu sync.Mutex
+		cfg.OnResult = func(r scan.HostResult) {
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
+		}
+		cfg.Progress = progress.update
+		if _, err = scan.ScanHosts(ctx, live, cfg, runner); err != nil {
 			s.bus.publish("error", map[string]string{"error": err.Error()})
 			return
 		}
 	}
+	progress.flush()
 
 	rows := ui.BuildRows(results, s.oui, true, true, macs)
 	for _, row := range rows {
