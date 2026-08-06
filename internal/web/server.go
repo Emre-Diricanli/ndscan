@@ -71,6 +71,7 @@ func (s *Server) Handler(addr string) http.Handler {
 	mux.HandleFunc("GET /api/export", s.handleExport)
 	mux.HandleFunc("GET /api/history", s.handleHistory)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
+	mux.HandleFunc("POST /api/scan/sweep", s.handleSweep)
 	mux.HandleFunc("POST /api/discover", s.handleDiscover)
 	mux.HandleFunc("POST /api/cancel", s.handleCancel)
 	mux.HandleFunc("POST /api/watch", s.handleWatch)
@@ -101,6 +102,9 @@ type stateResponse struct {
 	// answer to "what should I scan?" — making the user look up their own
 	// subnet is a gap between what we know and what we show.
 	Suggested []suggestedNetwork `json:"suggested,omitempty"`
+	// Siblings are bounded routed candidates derived passively from the same
+	// interface table, so showing the choice never probes the network.
+	Siblings []string `json:"siblings,omitempty"`
 }
 
 // netSnapshot is the machine's network context captured when a scan starts.
@@ -171,6 +175,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		resp.Topology = &d
 	}
 	resp.Suggested = suggestedNetworks()
+	resp.Siblings = netinfo.SiblingCandidates(netinfo.Locals(), nil)
 	resp.Watch = watchResponse{
 		Enabled:     s.watch.enabled,
 		IntervalSec: int(s.watch.interval.Seconds()),
@@ -332,22 +337,32 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		fast = *req.Fast
 	}
 
+	if !s.startScan(req.Targets, preset, fast) {
+		writeErr(w, http.StatusConflict, "a scan is already running")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"started": true})
+}
+
+// startScan owns the single transition from idle to scanning. Keeping the
+// check and state change under one lock prevents manual and routed requests
+// from racing each other into two concurrent scans.
+func (s *Server) startScan(targets []string, preset string, fast bool) bool {
 	s.mu.Lock()
 	if s.scanning {
 		s.mu.Unlock()
-		writeErr(w, http.StatusConflict, "a scan is already running")
-		return
+		return false
 	}
 	// Detached from the request context: the scan must outlive the POST that
 	// started it, since progress is delivered separately over SSE.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	s.scanning = true
-	s.targets = req.Targets
+	s.targets = targets
 	s.cancel = cancel
 	s.mu.Unlock()
 
-	go s.runScan(ctx, cancel, req.Targets, preset, fast)
-	writeJSON(w, http.StatusAccepted, map[string]bool{"started": true})
+	go s.runScan(ctx, cancel, targets, preset, fast)
+	return true
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
