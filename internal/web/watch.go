@@ -148,19 +148,25 @@ func (s *Server) watchLoop(ctx context.Context, gen int) {
 
 		s.mu.RLock()
 		stale := s.watch.gen != gen || !s.watch.enabled
-		busy := s.scanning
 		s.mu.RUnlock()
 		if stale {
 			return
 		}
-		if !busy {
-			scanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-			s.mu.Lock()
-			s.scanning = true
-			s.cancel = cancel
-			s.mu.Unlock()
+		// startScan owns the idle-to-scanning transition, so a manual request
+		// cannot enter between a separate watch check and state update.
+		//
+		// It starts the scan in its own goroutine, but the interval is meant to
+		// be the gap *between* scans: scheduling the next tick while this one is
+		// still running would let a scan slower than the interval be woken every
+		// interval, each wake bouncing off the busy check. Waiting keeps the
+		// documented "skipped rather than queued" behaviour.
+		if done, started := s.startWatchScan(st.targets, st.preset, st.fast); started {
 			s.bus.publish("watch", map[string]any{"enabled": true, "rescanning": true})
-			s.runScan(scanCtx, cancel, st.targets, st.preset, st.fast)
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+			}
 		}
 
 		s.mu.Lock()
@@ -175,9 +181,41 @@ func (s *Server) watchLoop(ctx context.Context, gen int) {
 	}
 }
 
+// startWatchScan admits a watch-driven scan through the same atomic transition
+// manual scans use, and reports a channel closed when that scan finishes.
+//
+// Watch needs the completion signal that startScan does not expose, because its
+// interval is defined as the gap between scans rather than between wake-ups.
+// The check-and-set itself is deliberately not reimplemented here — duplicating
+// it is what allowed a manual scan to slip between watch's separate check and
+// update in the first place.
+func (s *Server) startWatchScan(targets []string, preset string, fast bool) (<-chan struct{}, bool) {
+	done := make(chan struct{})
+	if !s.startScan(targets, preset, fast) {
+		return nil, false
+	}
+	// startScan has already put the server into the scanning state and launched
+	// the run. Observing s.scanning fall back to false is what tells us the run
+	// is over; the poll is cheap next to a scan and needs no change to the
+	// shared server state.
+	go func() {
+		defer close(done)
+		for {
+			s.mu.RLock()
+			running := s.scanning
+			s.mu.RUnlock()
+			if !running {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	return done, true
+}
+
 func validPreset(p string) bool {
 	switch p {
-	case "quick", "default", "udp", "deep":
+	case "quick", "smart", "default", "udp", "deep":
 		return true
 	}
 	return false
