@@ -74,6 +74,15 @@
   }
   .controls input[type="text"] { width: 220px; }
   .controls input[type="text"]:focus, .controls select:focus { border-color: var(--accent); }
+  .watch-controls, .export-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding-left: 8px;
+    border-left: 1px solid var(--border);
+  }
+  #watch-status { min-width: 92px; color: var(--muted); font-size: 12px; }
+  .export-controls button { padding: 5px 8px; font-size: 11px; }
   .toggle {
     display: inline-flex;
     align-items: center;
@@ -353,6 +362,24 @@
     </label>
     <button id="scan-btn">Scan</button>
     <button id="cancel-btn" class="danger" disabled>Cancel</button>
+    <span class="watch-controls">
+      <label class="toggle" title="repeat scans on this schedule">
+        <input type="checkbox" id="watch-toggle"> watch
+      </label>
+      <select id="watch-interval" title="watch interval">
+        <option value="30">30s</option>
+        <option value="60" selected>1m</option>
+        <option value="300">5m</option>
+        <option value="900">15m</option>
+      </select>
+      <span id="watch-status"></span>
+    </span>
+    <span class="export-controls" title="export the latest scan">
+      <button class="ghost export-btn" data-format="json" disabled>JSON</button>
+      <button class="ghost export-btn" data-format="csv" disabled>CSV</button>
+      <button class="ghost export-btn" data-format="md" disabled>MD</button>
+      <button class="ghost export-btn" data-format="html" disabled>HTML</button>
+    </span>
   </div>
 </header>
 
@@ -560,7 +587,9 @@ const S = {
   collapsed: new Set(), // node ids whose subtree is folded away
   sort: { key: "ip", dir: 1 },
   filter: "",
-  lastScan: null
+  lastScan: null,
+  hasScan: false,
+  watch: { enabled: false, intervalSec: 60, nextAt: null, rescanning: false }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -623,6 +652,8 @@ function applyState(st) {
   S.scanning = !!st.scanning;
   S.topology = st.topology || null;
   S.lastScan = st.lastScan || null;
+  S.hasScan = !!st.lastScan;
+  applyWatchState(st.watch || { enabled: false });
   S.hosts.clear();
   if (S.topology) {
     for (const seg of S.topology.segments || []) {
@@ -697,6 +728,9 @@ function connectEvents() {
     try { d = JSON.parse(ev.data); } catch (_) {}
     onScanDone(d);
   });
+  es.addEventListener("watch", (ev) => {
+    try { applyWatchState(JSON.parse(ev.data)); } catch (_) {}
+  });
   es.addEventListener("error", (ev) => {
     // An SSE "error" *event* carries a JSON payload; a transport failure hits onerror instead.
     if (ev.data) {
@@ -724,7 +758,9 @@ function onPhase(p) {
 
 function onScanDone(d) {
   S.scanning = false;
+  S.hasScan = true;
   updateScanButtons();
+  updateExportButtons();
   const cancelled = d && d.cancelled;
   const n = d && typeof d.hosts === "number" ? d.hosts : S.hosts.size;
   const ms = d && typeof d.elapsedMs === "number" ? d.elapsedMs : 0;
@@ -785,6 +821,100 @@ async function cancelScan() {
 function updateScanButtons() {
   $("scan-btn").disabled = S.scanning;
   $("cancel-btn").disabled = !S.scanning;
+}
+
+/* ------------------------------------------------------------------ *
+ * Watch state + exports                                               *
+ * ------------------------------------------------------------------ */
+let watchCountdownTimer = null;
+
+function stopWatchCountdown() {
+  if (watchCountdownTimer) { clearInterval(watchCountdownTimer); watchCountdownTimer = null; }
+}
+
+function renderWatchStatus() {
+  const w = S.watch;
+  $("watch-toggle").checked = w.enabled;
+  $("watch-interval").disabled = w.enabled;
+  if (!w.enabled) { $("watch-status").textContent = ""; return; }
+  if (w.rescanning) { $("watch-status").textContent = "rescanning…"; return; }
+  if (!w.nextAt) { $("watch-status").textContent = "scheduled"; return; }
+  const seconds = Math.max(0, Math.ceil((new Date(w.nextAt).getTime() - Date.now()) / 1000));
+  $("watch-status").textContent = "next scan in " + seconds + "s";
+}
+
+function applyWatchState(next) {
+  const hasInterval = typeof next.intervalSec === "number" && next.intervalSec > 0;
+  S.watch = {
+    enabled: typeof next.enabled === "boolean" ? next.enabled : S.watch.enabled,
+    intervalSec: hasInterval ? next.intervalSec : S.watch.intervalSec,
+    nextAt: Object.prototype.hasOwnProperty.call(next, "nextAt") ? next.nextAt : S.watch.nextAt,
+    rescanning: !!next.rescanning
+  };
+  if (hasInterval) {
+    const select = $("watch-interval");
+    if (!Array.from(select.options).some((o) => Number(o.value) === next.intervalSec)) {
+      select.add(new Option(next.intervalSec + "s", String(next.intervalSec)));
+    }
+    select.value = String(next.intervalSec);
+  }
+  stopWatchCountdown();
+  renderWatchStatus();
+  if (S.watch.enabled) watchCountdownTimer = setInterval(renderWatchStatus, 1000);
+}
+
+async function setWatch(enabled) {
+  $("watch-toggle").disabled = true;
+  try {
+    const body = enabled ? {
+      enabled: true,
+      intervalSec: Number($("watch-interval").value),
+      targets: currentTargets(),
+      preset: $("preset-select").value,
+      fast: $("fast-toggle").checked
+    } : { enabled: false };
+    const r = await fetch("/api/watch", {
+      method: "POST",
+      // Origin is a forbidden header name — fetch drops any value set here, and
+      // the browser supplies the real one. The CSRF guard is satisfied because
+      // this is a same-origin request, not because we asked for it.
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+    applyWatchState(data);
+  } catch (e) {
+    $("watch-toggle").checked = S.watch.enabled;
+    showError("Failed to update watch mode: " + e.message);
+  } finally {
+    $("watch-toggle").disabled = false;
+  }
+}
+
+function updateExportButtons() {
+  document.querySelectorAll(".export-btn").forEach((btn) => { btn.disabled = !S.hasScan || S.demo; });
+}
+
+async function downloadExport(format) {
+  try {
+    const r = await fetch("/api/export?format=" + encodeURIComponent(format));
+    const contentType = r.headers.get("Content-Type") || "";
+    if (!r.ok) {
+      const data = contentType.includes("application/json") ? await r.json().catch(() => ({})) : {};
+      throw new Error(data.error || ("HTTP " + r.status));
+    }
+    const blobUrl = URL.createObjectURL(await r.blob());
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = "ndscan-export." + format;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
+  } catch (e) {
+    showError("Export failed: " + e.message);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1634,6 +1764,10 @@ $("table-filter").addEventListener("input", (ev) => { S.filter = ev.target.value
  * ------------------------------------------------------------------ */
 $("scan-btn").addEventListener("click", startScan);
 $("cancel-btn").addEventListener("click", cancelScan);
+$("watch-toggle").addEventListener("change", (ev) => setWatch(ev.target.checked));
+document.querySelectorAll(".export-btn").forEach((btn) => {
+  btn.addEventListener("click", () => downloadExport(btn.dataset.format));
+});
 $("target-input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startScan(); });
 $("fit-btn").addEventListener("click", () => fitToNodes(G.nodes));
 
@@ -1676,12 +1810,14 @@ document.addEventListener("keydown", (ev) => {
 
 function renderAll() {
   updateScanButtons();
+  updateExportButtons();
   renderGraph();
   renderTable();
 }
 
 loadPrefs();
 loadInitialState().then(() => { if (!S.demo) connectEvents(); });
+window.addEventListener("beforeunload", stopWatchCountdown);
 </script>
 </body>
 </html>
