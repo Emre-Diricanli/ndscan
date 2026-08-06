@@ -284,6 +284,57 @@
   .graph-tools button { padding: 2px 10px; font-size: 11px; font-weight: 600; }
   #graph-legend .hint { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); opacity: 0.85; }
 
+  /* Coverage line: what the last scan actually covered. Its absence was what
+     made a correct scan look broken — the user could not tell "scanned, empty"
+     from "never scanned". */
+  #scope-line {
+    display: none;
+    padding: 6px 18px;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  #scope-line.on { display: block; }
+  #scope-line .t { color: var(--text); font-weight: 600; }
+
+  /* Sweep confirmation. A browser click is cheaper than the TUI's deliberate
+     'S' keypress, and a sweep probes networks the user may not own — so the
+     candidates and gateway get shown up front and the click confirms intent. */
+  #sweep-modal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 10;
+  }
+  #sweep-modal.on { display: flex; }
+  #sweep-dialog {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    max-width: 480px;
+    width: calc(100% - 32px);
+  }
+  #sweep-dialog h3 { margin: 0 0 8px; font-size: 14px; }
+  #sweep-dialog p { margin: 0 0 10px; font-size: 12.5px; color: var(--muted); }
+  #sweep-cidrs {
+    max-height: 180px;
+    overflow-y: auto;
+    margin: 0 0 12px;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  #sweep-cidrs div { padding: 1px 0; }
+  .sweep-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
   #detail-card { grid-area: panel; }
   #detail-body { padding: 12px 14px; overflow-y: auto; font-size: 13px; }
   #detail-body .placeholder { color: var(--muted); }
@@ -427,10 +478,13 @@
 
 <div id="error-banner"><span id="error-text"></span><button id="error-close" title="dismiss">✕</button></div>
 
+<div id="scope-line"></div>
+
 <main>
   <section class="card" id="graph-card">
     <h2>Topology
       <span class="graph-tools">
+        <button id="sweep-btn" class="ghost" hidden title="probe subnets reachable through the gateway (VLANs beyond your own)">Sweep sibling subnets</button>
         <button id="fit-btn" class="ghost" title="fit the whole tree to the view">Fit to view</button>
       </span>
     </h2>
@@ -495,6 +549,18 @@
     </div>
   </section>
 </main>
+
+<div id="sweep-modal">
+  <div id="sweep-dialog" role="dialog" aria-modal="true" aria-labelledby="sweep-title">
+    <h3 id="sweep-title">Sweep sibling subnets?</h3>
+    <p id="sweep-blurb"></p>
+    <div id="sweep-cidrs"></div>
+    <div class="sweep-actions">
+      <button id="sweep-cancel" class="ghost">Cancel</button>
+      <button id="sweep-confirm">Start sweep</button>
+    </div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -630,6 +696,8 @@ const S = {
   lastScan: null,
   staleTarget: null,   // previous target dropped because we left that network
   hasScan: false,
+  targets: [],        // CIDRs the last scan covered — the "what did it scan" answer
+  siblings: [],       // candidate sibling subnets the backend offers to sweep
   watch: { enabled: false, intervalSec: 60, nextAt: null, rescanning: false }
 };
 
@@ -696,6 +764,8 @@ function applyState(st) {
   S.topology = st.topology || null;
   S.lastScan = st.lastScan || null;
   S.hasScan = !!st.lastScan;
+  S.targets = Array.isArray(st.targets) ? st.targets : [];
+  S.siblings = Array.isArray(st.siblings) ? st.siblings : [];
   applyWatchState(st.watch || { enabled: false });
   S.hosts.clear();
   if (S.topology) {
@@ -894,6 +964,7 @@ function onScanDone(d) {
   const ms = d && typeof d.elapsedMs === "number" ? d.elapsedMs : 0;
   setProgress(cancelled ? "cancelled" : "done — " + n + " hosts, " + (ms / 1000).toFixed(1) + "s", 100);
   setTimeout(() => showProgress(false), 2500);
+  renderScopeLine();
   // Pull the fresh topology now that the scan finished.
   if (!S.demo) {
     apiGet("/api/topology").then((t) => {
@@ -916,6 +987,7 @@ async function startScan() {
   const targets = currentTargets();
   if (!targets.length) { showError("Enter at least one scan target."); return; }
   const body = { targets, fast: $("fast-toggle").checked, preset: $("preset-select").value };
+  S.targets = targets;
 
   S.hosts.clear();
   renderTable();
@@ -947,9 +1019,110 @@ async function cancelScan() {
   }
 }
 
+/* Clicking an attached-but-unscanned segment scans that CIDR (the TUI binds
+   the same action to 's' in the map view). Going through the target input
+   keeps the visible input, the scope line, and watch targets honest. */
+function scanSegment(n) {
+  if (S.scanning) { selectNode(n); return; } // can't start now; just explain
+  $("target-input").value = n.scanCidr;
+  startScan();
+}
+
 function updateScanButtons() {
   $("scan-btn").disabled = S.scanning;
   $("cancel-btn").disabled = !S.scanning;
+  renderSweepButton();
+  // Every scanning-state transition funnels through here; the scope line
+  // depends on it (hidden mid-scan) and is cheap to re-render.
+  renderScopeLine();
+}
+
+/* ------------------------------------------------------------------ *
+ * Sibling sweep — parity with the TUI's 'S' key in the map view:      *
+ * probe the subnets reachable through the gateway, not just ours.     *
+ * ------------------------------------------------------------------ */
+function renderSweepButton() {
+  const btn = $("sweep-btn");
+  const n = S.siblings.length;
+  // No candidates means nothing to offer (e.g. no attached IPv4 /24), and in
+  // demo mode there is no backend to sweep with — either way, no button.
+  btn.hidden = S.demo || n === 0;
+  btn.disabled = S.scanning;
+  btn.textContent = n ? "Sweep " + n + " sibling subnet" + (n === 1 ? "" : "s") : "Sweep sibling subnets";
+}
+
+function openSweepModal() {
+  if (!S.siblings.length || S.scanning) return;
+  const gw = S.topology && S.topology.gateway;
+  $("sweep-blurb").textContent =
+    "This probes " + S.siblings.length + " subnet" + (S.siblings.length === 1 ? "" : "s") +
+    " reachable through " + (gw ? "your gateway " + gw : "your gateway") +
+    " — likely other VLANs, which may not be yours to scan. Only continue if you are allowed to probe them.";
+  // DOM nodes, not markup: CIDRs come from the routing table of another
+  // machine's perspective and have no business reaching the HTML parser.
+  const list = $("sweep-cidrs");
+  list.textContent = "";
+  for (const cidr of S.siblings) {
+    const row = document.createElement("div");
+    row.textContent = cidr;
+    list.appendChild(row);
+  }
+  $("sweep-modal").classList.add("on");
+}
+
+function closeSweepModal() {
+  $("sweep-modal").classList.remove("on");
+}
+
+async function startSweep() {
+  closeSweepModal();
+  if (S.demo || S.scanning) return;
+  try {
+    const r = await apiPost("/api/scan/sweep", {});
+    // The server reports what it is actually sweeping; that becomes the scope
+    // line once the scan completes.
+    if (Array.isArray(r.targets) && r.targets.length) S.targets = r.targets;
+    S.scanning = true;
+    updateScanButtons();
+    showProgress(true);
+    setProgressIndeterminate("starting sweep…");
+  } catch (e) {
+    if (e.status === 409) {
+      showError("A scan is already running.");
+      S.scanning = true;
+      updateScanButtons();
+    } else if (e.status === 404) {
+      // Backend predates the sweep endpoint; say so instead of dying silently.
+      showError("This server build has no sweep endpoint yet.");
+    } else {
+      // 400 carries the server's own reason (e.g. no candidates) — show it.
+      showError("Sweep not started: " + e.message);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Scan scope line — one line answering "what did the last scan cover" *
+ * ------------------------------------------------------------------ */
+function renderScopeLine() {
+  const el = $("scope-line");
+  // Hidden mid-scan: the progress bar owns that moment, and showing the old
+  // scope next to it would read as the new scan's coverage.
+  const show = S.hasScan && S.targets.length > 0 && !S.scanning;
+  el.classList.toggle("on", show);
+  el.textContent = "";
+  if (!show) return;
+  const n = S.hosts.size;
+  el.appendChild(document.createTextNode("Scanned "));
+  const t = document.createElement("span");
+  t.className = "t";
+  t.textContent = S.targets.join(", ");
+  el.appendChild(t);
+  el.appendChild(document.createTextNode(" — "));
+  const c = document.createElement("span");
+  c.className = "t";
+  c.textContent = n + (n === 1 ? " host" : " hosts");
+  el.appendChild(c);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1179,9 +1352,15 @@ function buildGraph(topology) {
 
   for (const seg of segs) {
     if (seg.notScanned) {
+      // Same rule as the TUI's "press s to scan" affordance: only networks we
+      // are attached to (an interface exists) and that are actually sweepable
+      // (a /32 tunnel address is not a range) may be offered as a scan target.
+      const scannable = !!seg.interface && !seg.cidr.endsWith("/32");
       const ph = add({
-        id: "seg:" + seg.cidr, label: seg.cidr + " — attached, not scanned",
-        kind: "unknown", severity: "", host: null, r: 10
+        id: "seg:" + seg.cidr,
+        label: seg.cidr + " — attached, not scanned" + (scannable ? " · click to scan" : ""),
+        kind: "unknown", severity: "", host: null, r: 10,
+        scanCidr: scannable ? seg.cidr : ""
       });
       edges.push({ a: selfNode, b: ph, routed: false, label: seg.interface || "" });
       continue;
@@ -1204,7 +1383,18 @@ function buildGraph(topology) {
         routedVia: seg.routedVia || "", segCidr: seg.cidr
       }));
     }
-    if (!hosts.length) continue;
+    if (!hosts.length) {
+      // The scan covered this segment and nothing answered. That is a finding,
+      // not a gap — it must not look like the dashed "not scanned" placeholder
+      // above, or a correct empty result reads as a misfire.
+      const empty = add({
+        id: "seg:" + seg.cidr, label: seg.cidr, kind: "segment", severity: "",
+        host: null, r: 0, count: 0,
+        sub: "no hosts found" + (routed ? " · via " + seg.routedVia : "")
+      });
+      edges.push({ a: parent, b: empty, routed });
+      continue;
+    }
 
     // Per-segment grouping tier: hosts hang off a segment chip instead of all
     // dangling directly from the gateway. The chip doubles as the
@@ -1479,8 +1669,19 @@ function paintGraph() {
       g.appendChild(bt);
     }
 
+    // A scannable placeholder gets a native tooltip so the affordance reads
+    // as clickable before the user commits to the click.
+    if (n.scanCidr) {
+      const tip = svgEl("title");
+      tip.textContent = "scan " + n.scanCidr;
+      g.appendChild(tip);
+    }
+
     g.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      // An attached-but-unscanned segment is an action, not dead text: clicking
+      // it targets and scans that CIDR — parity with the TUI's 's' key.
+      if (n.scanCidr) { scanSegment(n); return; }
       if (kids.length) toggleCollapse(n);
       selectNode(n);
     });
@@ -1664,7 +1865,9 @@ function selectNode(n) {
     S.selectedIp = null;
     $("detail-body").innerHTML =
       '<div class="placeholder">' + esc(n.label) +
-      "<br><br>This segment is attached to this machine but was not covered by the scan, so its contents are unknown.</div>";
+      "<br><br>This segment is attached to this machine but was not covered by the scan, so its contents are unknown." +
+      (n.scanCidr ? "<br><br>Click it in the graph to scan " + esc(n.scanCidr) + "." : "") +
+      "</div>";
     renderTable();
     paintGraph();
     return;
@@ -1679,7 +1882,9 @@ function selectNode(n) {
       "<dt>Link</dt><dd>" + (e && e.routed ? "routed via gateway" : "directly attached") + "</dd>" +
       "<dt>Worst severity</dt><dd><span class=\"pill " + (n.severity || "none") + "\">" + (n.severity || "none") + "</span></dd>" +
       "</dl>" +
-      '<div class="placeholder">Click the chip to collapse or expand its hosts.</div>';
+      '<div class="placeholder">' + (n.count
+        ? "Click the chip to collapse or expand its hosts."
+        : "The scan covered this segment; no hosts answered.") + "</div>";
     renderTable();
     paintGraph();
     return;
@@ -1893,6 +2098,7 @@ function renderTable() {
     ? "No hosts match the filter."
     : (S.lastScan ? "Last scan found no hosts." : "No hosts yet — run a scan.");
   $("host-count").textContent = S.hosts.size ? "(" + S.hosts.size + ")" : "";
+  renderScopeLine();
 
   // Sort indicators.
   document.querySelectorAll("#hosts-table th").forEach((th) => {
@@ -1992,6 +2198,11 @@ document.querySelectorAll(".export-btn").forEach((btn) => {
 });
 $("target-input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startScan(); });
 $("fit-btn").addEventListener("click", () => fitToNodes(G.nodes));
+$("sweep-btn").addEventListener("click", openSweepModal);
+$("sweep-cancel").addEventListener("click", closeSweepModal);
+$("sweep-confirm").addEventListener("click", startSweep);
+// Backdrop click dismisses; a click inside the dialog must not bubble into one.
+$("sweep-modal").addEventListener("click", (ev) => { if (ev.target === $("sweep-modal")) closeSweepModal(); });
 $("changed-only").addEventListener("change", (ev) => { S.changedOnly = ev.target.checked; renderTable(); });
 
 document.addEventListener("keydown", (ev) => {
@@ -2004,6 +2215,7 @@ document.addEventListener("keydown", (ev) => {
     return;
   }
   if (ev.key === "Escape") {
+    if ($("sweep-modal").classList.contains("on")) { closeSweepModal(); return; }
     if (inField) { ae.blur(); return; }
     if (S.selectedIp) {
       S.selectedIp = null;
