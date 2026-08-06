@@ -85,7 +85,25 @@ func (c *Checker) readCache() cache {
 		return ch
 	}
 	_ = json.Unmarshal(b, &ch)
+	// A cache we cannot replace must not be allowed to answer for us. Running
+	// the tool once under sudo leaves this file owned by root, and from then on
+	// every unprivileged run would read the version recorded that day and
+	// suppress the check forever — the user simply stops being offered updates,
+	// with nothing to indicate why. Treating it as absent costs one API call.
+	if !c.cacheWritable() {
+		return cache{}
+	}
 	return ch
+}
+
+// cacheWritable reports whether the cache file can actually be updated.
+func (c *Checker) cacheWritable() bool {
+	f, err := os.OpenFile(c.CachePath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return os.IsNotExist(err) // absent is fine; it will be created
+	}
+	f.Close()
+	return true
 }
 
 func (c *Checker) writeCache(ch cache) {
