@@ -27,7 +27,7 @@ const (
 // topologyView renders the network map: every network this machine is attached
 // to, the gateway, and the hosts found on each.
 func (m Model) topologyView() string {
-	return m.renderTopology(topology.Build(m.topologyRows(), m.netLocals, m.netGateway))
+	return m.renderTopology(topology.Build(m.topologyRows(), topology.Input{Locals: m.netLocals, Gateway: m.netGateway, Coverage: m.params.targets}))
 }
 
 func (m Model) topologyRows() []ui.Row {
@@ -75,7 +75,7 @@ func (m Model) renderTopology(tm topology.Map) string {
 func (m Model) firstUnscannedNetwork() (string, bool) {
 	tm := m.topology
 	if m.mapDirty {
-		tm = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
+		tm = topology.Build(m.topologyRows(), topology.Input{Locals: m.netLocals, Gateway: m.netGateway, Coverage: m.params.targets})
 	}
 	for _, seg := range tm.Segments {
 		// Only offer networks this machine is actually attached to; synthetic
@@ -127,7 +127,7 @@ func (m Model) startRoutedSweep() (tea.Model, tea.Cmd) {
 func (m Model) routedHostCount() int {
 	tm := m.topology
 	if m.mapDirty {
-		tm = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
+		tm = topology.Build(m.topologyRows(), topology.Input{Locals: m.netLocals, Gateway: m.netGateway, Coverage: m.params.targets})
 	}
 	n := 0
 	for _, seg := range tm.Segments {

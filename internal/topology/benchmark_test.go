@@ -19,7 +19,7 @@ func BenchmarkBuild(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				_ = Build(rows, locals, netinfo.Gateway{IP: "10.0.0.254"})
+				_ = Build(rows, Input{Locals: locals, Gateway: netinfo.Gateway{IP: "10.0.0.254"}})
 			}
 		})
 	}

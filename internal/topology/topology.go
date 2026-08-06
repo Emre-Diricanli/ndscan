@@ -30,8 +30,11 @@ type Segment struct {
 	CIDR       string // e.g. "192.168.2.0/24"
 	Interface  string // e.g. "en0" ("" when inferred from results alone)
 	SelfAddr   string // this machine's address on it, if any
-	Nodes      []Node
-	NotScanned bool // attached to this network, but no scan covered it
+	Nodes []Node
+	// NotScanned means no scan covered this network — not that a scan looked
+	// and found nothing. Those are opposite facts and must not render alike:
+	// "I checked, it's empty" is a finding; "I never checked" is a gap.
+	NotScanned bool
 	// RoutedVia is set on segments this machine is NOT attached to but reached
 	// through the gateway (a sibling VLAN, a remote SSH scan). It holds the
 	// gateway IP the traffic transited, so the map can show the segment nested
@@ -42,6 +45,36 @@ type Segment struct {
 // Attached reports whether this machine has an interface on the segment.
 // Routed and orphan segments are not attached.
 func (s Segment) Attached() bool { return s.Interface != "" }
+
+// parseCoverage turns scan targets into prefixes. A bare address counts as
+// covering only itself, which is what a single-host scan actually did.
+func parseCoverage(targets []string) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(targets))
+	for _, t := range targets {
+		if p, err := netip.ParsePrefix(t); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(t); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out
+}
+
+// coversNetwork reports whether the scan reached into the given network.
+//
+// Any overlap counts. Scanning half a subnet still means we looked there, and
+// reporting it as untouched would hide the hosts we did find; the honest
+// distinction is "looked" versus "never looked", not "looked exhaustively".
+func coversNetwork(covered []netip.Prefix, net netip.Prefix) bool {
+	for _, c := range covered {
+		if c.Overlaps(net) {
+			return true
+		}
+	}
+	return false
+}
 
 // Map is the full topology.
 type Map struct {
@@ -79,21 +112,35 @@ func severityRank(s string) int {
 	}
 }
 
+// Input is everything Build needs about the machine and the scan that produced
+// the rows. Passing it in (rather than calling netinfo here) keeps Build pure
+// and testable.
+type Input struct {
+	// Locals are the networks this machine is attached to.
+	Locals []netinfo.Network
+	// Gateway is the default next hop.
+	Gateway netinfo.Gateway
+	// Coverage lists what the scan actually targeted. Without it, a segment
+	// with no hosts is ambiguous: coverage is the only thing that separates
+	// "scanned, nothing there" from "never looked". Callers that genuinely
+	// don't know may leave it nil, and every empty segment then reports as
+	// unscanned — the old, pessimistic behaviour.
+	Coverage []string
+}
+
 // Build assembles the map from scan rows plus the machine's own networks.
-//
-// locals and gateway come from netinfo; passing them in (rather than calling
-// netinfo here) keeps Build pure and testable.
-func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map {
+func Build(rows []ui.Row, in Input) Map {
 	type seg struct {
 		net   netip.Prefix
 		index int
 	}
 
-	m := Map{Gateway: gateway.IP}
+	m := Map{Gateway: in.Gateway.IP}
 	var parsed []seg
+	covered := parseCoverage(in.Coverage)
 
 	// Seed one segment per attached network, in interface order.
-	for _, l := range locals {
+	for _, l := range in.Locals {
 		ipnet, err := netip.ParsePrefix(l.CIDR)
 		if err != nil {
 			continue
@@ -102,8 +149,9 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 			CIDR:      l.CIDR,
 			Interface: l.Interface,
 			SelfAddr:  l.Addr,
-			// Assume nothing was scanned until a row lands here.
-			NotScanned: true,
+			// A segment the scan covered is "scanned" whether or not anything
+			// answered. Only segments outside the scan's reach stay unscanned.
+			NotScanned: !coversNetwork(covered, ipnet),
 		})
 		parsed = append(parsed, seg{net: ipnet, index: len(m.Segments) - 1})
 	}
@@ -114,7 +162,7 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 		node := Node{
 			Row:       r,
 			Severity:  worstSeverity(r),
-			IsGateway: gateway.IP != "" && r.IP == gateway.IP,
+			IsGateway: in.Gateway.IP != "" && r.IP == in.Gateway.IP,
 			addr:      ip,
 		}
 		placed := false
@@ -145,7 +193,7 @@ func Build(rows []ui.Row, locals []netinfo.Network, gateway netinfo.Gateway) Map
 	if len(m.Orphans) > 0 {
 		routed := orphanSegments(m.Orphans)
 		for i := range routed {
-			routed[i].RoutedVia = gateway.IP
+			routed[i].RoutedVia = in.Gateway.IP
 		}
 		m.Segments = append(m.Segments, routed...)
 		m.Orphans = nil

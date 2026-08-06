@@ -103,6 +103,14 @@ type stateResponse struct {
 	Suggested []suggestedNetwork `json:"suggested,omitempty"`
 }
 
+// netSnapshot is the machine's network context captured when a scan starts.
+// Carrying it forward keeps the finished map describing the network the scan
+// actually ran on, even if the machine roamed before the scan completed.
+type netSnapshot struct {
+	locals  []netinfo.Network
+	gateway netinfo.Gateway
+}
+
 // suggestedNetwork is one scannable local network offered as a starting target.
 type suggestedNetwork struct {
 	CIDR      string `json:"cidr"`
@@ -359,6 +367,10 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 // runScan executes a scan and publishes progress to SSE subscribers. It always
 // clears the scanning flag, so a failure can never wedge the server.
 func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets []string, preset string, fast bool) {
+	// Capture the network context now, not when the scan finishes. A laptop can
+	// change Wi-Fi or drop a VPN mid-scan, and reading the interfaces at the end
+	// would label these results with a network they were never taken on.
+	locals, gateway := netinfo.Locals(), netinfo.DefaultGateway()
 	start := time.Now()
 	defer func() {
 		cancel()
@@ -391,7 +403,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		return
 	}
 	if ctx.Err() != nil {
-		s.finishScan(nil, targets, preset, start, true)
+		s.finishScan(nil, targets, preset, start, true, netSnapshot{locals: locals, gateway: gateway})
 		return
 	}
 
@@ -453,7 +465,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 			s.bus.publish("host", toHostDTO(row))
 		}
 	}
-	s.finishScan(final, targets, preset, start, ctx.Err() != nil)
+	s.finishScan(final, targets, preset, start, ctx.Err() != nil, netSnapshot{locals: locals, gateway: gateway})
 }
 
 // rowIPs collects the addresses from a row set, for lookups keyed by IP.
@@ -466,8 +478,14 @@ func rowIPs(rows []ui.Row) []string {
 }
 
 // finishScan stores the resulting topology and announces completion.
-func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, start time.Time, cancelled bool) {
-	m := topology.Build(rows, netinfo.Locals(), netinfo.DefaultGateway())
+func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, start time.Time, cancelled bool, net netSnapshot) {
+	m := topology.Build(rows, topology.Input{
+		Locals:  net.locals,
+		Gateway: net.gateway,
+		// The scan's own targets are what makes an empty segment meaningful:
+		// covered-and-empty is a finding, uncovered is a gap.
+		Coverage: targets,
+	})
 	now := time.Now()
 	cur := make([]config.HostSnapshot, 0, len(rows))
 	for _, row := range rows {

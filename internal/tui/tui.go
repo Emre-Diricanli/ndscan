@@ -1189,7 +1189,7 @@ func (m *Model) refreshMap() {
 		m.mapVP.Width = w
 		m.mapVP.Height = h
 	}
-	m.topology = topology.Build(m.topologyRows(), m.netLocals, m.netGateway)
+	m.topology = topology.Build(m.topologyRows(), topology.Input{Locals: m.netLocals, Gateway: m.netGateway, Coverage: m.params.targets})
 	m.mapVP.SetContent(m.renderTopology(m.topology))
 	m.mapDirty = false
 }

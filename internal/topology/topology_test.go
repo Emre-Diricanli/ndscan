@@ -17,7 +17,7 @@ var homeLAN = []netinfo.Network{
 
 func TestBuild_PlacesHostsOnAttachedNetwork(t *testing.T) {
 	rows := []ui.Row{row("192.168.1.10"), row("192.168.1.1"), row("192.168.1.250")}
-	m := Build(rows, homeLAN, netinfo.Gateway{IP: "192.168.1.1", Interface: "en0"})
+	m := Build(rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{IP: "192.168.1.1", Interface: "en0"}})
 
 	if len(m.Segments) != 1 {
 		t.Fatalf("want 1 segment, got %d (%+v)", len(m.Segments), m.Segments)
@@ -54,7 +54,7 @@ func TestBuild_UnscannedNetworkIsMarked(t *testing.T) {
 	locals = append(locals, netinfo.Network{
 		Interface: "utun8", CIDR: "100.64.0.0/10", Addr: "100.127.245.23",
 	})
-	m := Build([]ui.Row{row("192.168.1.10")}, locals, netinfo.Gateway{})
+	m := Build([]ui.Row{row("192.168.1.10")}, Input{Locals: locals, Gateway: netinfo.Gateway{}})
 
 	if len(m.Segments) != 2 {
 		t.Fatalf("want 2 segments, got %d", len(m.Segments))
@@ -74,7 +74,7 @@ func TestBuild_UnscannedNetworkIsMarked(t *testing.T) {
 // grouped into a network rather than dropped or misattached.
 func TestBuild_OrphansGroupedBySubnet(t *testing.T) {
 	rows := []ui.Row{row("10.0.5.7"), row("10.0.5.9"), row("172.16.3.1")}
-	m := Build(rows, homeLAN, netinfo.Gateway{})
+	m := Build(rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
 
 	if len(m.Orphans) != 0 {
 		t.Errorf("orphans should be folded into segments, got %d", len(m.Orphans))
@@ -105,7 +105,7 @@ func TestBuild_RoutedSubnetTaggedViaGateway(t *testing.T) {
 		row("192.168.100.60"),
 	}
 	gw := netinfo.Gateway{IP: "192.168.1.1", Interface: "en0"}
-	m := Build(rows, homeLAN, gw)
+	m := Build(rows, Input{Locals: homeLAN, Gateway: gw})
 
 	var attached, routed *Segment
 	for i := range m.Segments {
@@ -139,7 +139,7 @@ func TestBuild_RoutedSubnetTaggedViaGateway(t *testing.T) {
 // Without a known gateway, routed hosts still segment but carry no via label
 // (we can't claim a path we don't know).
 func TestBuild_RoutedWithoutGatewayHasNoVia(t *testing.T) {
-	m := Build([]ui.Row{row("10.9.9.9")}, homeLAN, netinfo.Gateway{})
+	m := Build([]ui.Row{row("10.9.9.9")}, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
 	for i := range m.Segments {
 		if m.Segments[i].CIDR == "10.9.9.0/24" && m.Segments[i].RoutedVia != "" {
 			t.Errorf("no gateway known, but RoutedVia = %q", m.Segments[i].RoutedVia)
@@ -153,7 +153,7 @@ func TestBuild_SeverityRollup(t *testing.T) {
 		row("192.168.1.11", ui.PortInfo{Port: 80, Severity: ""}),
 		row("192.168.1.12"),
 	}
-	m := Build(rows, homeLAN, netinfo.Gateway{})
+	m := Build(rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
 	got := map[string]string{}
 	for _, n := range m.Segments[0].Nodes {
 		got[n.Row.IP] = n.Severity
@@ -168,7 +168,7 @@ func TestBuild_SeverityRollup(t *testing.T) {
 
 func TestBuild_NodesSortedNumerically(t *testing.T) {
 	rows := []ui.Row{row("192.168.1.100"), row("192.168.1.9"), row("192.168.1.10")}
-	m := Build(rows, homeLAN, netinfo.Gateway{})
+	m := Build(rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
 	want := []string{"192.168.1.9", "192.168.1.10", "192.168.1.100"}
 	for i, w := range want {
 		if got := m.Segments[0].Nodes[i].Row.IP; got != w {
@@ -178,12 +178,12 @@ func TestBuild_NodesSortedNumerically(t *testing.T) {
 }
 
 func TestBuild_EmptyInputs(t *testing.T) {
-	m := Build(nil, nil, netinfo.Gateway{})
+	m := Build(nil, Input{Locals: nil, Gateway: netinfo.Gateway{}})
 	if len(m.Segments) != 0 || len(m.Orphans) != 0 {
 		t.Errorf("empty build should yield nothing, got %+v", m)
 	}
 	// Locals with no scan still produce segments, all marked unscanned.
-	m = Build(nil, homeLAN, netinfo.Gateway{})
+	m = Build(nil, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
 	if len(m.Segments) != 1 || !m.Segments[0].NotScanned {
 		t.Errorf("want 1 unscanned segment, got %+v", m.Segments)
 	}
