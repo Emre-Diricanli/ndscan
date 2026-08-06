@@ -236,7 +236,21 @@
   }
   .edge { stroke: #3a4756; stroke-width: 1.5; }
   .edge.routed { stroke: var(--sev-warn); stroke-dasharray: 6 5; opacity: 0.85; }
+  .edge.hl { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
   .edge-label { fill: var(--muted); font-size: 10px; text-anchor: middle; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
+
+  #graph { user-select: none; -webkit-user-select: none; }
+  .node { cursor: pointer; }
+  .node.hl circle, .node.hl .chip { stroke: var(--accent); stroke-width: 2.5; }
+  .node .chip { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
+  .node.selected .chip { stroke: #fff; stroke-width: 2; }
+  .node.selected.hl circle { stroke: #fff; stroke-width: 2.5; }
+  .chip-text { pointer-events: none; }
+  .badge-c { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; }
+  .badge-t { fill: #fff; font-size: 9px; font-weight: 700; text-anchor: middle; pointer-events: none; }
+  .graph-tools { margin-left: auto; display: flex; gap: 6px; }
+  .graph-tools button { padding: 2px 10px; font-size: 11px; font-weight: 600; }
+  #graph-legend .hint { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); opacity: 0.85; }
 
   #detail-card { grid-area: panel; }
   #detail-body { padding: 12px 14px; overflow-y: auto; font-size: 13px; }
@@ -334,7 +348,11 @@
 
 <main>
   <section class="card" id="graph-card">
-    <h2>Topology</h2>
+    <h2>Topology
+      <span class="graph-tools">
+        <button id="fit-btn" class="ghost" title="fit the whole tree to the view">Fit to view</button>
+      </span>
+    </h2>
     <svg id="graph" role="img" aria-label="network topology graph">
       <g id="viewport">
         <g id="edges"></g>
@@ -359,8 +377,9 @@
       <div class="row"><span class="dot" style="background:var(--sev-warn)"></span> warning</div>
       <div class="row"><span class="dot" style="background:var(--sev-info)"></span> info</div>
       <div class="row"><span class="dot" style="background:var(--sev-none)"></span> no findings</div>
-      <div class="row"><span class="line"></span> attached segment</div>
-      <div class="row"><span class="line dashed"></span> routed segment</div>
+      <div class="row"><span class="line"></span> directly attached</div>
+      <div class="row"><span class="line dashed"></span> routed via gateway</div>
+      <div class="row hint">click parent: collapse/expand · double-click: zoom · / filter · Esc clear</div>
     </div>
   </section>
 
@@ -518,6 +537,7 @@ const S = {
   topology: null,       // last known Topology object (or null)
   hosts: new Map(),     // ip -> Host, accumulates live `host` events
   selectedIp: null,
+  collapsed: new Set(), // node ids whose subtree is folded away
   sort: { key: "ip", dir: 1 },
   filter: "",
   lastScan: null
@@ -787,16 +807,17 @@ function stopDemoScan(cancelled) {
 }
 
 /* ------------------------------------------------------------------ *
- * Topology graph — hand-rolled force layout on SVG                    *
+ * Topology graph — hierarchical tidy-tree layout on SVG               *
  * ------------------------------------------------------------------ */
 const svg = $("graph");
 const NS = "http://www.w3.org/2000/svg";
 const G = {
-  nodes: [],      // {id,label,kind,severity,host,x,y,vx,vy,fx,fy,r}
-  edges: [],      // {a,b,routed,label}
-  alpha: 1,
+  nodes: [],          // {id,label,kind,severity,host,x,y,r,...}
+  edges: [],          // {a,b,routed,label}
+  kids: new Map(),    // parent id -> [child nodes] in layout order
+  parent: new Map(),  // child id -> parent node
   view: { x: 0, y: 0, k: 1 },
-  fitted: false
+  viewTouched: false  // true once the user pans/zooms or a saved view loads
 };
 
 function svgEl(tag, attrs) {
@@ -844,8 +865,6 @@ function buildGraph(topology) {
   if (gwNode && selfNode) edges.push({ a: selfNode, b: gwNode, routed: false });
 
   for (const seg of segs) {
-    const routed = !!seg.routedVia;
-
     if (seg.notScanned) {
       const ph = add({
         id: "seg:" + seg.cidr, label: seg.cidr + " — attached, not scanned",
@@ -855,20 +874,40 @@ function buildGraph(topology) {
       continue;
     }
 
-    // Attachment point for this segment's hosts: gateway if routed or if the
-    // gateway lives in this segment, otherwise this machine.
+    const routed = !!seg.routedVia;
+
+    // Attachment point for this segment: gateway if routed or if the gateway
+    // lives in this segment, otherwise this machine.
     const gwInSeg = gwNode && (seg.nodes || []).some((n) => n.host && n.host.ip === gwNode.id);
     const parent = (routed || gwInSeg) && gwNode ? gwNode : selfNode;
 
+    const hosts = [];
     for (const n of seg.nodes || []) {
       if (!n.host || !n.host.ip) continue;
       if (byId.has(n.host.ip)) continue; // self / gateway already added
-      const gn = add({
+      hosts.push(add({
         id: n.host.ip, label: n.host.hostname || n.host.ip,
         kind: "host", severity: n.severity || "", host: n.host, r: 10
-      });
-      edges.push({ a: parent, b: gn, routed, label: routed ? "via " + seg.routedVia : "" });
+      }));
     }
+    if (!hosts.length) continue;
+
+    // Per-segment grouping tier: hosts hang off a segment chip instead of all
+    // dangling directly from the gateway. The chip doubles as the
+    // collapse/expand handle for dense networks and carries the "via" note,
+    // which used to be repeated on every routed edge label.
+    let worst = "";
+    for (const h of hosts) {
+      if ((SEV_ORDER[h.severity] || 0) > (SEV_ORDER[worst] || 0)) worst = h.severity;
+    }
+    const segNode = add({
+      id: "seg:" + seg.cidr, label: seg.cidr, kind: "segment", severity: worst,
+      host: null, r: 0, count: hosts.length,
+      sub: hosts.length + (hosts.length === 1 ? " host" : " hosts") +
+        (routed ? " · via " + seg.routedVia : "")
+    });
+    edges.push({ a: parent, b: segNode, routed });
+    for (const h of hosts) edges.push({ a: segNode, b: h, routed });
   }
 
   return { nodes, edges };
@@ -879,75 +918,127 @@ function buildGraph(topology) {
 // actually structured — and how the CLI's tree view prints it — so the drawing
 // carries meaning that a force-directed ball of nodes does not.
 //
-// Uses the classic tidy-tree approach: walk the tree bottom-up assigning each
-// leaf the next free horizontal slot, then place each parent at the midpoint of
-// its children. No physics, so the result is stable and deterministic — the
-// same scan always draws the same picture.
-const LAYOUT = { levelGap: 120, leafGap: 104, topPad: 56 };
+// Two-pass tidy tree: bottom-up each node learns how wide its subtree is,
+// top-down each parent hands its children slices of that width, so parents end
+// up centred over their children. A parent with many leaf children (a dense
+// segment) wraps them into rows of LAYOUT.wrapAt instead of one endless row.
+// No physics: the result is stable and deterministic — the same scan always
+// draws the same picture.
+const LAYOUT = { levelGap: 130, leafGap: 112, topPad: 56, rowGap: 96, wrapAt: 8 };
+const CHIP_H = 34;
 
-function buildTree() {
-  // Index children by parent from the edge list produced by buildGraph.
-  const kids = new Map();
-  const hasParent = new Set();
-  for (const e of G.edges) {
-    if (!kids.has(e.a.id)) kids.set(e.a.id, []);
-    kids.get(e.a.id).push(e.b);
-    hasParent.add(e.b.id);
+function visibleKids(n) {
+  if (S.collapsed.has(n.id)) return [];
+  return G.kids.get(n.id) || [];
+}
+
+// Rough label width at the graph's 11px font — good enough for spacing.
+function textW(s) { return String(s || "").length * 6.4 + 14; }
+
+function labelW(n) {
+  if (n.kind === "segment") {
+    n._chipW = Math.max(textW(n.label), textW(n.sub)) + 34;
+    return n._chipW;
   }
-  const roots = G.nodes.filter((n) => !hasParent.has(n.id));
-  return { kids, roots };
+  return Math.max(LAYOUT.leafGap * 0.6, textW(n.label), 2 * n.r + 10);
+}
+
+function computeWidth(n, seen) {
+  const kids = visibleKids(n).filter((k) => !seen.has(k.id));
+  if (!kids.length) { n._w = labelW(n); n._wrap = false; return n._w; }
+  // Wrap only when every child is a leaf — wrapping subtrees would break the
+  // level alignment their children depend on.
+  const allLeaves = kids.every((k) => visibleKids(k).length === 0);
+  if (kids.length > LAYOUT.wrapAt && allLeaves) {
+    const cell = Math.max(LAYOUT.leafGap, ...kids.map(labelW));
+    n._wrap = true;
+    n._cell = cell;
+    n._w = Math.min(kids.length, LAYOUT.wrapAt) * cell;
+    return n._w;
+  }
+  n._wrap = false;
+  let w = 0;
+  for (const k of kids) { seen.add(k.id); w += computeWidth(k, seen); }
+  n._w = Math.max(w, labelW(n));
+  return n._w;
+}
+
+function place(n, cx, depth, seen) {
+  if (seen.has(n.id)) return;
+  seen.add(n.id);
+  n._vis = true;
+  n.x = cx;
+  n.depth = depth;
+  n.y = LAYOUT.topPad + depth * LAYOUT.levelGap;
+
+  const kids = visibleKids(n);
+  if (!kids.length) return;
+
+  if (n._wrap) {
+    const per = LAYOUT.wrapAt, cell = n._cell;
+    kids.forEach((k, i) => {
+      if (seen.has(k.id)) return;
+      const row = Math.floor(i / per);
+      const inRow = Math.min(per, kids.length - row * per);
+      const col = i % per;
+      k._vis = true;
+      k.x = cx - (inRow * cell) / 2 + cell / 2 + col * cell;
+      k.y = n.y + LAYOUT.levelGap + row * LAYOUT.rowGap;
+      k.depth = depth + 1;
+      k._slot = col; // for label staggering within the row
+      seen.add(k.id);
+    });
+    return;
+  }
+
+  let x = cx - kids.reduce((a, k) => a + (k._w || 0), 0) / 2;
+  for (const k of kids) {
+    place(k, x + (k._w || 0) / 2, depth + 1, seen);
+    x += k._w || 0;
+  }
 }
 
 function layoutTree() {
-  if (!G.nodes.length) return;
-  const { kids, roots } = buildTree();
-
-  let cursor = 0;              // next free leaf slot
-  const seen = new Set();      // guards against cycles in malformed data
-
-  // Depth-first: leaves claim slots left to right, parents centre over theirs.
-  function place(node, depth) {
-    if (seen.has(node.id)) return node.x;
-    seen.add(node.id);
-    node.y = LAYOUT.topPad + depth * LAYOUT.levelGap;
-    node.depth = depth;
-
-    const children = (kids.get(node.id) || []).filter((c) => !seen.has(c.id));
-    if (!children.length) {
-      node._slot = cursor;
-      node.x = cursor * LAYOUT.leafGap;
-      cursor++;
-      return node.x;
-    }
-    let first = null, last = null;
-    for (const c of children) {
-      const cx = place(c, depth + 1);
-      if (first === null) first = cx;
-      last = cx;
-    }
-    node.x = (first + last) / 2;
-    return node.x;
+  G.kids = new Map();
+  G.parent = new Map();
+  const hasParent = new Set();
+  for (const e of G.edges) {
+    if (!G.kids.has(e.a.id)) G.kids.set(e.a.id, []);
+    G.kids.get(e.a.id).push(e.b);
+    G.parent.set(e.b.id, e.a);
+    hasParent.add(e.b.id);
   }
+  for (const n of G.nodes) n._vis = false;
 
-  for (const r of roots) place(r, 0);
-  // Any node unreachable from a root (shouldn't happen) still gets a slot.
-  for (const n of G.nodes) {
-    if (!seen.has(n.id)) place(n, 0);
+  const seen = new Set(); // guards against cycles in malformed data
+  const roots = G.nodes.filter((n) => !hasParent.has(n.id));
+  let x0 = 0;
+  for (const r of roots) {
+    computeWidth(r, new Set());
+    place(r, x0 + (r._w || 0) / 2, 0, seen);
+    x0 += r._w || 0;
   }
-
-  // Centre the drawing horizontally in the viewport.
-  const xs = G.nodes.map((n) => n.x);
-  const mid = (Math.min(...xs) + Math.max(...xs)) / 2;
-  const cx = (svg.clientWidth || 900) / 2;
+  // Any node unreachable from a root (cycle in malformed data) still gets
+  // placed — but nodes hidden behind a collapsed ancestor must stay hidden.
   for (const n of G.nodes) {
-    n.x += cx - mid;
-    n.fx = null; n.fy = null;
+    if (!n._vis && !isHidden(n)) {
+      computeWidth(n, new Set());
+      place(n, x0 + (n._w || 0) / 2, 0, seen);
+      x0 += n._w || 0;
+    }
   }
 }
 
-function tick() {
-  paintGraph();
-  requestAnimationFrame(tick);
+// True when a collapsed ancestor hides this node from the layout.
+function isHidden(n) {
+  const guard = new Set();
+  let p = G.parent.get(n.id);
+  while (p) {
+    if (S.collapsed.has(p.id) || guard.has(p.id)) return true;
+    guard.add(p.id);
+    p = G.parent.get(p.id);
+  }
+  return false;
 }
 
 function nodeFill(n) {
@@ -955,27 +1046,70 @@ function nodeFill(n) {
   return SEV_COLOR[n.severity] || "var(--sev-none)";
 }
 
+// Rounded orthogonal elbow: down from the parent, across, then down to the
+// child. Straight diagonals would read as a mesh; right angles read as a
+// hierarchy.
+function elbowD(ax, ay, bx, by, midY) {
+  const dx = Math.abs(bx - ax);
+  if (dx < 1) return "M " + ax + " " + ay + " V " + by;
+  const dir = bx > ax ? 1 : -1;
+  const r = Math.max(0, Math.min(12, dx / 2, midY - ay, by - midY));
+  if (r < 1) return "M " + ax + " " + ay + " V " + midY + " H " + bx + " V " + by;
+  return "M " + ax + " " + ay +
+    " V " + (midY - r) +
+    " Q " + ax + " " + midY + " " + (ax + r * dir) + " " + midY +
+    " H " + (bx - r * dir) +
+    " Q " + bx + " " + midY + " " + bx + " " + (midY + r) +
+    " V " + by;
+}
+
+// Total number of descendants hidden behind a collapsed node.
+function hiddenCount(n) {
+  let c = 0;
+  const seen = new Set();
+  const stack = (G.kids.get(n.id) || []).slice();
+  while (stack.length) {
+    const k = stack.pop();
+    if (seen.has(k.id)) continue;
+    seen.add(k.id);
+    c++;
+    for (const kk of G.kids.get(k.id) || []) stack.push(kk);
+  }
+  return c;
+}
+
 function paintGraph() {
   const edgesG = $("edges"), labelsG = $("edge-labels"), nodesG = $("nodes");
   edgesG.textContent = ""; labelsG.textContent = ""; nodesG.textContent = "";
 
+  // Path from the selected node back to the root (visible ancestors only).
+  const hlNodes = new Set(), hlEdges = new Set();
+  if (S.selectedIp) {
+    let n = G.nodes.find((x) => x.host && x.host.ip === S.selectedIp);
+    while (n) {
+      if (n._vis) hlNodes.add(n.id);
+      const p = G.parent.get(n.id);
+      if (p && n._vis && p._vis) hlEdges.add(p.id + "→" + n.id);
+      n = p;
+    }
+  }
+
   for (const e of G.edges) {
-    // Orthogonal elbow with rounded corners: down from the parent, across,
-    // then down to the child. Straight diagonals would read as a mesh; right
-    // angles read as a hierarchy.
-    const midY = (e.a.y + e.b.y) / 2;
-    const dir = e.b.x > e.a.x ? 1 : -1;
-    const r = Math.min(12, Math.abs(e.b.x - e.a.x) / 2);
-    const d = Math.abs(e.b.x - e.a.x) < 1
-      ? "M " + e.a.x + " " + e.a.y + " V " + e.b.y
-      : "M " + e.a.x + " " + e.a.y +
-        " V " + (midY - r) +
-        " Q " + e.a.x + " " + midY + " " + (e.a.x + r * dir) + " " + midY +
-        " H " + (e.b.x - r * dir) +
-        " Q " + e.b.x + " " + midY + " " + e.b.x + " " + (midY + r) +
-        " V " + e.b.y;
+    if (!e.a._vis || !e.b._vis) continue;
+    // Children of a wrapped parent share a horizontal "bus" per row: every
+    // child's elbow drops to the same midY for that row, so the overlapping
+    // strokes merge into one continuous bus line.
+    let midY;
+    if (e.a._wrap) {
+      const row = Math.round((e.b.y - (e.a.y + LAYOUT.levelGap)) / LAYOUT.rowGap);
+      midY = row <= 0 ? e.a.y + LAYOUT.levelGap / 2 : e.b.y - LAYOUT.rowGap / 2;
+    } else {
+      midY = (e.a.y + e.b.y) / 2;
+    }
     edgesG.appendChild(svgEl("path", {
-      d: d, class: "edge" + (e.routed ? " routed" : ""), fill: "none"
+      d: elbowD(e.a.x, e.a.y, e.b.x, e.b.y, midY),
+      class: "edge" + (e.routed ? " routed" : "") + (hlEdges.has(e.a.id + "→" + e.b.id) ? " hl" : ""),
+      fill: "none"
     }));
     if (e.label) {
       const t = svgEl("text", { x: (e.a.x + e.b.x) / 2, y: (e.a.y + e.b.y) / 2 - 4, class: "edge-label" });
@@ -983,24 +1117,63 @@ function paintGraph() {
       labelsG.appendChild(t);
     }
   }
+
   for (const n of G.nodes) {
-    const g = svgEl("g", { class: "node" + (S.selectedIp && n.host && n.host.ip === S.selectedIp ? " selected" : ""), transform: "translate(" + n.x + "," + n.y + ")" });
-    const c = svgEl("circle", { r: n.r, fill: nodeFill(n) });
-    if (n.kind === "gateway") c.setAttribute("stroke-width", "3");
-    if (n.kind === "unknown") { c.setAttribute("stroke-dasharray", "4 3"); c.setAttribute("stroke", "var(--muted)"); }
-    g.appendChild(c);
-    if (n.kind === "self") {
-      const t0 = svgEl("text", { y: 3.5, style: "font-size:9px;font-weight:700" });
-      t0.textContent = "YOU";
-      g.appendChild(t0);
+    if (!n._vis) continue;
+    const selected = S.selectedIp && n.host && n.host.ip === S.selectedIp;
+    const kids = G.kids.get(n.id) || [];
+    const collapsed = kids.length > 0 && S.collapsed.has(n.id);
+    const g = svgEl("g", {
+      class: "node kind-" + n.kind + (selected ? " selected" : "") + (hlNodes.has(n.id) ? " hl" : ""),
+      transform: "translate(" + n.x + "," + n.y + ")"
+    });
+
+    if (n.kind === "segment") {
+      const w = n._chipW || 90, h = CHIP_H;
+      g.appendChild(svgEl("rect", { class: "chip", x: -w / 2, y: -h / 2, width: w, height: h, rx: 6 }));
+      g.appendChild(svgEl("circle", { cx: -w / 2 + 12, cy: 0, r: 4.5, fill: nodeFill(n), stroke: "none" }));
+      const t1 = svgEl("text", { class: "chip-text", x: -w / 2 + 23, y: -2, style: "font-size:11px;font-weight:600;text-anchor:start;stroke:none" });
+      t1.textContent = n.label;
+      const t2 = svgEl("text", { class: "chip-text", x: -w / 2 + 23, y: 11, style: "font-size:9.5px;text-anchor:start;fill:var(--muted);stroke:none" });
+      t2.textContent = n.sub;
+      g.appendChild(t1);
+      g.appendChild(t2);
+    } else {
+      const c = svgEl("circle", { r: n.r, fill: nodeFill(n) });
+      if (n.kind === "gateway") c.setAttribute("stroke-width", "3");
+      if (n.kind === "unknown") { c.setAttribute("stroke-dasharray", "4 3"); c.setAttribute("stroke", "var(--muted)"); }
+      g.appendChild(c);
+      if (n.kind === "self") {
+        const t0 = svgEl("text", { y: 3.5, style: "font-size:9px;font-weight:700" });
+        t0.textContent = "YOU";
+        g.appendChild(t0);
+      }
+      // Stagger labels inside wrapped rows so adjacent hostnames don't collide.
+      const stagger = (n._slot % 2 === 1) ? 13 : 0;
+      const t = svgEl("text", { y: n.r + 13 + stagger });
+      t.textContent = n.label;
+      g.appendChild(t);
     }
-    // Stagger labels on the densest row so adjacent hostnames don't collide.
-    const stagger = (n.depth >= 2 && (n._slot % 2 === 1)) ? 13 : 0;
-    const t = svgEl("text", { y: n.r + 13 + stagger });
-    t.textContent = n.label;
-    g.appendChild(t);
-    g.addEventListener("pointerdown", (ev) => startNodeDrag(ev, n));
-    g.addEventListener("click", () => { if (!n._dragged) selectNode(n); n._dragged = false; });
+
+    if (collapsed) {
+      const n2 = hiddenCount(n);
+      const bx = n.kind === "segment" ? (n._chipW || 90) / 2 : n.r * 0.85;
+      const by = n.kind === "segment" ? -CHIP_H / 2 : -n.r * 0.85;
+      g.appendChild(svgEl("circle", { class: "badge-c", cx: bx, cy: by, r: 9 }));
+      const bt = svgEl("text", { class: "badge-t", x: bx, y: by + 3 });
+      bt.textContent = "+" + n2;
+      g.appendChild(bt);
+    }
+
+    g.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (kids.length) toggleCollapse(n);
+      selectNode(n);
+    });
+    g.addEventListener("dblclick", (ev) => {
+      ev.stopPropagation();
+      zoomToSubtree(n);
+    });
     nodesG.appendChild(g);
   }
   applyView();
@@ -1026,65 +1199,151 @@ function renderGraph() {
   G.nodes = g.nodes;
   G.edges = g.edges;
   layoutTree();
-  if (!G.fitted) { G.view = { x: 0, y: 0, k: 1 }; G.fitted = true; }
+  // Auto-fit until the user takes over the view; after that, a rescan keeps
+  // the user's pan/zoom instead of resetting it — unless the saved/current
+  // view shows nothing at all (e.g. scanning a different network).
+  if (!G.viewTouched || !viewIntersectsContent()) fitToNodes(G.nodes);
+  paintGraph();
 }
 
-/* --- pan / zoom / drag ------------------------------------------- */
-function toGraph(ev) {
-  const r = svg.getBoundingClientRect();
-  return {
-    x: (ev.clientX - r.left - G.view.x) / G.view.k,
-    y: (ev.clientY - r.top - G.view.y) / G.view.k
-  };
+// True when at least part of the laid-out tree is inside the current viewport.
+function viewIntersectsContent() {
+  const vis = G.nodes.filter((n) => n._vis);
+  if (!vis.length) return true;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of vis) {
+    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+    minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+  }
+  const cw = svg.clientWidth || 900, ch = svg.clientHeight || 500;
+  const k = G.view.k;
+  return maxX * k + G.view.x >= 0 && minX * k + G.view.x <= cw &&
+         maxY * k + G.view.y >= 0 && minY * k + G.view.y <= ch;
 }
 
+/* --- fit / zoom ---------------------------------------------------- */
+function fitToNodes(list, pad) {
+  list = list.filter((n) => n._vis);
+  if (!list.length) return;
+  pad = pad == null ? 48 : pad;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const n of list) {
+    const halfW = Math.max(n._w || 0, 2 * (n.r || 0) + 10) / 2;
+    minX = Math.min(minX, n.x - halfW); maxX = Math.max(maxX, n.x + halfW);
+    minY = Math.min(minY, n.y - 30); maxY = Math.max(maxY, n.y + 36);
+  }
+  const cw = svg.clientWidth || 900, ch = svg.clientHeight || 500;
+  // The legend overlays the bottom-left corner; keep content clear of it.
+  const il = 190;
+  const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
+  G.view.k = Math.min(2, Math.max(0.15, Math.min((cw - il) / (w + pad * 2), ch / (h + pad * 2))));
+  G.view.x = il + (cw - il) / 2 - ((minX + maxX) / 2) * G.view.k;
+  G.view.y = ch / 2 - ((minY + maxY) / 2) * G.view.k;
+  applyView();
+}
+
+function zoomToSubtree(n) {
+  const list = [n];
+  const seen = new Set([n.id]);
+  const stack = visibleKids(n).slice();
+  while (stack.length) {
+    const k = stack.pop();
+    if (seen.has(k.id)) continue;
+    seen.add(k.id);
+    list.push(k);
+    stack.push(...visibleKids(k));
+  }
+  fitToNodes(list, 80);
+  G.viewTouched = true;
+  prefsSoon();
+}
+
+/* --- collapse / expand ---------------------------------------------- */
+function toggleCollapse(n) {
+  if (S.collapsed.has(n.id)) S.collapsed.delete(n.id);
+  else S.collapsed.add(n.id);
+  prefsSoon();
+  layoutTree();
+  if (!G.viewTouched) fitToNodes(G.nodes);
+  paintGraph();
+}
+
+/* --- persisted view preferences -------------------------------------- */
+const PREFS_KEY = "ndscan.topology.view";
+
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ view: G.view, collapsed: [...S.collapsed] }));
+  } catch (_) {}
+}
+
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PREFS_KEY) || "null");
+    if (!p) return;
+    if (p.view && isFinite(p.view.x) && isFinite(p.view.y) && isFinite(p.view.k) && p.view.k > 0) {
+      G.view = p.view;
+      G.viewTouched = true;
+    }
+    if (Array.isArray(p.collapsed)) S.collapsed = new Set(p.collapsed.filter((x) => typeof x === "string"));
+  } catch (_) {}
+}
+
+let saveTimer = null;
+function prefsSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(savePrefs, 400);
+}
+
+/* --- pan / zoom ------------------------------------------------------ */
 let panDrag = null;
 svg.addEventListener("pointerdown", (ev) => {
-  if (ev.target !== svg) return; // node drags handle themselves
-  panDrag = { x: ev.clientX, y: ev.clientY, vx: G.view.x, vy: G.view.y };
+  if (ev.target !== svg) return; // nodes handle their own clicks
+  panDrag = { x: ev.clientX, y: ev.clientY, vx: G.view.x, vy: G.view.y, moved: false };
   svg.setPointerCapture(ev.pointerId);
   svg.classList.add("dragging");
 });
 svg.addEventListener("pointermove", (ev) => {
   if (!panDrag) return;
+  if (Math.abs(ev.clientX - panDrag.x) + Math.abs(ev.clientY - panDrag.y) > 4) panDrag.moved = true;
   G.view.x = panDrag.vx + (ev.clientX - panDrag.x);
   G.view.y = panDrag.vy + (ev.clientY - panDrag.y);
+  G.viewTouched = true;
   applyView();
 });
-svg.addEventListener("pointerup", () => { panDrag = null; svg.classList.remove("dragging"); });
+svg.addEventListener("pointerup", () => {
+  if (panDrag && panDrag.moved) prefsSoon();
+  if (panDrag && !panDrag.moved && S.selectedIp) {
+    // Background click (no drag): clear the selection.
+    S.selectedIp = null;
+    renderTable();
+    paintGraph();
+    showDetailPlaceholder();
+  }
+  panDrag = null;
+  svg.classList.remove("dragging");
+});
 svg.addEventListener("wheel", (ev) => {
   ev.preventDefault();
   const r = svg.getBoundingClientRect();
   const mx = ev.clientX - r.left, my = ev.clientY - r.top;
   const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
-  const k2 = Math.min(4, Math.max(0.25, G.view.k * factor));
+  const k2 = Math.min(4, Math.max(0.15, G.view.k * factor));
   G.view.x = mx - ((mx - G.view.x) / G.view.k) * k2;
   G.view.y = my - ((my - G.view.y) / G.view.k) * k2;
   G.view.k = k2;
+  G.viewTouched = true;
   applyView();
+  prefsSoon();
 }, { passive: false });
-
-function startNodeDrag(ev, n) {
-  ev.stopPropagation();
-  const start = toGraph(ev);
-  const off = { x: n.x - start.x, y: n.y - start.y };
-  const move = (e2) => {
-    n._dragged = true;
-    const p = toGraph(e2);
-    n.fx = p.x + off.x; n.fy = p.y + off.y;
-  };
-  const up = () => {
-    window.removeEventListener("pointermove", move);
-    window.removeEventListener("pointerup", up);
-    n.fx = null; n.fy = null;
-  };
-  window.addEventListener("pointermove", move);
-  window.addEventListener("pointerup", up);
-}
 
 /* ------------------------------------------------------------------ *
  * Detail panel                                                        *
  * ------------------------------------------------------------------ */
+function showDetailPlaceholder() {
+  $("detail-body").innerHTML = '<div class="placeholder">Click a node in the graph or a row in the table.</div>';
+}
+
 function selectNode(n) {
   if (!n) return;
   if (n.kind === "unknown") {
@@ -1093,12 +1352,29 @@ function selectNode(n) {
       '<div class="placeholder">' + esc(n.label) +
       "<br><br>This segment is attached to this machine but was not covered by the scan, so its contents are unknown.</div>";
     renderTable();
+    paintGraph();
+    return;
+  }
+  if (n.kind === "segment") {
+    S.selectedIp = null;
+    const e = G.edges.find((x) => x.b === n);
+    $("detail-body").innerHTML =
+      '<dl class="kv">' +
+      "<dt>Segment</dt><dd>" + esc(n.label) + "</dd>" +
+      "<dt>Hosts</dt><dd>" + n.count + "</dd>" +
+      "<dt>Link</dt><dd>" + (e && e.routed ? "routed via gateway" : "directly attached") + "</dd>" +
+      "<dt>Worst severity</dt><dd><span class=\"pill " + (n.severity || "none") + "\">" + (n.severity || "none") + "</span></dd>" +
+      "</dl>" +
+      '<div class="placeholder">Click the chip to collapse or expand its hosts.</div>';
+    renderTable();
+    paintGraph();
     return;
   }
   if (n.host && n.host.ip) {
     S.selectedIp = n.host.ip;
     renderDetail(n.host, n.kind);
     renderTable();
+    paintGraph();
   }
 }
 
@@ -1204,8 +1480,18 @@ function renderTable() {
       "<td>" + (esc(h.rtt) || "—") + "</td>";
     tr.addEventListener("click", () => {
       const gn = G.nodes.find((n) => n.host && n.host.ip === h.ip);
-      if (gn) selectNode(gn);
-      else { S.selectedIp = h.ip; renderDetail(h, "host"); renderTable(); }
+      if (gn) {
+        // Reveal the node if it sits inside a collapsed subtree.
+        let p = G.parent.get(gn.id), changed = false;
+        while (p) {
+          if (S.collapsed.delete(p.id)) changed = true;
+          p = G.parent.get(p.id);
+        }
+        if (changed) { prefsSoon(); layoutTree(); }
+        selectNode(gn);
+      } else {
+        S.selectedIp = h.ip; renderDetail(h, "host"); renderTable(); paintGraph();
+      }
     });
     tbody.appendChild(tr);
   }
@@ -1240,6 +1526,44 @@ $("table-filter").addEventListener("input", (ev) => { S.filter = ev.target.value
 $("scan-btn").addEventListener("click", startScan);
 $("cancel-btn").addEventListener("click", cancelScan);
 $("target-input").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startScan(); });
+$("fit-btn").addEventListener("click", () => fitToNodes(G.nodes));
+
+document.addEventListener("keydown", (ev) => {
+  const ae = document.activeElement;
+  const inField = ae && (ae.tagName === "INPUT" || ae.tagName === "SELECT" || ae.tagName === "TEXTAREA");
+
+  if (ev.key === "/" && !inField) {
+    ev.preventDefault();
+    $("table-filter").focus();
+    return;
+  }
+  if (ev.key === "Escape") {
+    if (inField) { ae.blur(); return; }
+    if (S.selectedIp) {
+      S.selectedIp = null;
+      renderTable();
+      paintGraph();
+      showDetailPlaceholder();
+    }
+    return;
+  }
+  if (inField || !S.selectedIp || !ev.key.startsWith("Arrow")) return;
+
+  const cur = G.nodes.find((n) => n._vis && n.host && n.host.ip === S.selectedIp);
+  if (!cur) return;
+  let next = null;
+  if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+    const p = G.parent.get(cur.id);
+    const sibs = p ? visibleKids(p) : G.nodes.filter((n) => n._vis && !G.parent.has(n.id));
+    const i = sibs.indexOf(cur);
+    if (i >= 0) next = sibs[i + (ev.key === "ArrowLeft" ? -1 : 1)] || null;
+  } else if (ev.key === "ArrowUp") {
+    next = G.parent.get(cur.id) || null;
+  } else if (ev.key === "ArrowDown") {
+    next = visibleKids(cur)[0] || null;
+  }
+  if (next) { ev.preventDefault(); selectNode(next); }
+});
 
 function renderAll() {
   updateScanButtons();
@@ -1247,7 +1571,7 @@ function renderAll() {
   renderTable();
 }
 
-requestAnimationFrame(tick);
+loadPrefs();
 loadInitialState().then(() => { if (!S.demo) connectEvents(); });
 </script>
 </body>
