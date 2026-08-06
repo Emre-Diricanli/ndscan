@@ -96,6 +96,53 @@ type stateResponse struct {
 	LastScan *time.Time    `json:"lastScan"`
 	Topology *topologyDTO  `json:"topology"`
 	Watch    watchResponse `json:"watch"`
+	// Suggested lists the networks this machine is attached to, so the UI can
+	// offer a target instead of an empty box. The scanner already knows the
+	// answer to "what should I scan?" — making the user look up their own
+	// subnet is a gap between what we know and what we show.
+	Suggested []suggestedNetwork `json:"suggested,omitempty"`
+}
+
+// suggestedNetwork is one scannable local network offered as a starting target.
+type suggestedNetwork struct {
+	CIDR      string `json:"cidr"`
+	Interface string `json:"interface"`
+	Addr      string `json:"addr"`
+}
+
+// suggestedNetworks returns the local networks worth offering as scan targets.
+//
+// Physical interfaces only: a machine typically has several tunnel and
+// link-local interfaces (utun*, awdl*, llw*, bridge*) whose networks are either
+// point-to-point, Apple-internal, or virtual. Offering those as targets would
+// bury the one network the user actually means, and scanning a /32 tunnel
+// endpoint finds nothing.
+func suggestedNetworks() []suggestedNetwork {
+	out := make([]suggestedNetwork, 0, 2)
+	for _, n := range netinfo.Locals() {
+		if !scannableInterface(n.Interface) {
+			continue
+		}
+		// A prefix this narrow holds no other hosts, so there is nothing to
+		// sweep — typical of VPN and point-to-point links.
+		if p, err := netip.ParsePrefix(n.CIDR); err != nil || p.Bits() >= 31 {
+			continue
+		}
+		out = append(out, suggestedNetwork{CIDR: n.CIDR, Interface: n.Interface, Addr: n.Addr})
+	}
+	return out
+}
+
+// scannableInterface reports whether an interface name denotes a real network
+// this machine shares with other hosts, rather than a tunnel or a link-local
+// virtual interface.
+func scannableInterface(name string) bool {
+	for _, prefix := range []string{"utun", "awdl", "llw", "bridge", "gif", "stf", "ap"} {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +162,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		d := toTopologyDTO(*s.topo)
 		resp.Topology = &d
 	}
+	resp.Suggested = suggestedNetworks()
 	resp.Watch = watchResponse{
 		Enabled:     s.watch.enabled,
 		IntervalSec: int(s.watch.interval.Seconds()),

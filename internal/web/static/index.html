@@ -251,6 +251,19 @@
   .node.selected .chip { stroke: #fff; stroke-width: 2; }
   .node.selected.hl circle { stroke: #fff; stroke-width: 2.5; }
   .chip-text { pointer-events: none; }
+
+  /* Suggested local networks. Hidden until there is something to suggest, so a
+     machine with only tunnel interfaces shows no empty bar. */
+  #suggest-bar { display: none; align-items: center; gap: 8px; padding: 8px 18px 0; font-size: 12px; }
+  #suggest-bar.on { display: flex; }
+  .suggest-label { color: var(--muted); }
+  #suggest-list { display: flex; gap: 6px; flex-wrap: wrap; }
+  .suggest-chip {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--fg);
+    border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .suggest-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .suggest-chip .iface { color: var(--muted); margin-left: 5px; }
   .badge-c { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; }
   .badge-t { fill: #fff; font-size: 9px; font-weight: 700; text-anchor: middle; pointer-events: none; }
   .graph-tools { margin-left: auto; display: flex; gap: 6px; }
@@ -342,6 +355,8 @@
     <button id="cancel-btn" class="danger" disabled>Cancel</button>
   </div>
 </header>
+
+<div id="suggest-bar"><span class="suggest-label">your networks:</span><span id="suggest-list"></span></div>
 
 <div id="progress-wrap">
   <span id="progress-label">scanning…</span>
@@ -617,8 +632,42 @@ function applyState(st) {
       }
     }
   }
-  if (st.targets && st.targets.length) $("target-input").value = st.targets.join(", ");
+  if (st.targets && st.targets.length) {
+    $("target-input").value = st.targets.join(", ");
+  } else if (st.suggested && st.suggested.length) {
+    // First run: the scanner already knows which networks this machine is on,
+    // so prefill rather than making the user look up their own subnet. Only
+    // when there is no prior target — a returning user's choice always wins.
+    $("target-input").value = st.suggested[0].cidr;
+  }
+  renderSuggestions(st.suggested || []);
   renderAll();
+}
+
+/* Render one clickable chip per attached network. With a single network the
+   input is already prefilled, but the chip still tells the user *why* that
+   value is there — and on a multi-homed machine it is the only way to switch
+   networks without knowing the CIDR by heart. */
+function renderSuggestions(nets) {
+  const bar = $("suggest-bar"), list = $("suggest-list");
+  list.innerHTML = "";
+  bar.classList.toggle("on", nets.length > 0);
+  for (const n of nets) {
+    const b = document.createElement("button");
+    b.className = "suggest-chip";
+    b.type = "button";
+    b.title = "scan " + n.cidr + " (this machine is " + n.addr + ")";
+    // Built as text nodes rather than markup: these strings come from the OS
+    // interface table, and there is no reason for an interface name to be able
+    // to reach the parser at all.
+    b.appendChild(document.createTextNode(n.cidr));
+    const iface = document.createElement("span");
+    iface.className = "iface";
+    iface.textContent = n.interface;
+    b.appendChild(iface);
+    b.addEventListener("click", () => { $("target-input").value = n.cidr; });
+    list.appendChild(b);
+  }
 }
 
 /* ------------------------------------------------------------------ *
