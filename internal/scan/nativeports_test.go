@@ -232,3 +232,30 @@ func TestNativePortScan_ProgressReported(t *testing.T) {
 		t.Error("progress never reported")
 	}
 }
+
+// ValidatePorts is what the front ends call before a scan starts. An empty spec
+// must stay valid — it means "use the preset's ports" — while anything the
+// parser would reject has to be caught here rather than after the scan runs.
+func TestValidatePorts(t *testing.T) {
+	cases := []struct {
+		spec    string
+		wantErr bool
+	}{
+		{"", false},
+		{"22", false},
+		{"22,80,443", false},
+		{"1-1024", false},
+		{"22,1000-1010", false},
+		{"banana", true},
+		{"22,banana", true},
+		{"99999", true},
+		{"0", true},
+		{"100-50", true},
+		{"22,,80", true},
+	}
+	for _, c := range cases {
+		if err := ValidatePorts(c.spec); (err != nil) != c.wantErr {
+			t.Errorf("ValidatePorts(%q) error = %v, wantErr %v", c.spec, err, c.wantErr)
+		}
+	}
+}

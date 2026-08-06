@@ -19,6 +19,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/notify"
+	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
@@ -177,10 +178,10 @@ type Model struct {
 	// trusting the startup snapshot, since the machine may have roamed since;
 	// tests substitute it to control what networks appear attached.
 	localsFn func() []netinfo.Network
-	mapVP      viewport.Model // scrollable container for the map view
-	mapRdy     bool
-	mapDirty   bool
-	topology   topology.Map
+	mapVP    viewport.Model // scrollable container for the map view
+	mapRdy   bool
+	mapDirty bool
+	topology topology.Map
 
 	// watch mode
 	watch       bool
@@ -714,6 +715,12 @@ func (m Model) startScan() (tea.Model, tea.Cmd) {
 	}
 	if !nmapAvailable(ssh) {
 		m.err = fmt.Errorf("nmap not found — install it with: brew install nmap")
+		return m, nil
+	}
+	// Catch a mistyped port spec at the form rather than after the scan, where
+	// it would look like a network with nothing open.
+	if err := scan.ValidatePorts(strings.TrimSpace(m.portsIn.Value())); err != nil {
+		m.err = err
 		return m, nil
 	}
 	m.err = nil

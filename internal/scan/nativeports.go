@@ -108,6 +108,18 @@ func syntheticXML(r sweep.PortResult) []byte {
 	return []byte(b.String())
 }
 
+// ValidatePorts reports whether a port specification is usable, without running
+// anything. Front ends call it before a scan starts so a typo is a message at
+// the prompt rather than an empty result table after the work is done — the
+// native and nmap paths disagree about what malformed syntax means, and neither
+// disagreement should be visible to a user who simply mistyped.
+//
+// An empty spec is valid: it means "use the preset's default ports".
+func ValidatePorts(spec string) error {
+	_, err := parsePortSpec(spec)
+	return err
+}
+
 // parsePortSpec turns ndscan's port syntax ("22,80,443" or "1-1024", possibly
 // mixed) into an explicit port list. Empty input deliberately returns nil so
 // the sweep uses its default set; malformed input must never take that path.
