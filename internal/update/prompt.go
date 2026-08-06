@@ -24,6 +24,14 @@ type Options struct {
 	Checker     *Checker
 }
 
+// The version check must stay snappy — it runs at every startup — while the
+// download is a multi-megabyte fetch that gets a budget of its own. Both are
+// vars (not consts) so tests can shrink them instead of sleeping.
+var (
+	checkTimeout    = 10 * time.Second
+	downloadTimeout = 5 * time.Minute
+)
+
 // MaybeUpdate is the startup hook: if a newer release exists and the session
 // is interactive, offer to self-update. It never blocks for more than the
 // check timeout, never fails the host command, and stays silent when
@@ -46,10 +54,13 @@ func MaybeUpdate(ctx context.Context, opts Options) {
 		checker = NewChecker()
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	latest, available, err := checker.Check(ctx, opts.Current)
+	// Only the version check runs under the short timeout. The prompt below
+	// blocks on a human, and a slow reader must not inherit an expired
+	// context — that used to turn every thoughtful pause into a spurious
+	// "Update failed". The stdin read itself stays outside any timeout.
+	checkCtx, checkCancel := context.WithTimeout(ctx, checkTimeout)
+	latest, available, err := checker.Check(checkCtx, opts.Current)
+	checkCancel()
 	if err != nil || !available {
 		return // silent: offline, rate-limited, or already current
 	}
@@ -66,7 +77,11 @@ func MaybeUpdate(ctx context.Context, opts Options) {
 			}
 		}
 		fmt.Fprintf(out, "Downloading and verifying %s…\n", latest)
-		if err := checker.DownloadAndReplace(ctx, latest, exe); err != nil {
+		// A fresh, generous context for the download — separate from the
+		// check window above, but still cancelled when the parent is.
+		dlCtx, dlCancel := context.WithTimeout(ctx, downloadTimeout)
+		defer dlCancel()
+		if err := checker.DownloadAndReplace(dlCtx, latest, exe); err != nil {
 			fmt.Fprintf(out, "Update failed: %v\nContinuing with v%s.\n", err, strings.TrimPrefix(opts.Current, "v"))
 			return
 		}

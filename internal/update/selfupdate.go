@@ -126,6 +126,12 @@ func replaceExecutable(exePath string, bin []byte) error {
 		tmp.Close()
 		return fmt.Errorf("marking new binary executable: %w", err)
 	}
+	// fsync before the rename: a power loss between write and rename can
+	// otherwise install a zero-length binary, uninstalling the tool.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("flushing new binary to disk: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("finalizing new binary: %w", err)
 	}

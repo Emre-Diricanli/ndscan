@@ -5,6 +5,26 @@ import (
 	"strings"
 )
 
+// mdEsc renders network-derived text safe for inline Markdown: line breaks
+// would split a table row or list item apart, and backticks/brackets would
+// inject formatting into reports people paste into GitHub.
+func mdEsc(s string) string {
+	return mdEscaper.Replace(s)
+}
+
+var mdEscaper = strings.NewReplacer(
+	"\r\n", " ", "\r", " ", "\n", " ",
+	"`", "\\`",
+	"[", "\\[",
+	"]", "\\]",
+)
+
+// mdCell is mdEsc plus pipe escaping — a raw | ends a table cell early and
+// breaks the whole row.
+func mdCell(s string) string {
+	return strings.ReplaceAll(mdEsc(s), "|", "\\|")
+}
+
 // Markdown renders the report as a GitHub-flavored Markdown document.
 func (r Report) Markdown() string {
 	s, findings := summarize(r.Rows)
@@ -29,12 +49,12 @@ func (r Report) Markdown() string {
 		b.WriteString("| Severity | Host | Port | Service | Reason |\n")
 		b.WriteString("|----------|------|------|---------|--------|\n")
 		for _, f := range findings {
-			host := f.IP
+			host := mdCell(f.IP)
 			if f.Host != "" {
-				host = fmt.Sprintf("%s (%s)", f.IP, f.Host)
+				host = fmt.Sprintf("%s (%s)", mdCell(f.IP), mdCell(f.Host))
 			}
 			fmt.Fprintf(&b, "| %s | %s | %d | %s | %s |\n",
-				sevLabel(f.Severity), host, f.Port, dash(f.Service), dash(f.Reason))
+				sevLabel(f.Severity), host, f.Port, mdCell(dash(f.Service)), mdCell(dash(f.Reason)))
 		}
 		b.WriteString("\n")
 	} else {
@@ -46,13 +66,13 @@ func (r Report) Markdown() string {
 	b.WriteString("| IP | Host | MAC | Vendor | OS | RTT | Open ports |\n")
 	b.WriteString("|----|------|-----|--------|----|----|-----------|\n")
 	for _, row := range r.Rows {
-		os := dash(row.OS)
+		os := mdCell(dash(row.OS))
 		if row.OS != "" && row.OSAccuracy > 0 {
-			os = fmt.Sprintf("%s (%d%%)", row.OS, row.OSAccuracy)
+			os = fmt.Sprintf("%s (%d%%)", mdCell(row.OS), row.OSAccuracy)
 		}
 		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s |\n",
-			row.IP, dash(row.Host), dash(row.MAC), dash(row.Vendor),
-			os, dash(row.RTT), portSummary(row))
+			mdCell(row.IP), mdCell(dash(row.Host)), mdCell(dash(row.MAC)), mdCell(dash(row.Vendor)),
+			os, mdCell(dash(row.RTT)), mdCell(portSummary(row)))
 	}
 	b.WriteString("\n")
 
@@ -66,23 +86,23 @@ func (r Report) Markdown() string {
 			b.WriteString("## Service detail\n\n")
 			detailed = true
 		}
-		head := row.IP
+		head := mdEsc(row.IP)
 		if row.Host != "" {
-			head += " (" + row.Host + ")"
+			head += " (" + mdEsc(row.Host) + ")"
 		}
 		fmt.Fprintf(&b, "### %s\n\n", head)
 		for _, p := range row.PortDetails {
-			fmt.Fprintf(&b, "- **%d/%s** %s", p.Port, p.Proto, p.Service)
+			fmt.Fprintf(&b, "- **%d/%s** %s", p.Port, mdEsc(p.Proto), mdEsc(p.Service))
 			if p.TLS {
 				b.WriteString(" 🔒")
 			}
 			if vl := p.VersionLabel(); vl != "" {
-				fmt.Fprintf(&b, " — %s", vl)
+				fmt.Fprintf(&b, " — %s", mdEsc(vl))
 			}
 			b.WriteString("\n")
 			sub := func(k, v string) {
 				if v != "" {
-					fmt.Fprintf(&b, "  - %s: %s\n", k, v)
+					fmt.Fprintf(&b, "  - %s: %s\n", k, mdEsc(v))
 				}
 			}
 			sub("info", p.ExtraInfo)
@@ -90,7 +110,7 @@ func (r Report) Markdown() string {
 			sub("cert", p.Cert)
 			sub("cpe", p.CPE)
 			if p.Risk != "" {
-				fmt.Fprintf(&b, "  - %s **%s**\n", sevLabel(p.Severity), p.Risk)
+				fmt.Fprintf(&b, "  - %s **%s**\n", sevLabel(p.Severity), mdEsc(p.Risk))
 			}
 		}
 		b.WriteString("\n")
