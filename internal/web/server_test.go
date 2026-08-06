@@ -360,11 +360,11 @@ func TestFinishScanPersistsAndDiffsHistory(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	targets := []string{"192.0.2.1"}
 	s := NewServer("test")
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", time.Now(), false, netSnapshot{})
-	if got := config.LoadHistory(targets, "", "quick"); len(got) != 1 {
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+	if got := config.LoadHistory(config.ScanKey{Targets: targets, Ports: s.portsFor("quick"), Preset: "quick"}); len(got) != 1 {
 		t.Fatalf("saved history = %+v", got)
 	}
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", time.Now(), false, netSnapshot{})
+	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
 	if !s.hasPrevious || s.diff["192.0.2.1"].PortsOpened[0] != "443" || s.diff["192.0.2.1"].PortsClosed[0] != "22" {
 		t.Errorf("history state: hasPrevious=%v diff=%+v", s.hasPrevious, s.diff)
 	}

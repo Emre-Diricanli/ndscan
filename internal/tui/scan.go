@@ -102,16 +102,26 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			runner = scan.NewLocalRunner()
 		}
 
+		// Which discovery path ran is only known once the switch below picks one,
+		// and it belongs in the history key: the native sweep and an nmap scan
+		// legitimately find different hosts, so comparing one against the other
+		// invents arrivals and departures that never happened.
+		usedFast := false
+
 		finish := func(rows []ui.Row, failed int, cancelled bool) {
-			prev := config.LoadHistory(p.targets, p.ports, p.preset)
+			key := config.ScanKey{Targets: p.targets, Ports: p.ports, Preset: p.preset, Fast: usedFast}
+			prev := config.LoadHistory(key)
 			cur := make([]config.HostSnapshot, 0, len(rows))
 			for _, r := range rows {
-				cur = append(cur, config.HostSnapshot{IP: r.IP, Host: r.Host, Ports: r.Ports})
+				cur = append(cur, config.HostSnapshot{IP: r.IP, Host: r.Host, Up: r.Up, Ports: r.Ports})
 			}
 			var diff map[string]config.HostDiff
-			if !cancelled && failed == 0 { // failed/partial scans must not poison history
+			// failed/partial scans must not poison history, and neither may a
+			// scan that found nothing at all — zero hosts is far more often a
+			// dropped VPN than an empty network.
+			if config.SaveEligible(cancelled, failed, len(cur)) {
 				diff = config.Diff(prev, cur)
-				_ = config.SaveHistory(p.targets, p.ports, p.preset, cur)
+				_ = config.SaveHistory(key, cur)
 			}
 			ch <- doneMsg{
 				rows:      rows,
@@ -137,6 +147,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			// faster than `nmap -sn` on a LAN because the timeout policy is
 			// ours. Only valid locally — over SSH the probes would originate
 			// from the wrong machine.
+			usedFast = true
 			live, discoveredMACs, err = scan.NativeDiscovery(ctx, p.targets, runner,
 				func(done, total int) {
 					// Non-blocking: the sweep fans out across thousands of

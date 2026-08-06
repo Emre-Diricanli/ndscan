@@ -119,27 +119,62 @@ func DeleteProfile(name string) error {
 // ----- scan history (for diffing consecutive scans of the same targets) -----
 
 // HostSnapshot is the minimal per-host state we remember between scans.
+//
+// Up is recorded explicitly because a host that stopped responding is a
+// different event from a host whose ports all closed. Without it, a machine
+// that went offline diffs as "every port closed" while the host itself appears
+// to still be there — the opposite of what happened.
 type HostSnapshot struct {
 	IP    string   `json:"ip"`
 	Host  string   `json:"host,omitempty"`
+	Up    bool     `json:"up"`
 	Ports []string `json:"ports,omitempty"` // bare port labels, e.g. "22/tcp ssh"
 }
 
-// historyKey identifies "the same scan" across runs: same targets+ports+preset.
-func historyKey(targets []string, ports, preset string) string {
-	t := append([]string(nil), targets...)
+// ScanKey identifies "the same scan" across runs. Two scans are comparable only
+// when every field matches, because each one changes which hosts or ports the
+// scan could possibly have found.
+//
+// This is a struct rather than a positional argument list on purpose. It was
+// previously three bare strings, and the front ends drifted: the web passed ""
+// for Ports while the TUI passed the real value, so the two never shared a
+// baseline and neither could see the other's history. A named field per input
+// makes an omission visible at the call site instead of silent.
+type ScanKey struct {
+	Targets []string
+	Ports   string
+	Preset  string
+	// Fast records whether this was the native ARP+TCP sweep rather than an
+	// nmap scan. The two probe different things and legitimately find different
+	// hosts, so mixing them under one key manufactures phantom
+	// appeared/disappeared events on every alternation.
+	Fast bool
+}
+
+// signature renders the key as the stable string the on-disk name hashes.
+func (k ScanKey) signature() string {
+	t := append([]string(nil), k.Targets...)
 	sort.Strings(t)
-	h := sha1.Sum([]byte(strings.Join(t, ",") + "|" + ports + "|" + preset))
+	mode := "nmap"
+	if k.Fast {
+		mode = "fast"
+	}
+	return strings.Join(t, ",") + "|" + k.Ports + "|" + k.Preset + "|" + mode
+}
+
+// historyKey identifies "the same scan" across runs.
+func historyKey(k ScanKey) string {
+	h := sha1.Sum([]byte(k.signature()))
 	return hex.EncodeToString(h[:])
 }
 
-func historyPath(targets []string, ports, preset string) string {
-	return filepath.Join(historyDir(), historyKey(targets, ports, preset)+".json")
+func historyPath(k ScanKey) string {
+	return filepath.Join(historyDir(), historyKey(k)+".json")
 }
 
 // LoadHistory returns the previous snapshot for this scan signature, or nil.
-func LoadHistory(targets []string, ports, preset string) []HostSnapshot {
-	b, err := os.ReadFile(historyPath(targets, ports, preset))
+func LoadHistory(k ScanKey) []HostSnapshot {
+	b, err := os.ReadFile(historyPath(k))
 	if err != nil {
 		return nil
 	}
@@ -151,7 +186,13 @@ func LoadHistory(targets []string, ports, preset string) []HostSnapshot {
 }
 
 // SaveHistory stores the snapshot for this scan signature.
-func SaveHistory(targets []string, ports, preset string, snaps []HostSnapshot) error {
+//
+// Callers must not reach here with the results of a cancelled, failed, or
+// partial scan: an incomplete run looks exactly like a network where everything
+// disappeared, and persisting it as the baseline makes the *next* scan report
+// the whole network as new. Eligibility is the caller's decision because only
+// it knows how the run terminated; SaveEligible states the rule in one place.
+func SaveHistory(k ScanKey, snaps []HostSnapshot) error {
 	if err := os.MkdirAll(historyDir(), 0o755); err != nil {
 		return err
 	}
@@ -160,7 +201,22 @@ func SaveHistory(targets []string, ports, preset string, snaps []HostSnapshot) e
 	if err != nil {
 		return err
 	}
-	return writeIfChanged(historyPath(targets, ports, preset), b, 0o644)
+	return writeIfChanged(historyPath(k), b, 0o644)
+}
+
+// SaveEligible reports whether a finished scan may become the new baseline.
+//
+// The three front ends each answered this question separately and gave three
+// different answers — the web saved unconditionally, including on cancellation,
+// which corrupted history for every later run. Centralising the rule is what
+// keeps them from drifting apart again.
+//
+// An empty result set is rejected even when the scan reported success: finding
+// zero hosts almost always means the machine lost its network (VPN dropped,
+// Wi-Fi roamed) rather than that the network emptied out, and treating it as
+// truth discards a good baseline in favour of a useless one.
+func SaveEligible(cancelled bool, failed int, hosts int) bool {
+	return !cancelled && failed == 0 && hosts > 0
 }
 
 // writeIfChanged avoids watch-mode disk churn and replaces files atomically,
@@ -219,6 +275,38 @@ func (d HostDiff) Changed() bool {
 	return d.New || d.Gone || len(d.PortsOpened) > 0 || len(d.PortsClosed) > 0
 }
 
+// presentHosts indexes the hosts a snapshot says were actually on the network.
+//
+// A host is dropped only when the set demonstrably tracks liveness — that is,
+// when at least one entry is marked up. Two situations produce a set where
+// nobody is up, and neither means "the network is empty":
+//
+//   - a history file written before HostSnapshot carried Up, which decodes as
+//     all-false and would otherwise diff as the whole network vanishing the
+//     first time a user upgrades;
+//   - a caller that builds snapshots without setting Up at all.
+//
+// Silently discarding every host in those cases would be a worse failure than
+// the one this field exists to fix, so the conservative reading wins: absence
+// is only inferred from a set that is clearly using the field.
+func presentHosts(snaps []HostSnapshot) map[string]HostSnapshot {
+	tracksLiveness := false
+	for _, s := range snaps {
+		if s.Up {
+			tracksLiveness = true
+			break
+		}
+	}
+	out := make(map[string]HostSnapshot, len(snaps))
+	for _, s := range snaps {
+		if tracksLiveness && !s.Up {
+			continue
+		}
+		out[s.IP] = s
+	}
+	return out
+}
+
 // portNum reduces "22/tcp ssh" to "22".
 func portNum(label string) string {
 	for i, r := range label {
@@ -239,14 +327,22 @@ func Diff(prev []HostSnapshot, cur []HostSnapshot) map[string]HostDiff {
 	if prev == nil {
 		return nil // first scan of this signature: nothing to compare
 	}
-	prevByIP := make(map[string]HostSnapshot, len(prev))
-	for _, s := range prev {
-		prevByIP[s.IP] = s
-	}
+	// A host recorded as down is not present on the network, so it takes part in
+	// the diff as an absence rather than as a host with no open ports. Older
+	// snapshots predate the Up field and decode as false; treating those as down
+	// would report the entire previous scan as gone, so a snapshot set that
+	// knows about nobody being up is read as a pre-Up file and taken at face
+	// value.
+	prevByIP := presentHosts(prev)
+	curByIP := presentHosts(cur)
+
 	out := map[string]HostDiff{}
 
 	seen := map[string]bool{}
 	for _, c := range cur {
+		if _, present := curByIP[c.IP]; !present {
+			continue // scanned and found down: handled as an absence below
+		}
 		seen[c.IP] = true
 		p, existed := prevByIP[c.IP]
 		if !existed {
