@@ -30,8 +30,12 @@ func TestClassify(t *testing.T) {
 }
 
 // A blank vendor should explain itself rather than looking like a failure.
+//
+// The database is supplied explicitly rather than via LoadDefault: nmap's OUI
+// file is not present on CI runners, so depending on it would make this test
+// pass or fail based on the machine rather than the behaviour under test.
 func TestDescribe(t *testing.T) {
-	db := LoadDefault()
+	db := DB{"6C63F8": "Ubiquiti"}
 
 	if got := Describe(db, "6c:63:f8:aa:d8:c9"); got != "Ubiquiti" {
 		t.Errorf("known OUI = %q, want Ubiquiti", got)
