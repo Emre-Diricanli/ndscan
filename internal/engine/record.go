@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/alert"
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/device"
 	"github.com/Emre-Diricanli/ndscan/internal/timeline"
@@ -32,6 +33,10 @@ type Record struct {
 	NewDevices []string
 	// Events are the timeline facts this run appended.
 	Events []timeline.Event
+	// Alerts are the changes worth telling a person about, already filtered by
+	// the user's rules and by the suppressor that keeps watch mode from saying
+	// the same thing every interval.
+	Alerts []alert.Alert
 	// Warnings are non-fatal persistence problems. A failed write is not fatal
 	// to the scan but it silently disables change detection for every future
 	// one, so it has to be said out loud rather than swallowed.
@@ -53,6 +58,13 @@ func (r Record) Comparable() bool { return r.Diff != nil }
 // now is a parameter so a caller can attribute a run to when it started rather
 // than when it finished writing, and so tests are not at the mercy of a clock.
 func (e *Engine) Persist(out Outcome, p Plan, now time.Time, oui vendor.DB) Record {
+	return e.PersistWithGateway(out, p, now, oui, "")
+}
+
+// PersistWithGateway is Persist plus the gateway address this scan ran behind,
+// which the ARP-spoof canary needs in order to notice the hardware answering
+// for it changing.
+func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vendor.DB, gatewayIP string) Record {
 	rec := Record{}
 	key := out.ScanKey(p)
 	prev := config.LoadHistory(key)
@@ -82,7 +94,26 @@ func (e *Engine) Persist(out Outcome, p Plan, now time.Time, oui vendor.DB) Reco
 	}
 
 	rec.Events = e.appendTimeline(rec, out, now)
+
+	// Alerting last: it reads the diff and the device set this run produced, so
+	// it has to come after both. The suppressor is per-Engine, which is what
+	// makes watch mode report a new device once rather than every interval.
+	for _, a := range e.evaluateAlerts(&rec, out, gatewayIP, now) {
+		if e.suppressor().Allow(a) {
+			rec.Alerts = append(rec.Alerts, a)
+		}
+	}
 	return rec
+}
+
+// suppressor returns the process-wide alert suppressor, built on first use.
+func (e *Engine) suppressor() *alert.Suppressor {
+	e.alertMu.Lock()
+	defer e.alertMu.Unlock()
+	if e.alertSup == nil {
+		e.alertSup = alert.NewSuppressor(alertCooldown)
+	}
+	return e.alertSup
 }
 
 // appendTimeline turns this run's diff into durable facts.

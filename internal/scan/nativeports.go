@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/enrich"
@@ -40,16 +42,28 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 type NativeMetadata struct {
 	RTT time.Duration
 	TLS map[int]enrich.TLSInfo
+	// IdentifyTLS opts this scan into active TLS handshakes. It is deliberately
+	// separate from TLS: callers may supply already-known certificate data
+	// without authorizing network activity.
+	IdentifyTLS bool
+	// TLSConfig bounds the active identification work. Zero values use the
+	// conservative defaults in enrich.LookupTLS.
+	TLSConfig enrich.TLSConfig
+	// TLSMaxEndpoints caps handshakes across the entire scan. Values <= 0 use
+	// the package default. The first metadata entry with IdentifyTLS set owns
+	// these scan-wide settings.
+	TLSMaxEndpoints int
 }
+
+const defaultTLSMaxEndpoints = 64
 
 // NativePortScanWithMetadata preserves discovery timing and TLS identification
 // through the native scan's existing XML/parser/rendering path.
 //
 // The engine supplies the metadata: the discovery sweep already timed each
 // host's answer, and passing that through here is what puts a value in the RTT
-// column on the fast path. TLS identification is not yet wired — it needs the
-// proven-open endpoint set, which means splitting port collection from
-// rendering, and that is a larger change than this one.
+// column on the fast path. Setting IdentifyTLS on one metadata entry opts the
+// run into bounded certificate identification after every open port is known.
 func NativePortScanWithMetadata(ctx context.Context, hosts []string, metadata map[string]NativeMetadata, cfg Config, progress func(done, total int)) []HostResult {
 	return nativePortScan(ctx, hosts, metadata, cfg, progress)
 }
@@ -71,30 +85,39 @@ func nativePortScan(ctx context.Context, hosts []string, metadata map[string]Nat
 		return out
 	}
 
+	tlsCfg, tlsLimit, identifyTLS := nativeTLSSettings(hosts, metadata)
 	var onResult func(sweep.PortResult)
-	if cfg.OnResult != nil {
+	if cfg.OnResult != nil && !identifyTLS {
 		onResult = func(r sweep.PortResult) {
 			cfg.OnResult(HostResult{IP: r.IP, XMLBytes: syntheticXMLWithMetadata(r, metadata[r.IP])})
 		}
 	}
 
-	var incomplete int
+	var incomplete atomic.Int64
 	results := scanNativePorts(ctx, hosts, sweep.PortConfig{
 		Ports:       ports,
 		Concurrency: cfg.Concurrency * 32, // per-host workers -> per-probe workers
 		Progress:    progress,
 		OnResult:    onResult,
 		OnIncomplete: func(probes int) {
-			incomplete = probes
+			incomplete.Store(int64(probes))
 		},
 	})
 
+	if identifyTLS && ctx.Err() == nil {
+		enrichNativeTLS(ctx, results, metadata, tlsCfg, tlsLimit)
+	}
+
 	out := make([]HostResult, 0, len(results))
 	for _, r := range results {
-		out = append(out, HostResult{
+		result := HostResult{
 			IP:       r.IP,
 			XMLBytes: syntheticXMLWithMetadata(r, metadata[r.IP]),
-		})
+		}
+		out = append(out, result)
+		if cfg.OnResult != nil && identifyTLS {
+			cfg.OnResult(result)
+		}
 	}
 	// Descriptor exhaustion is a property of the run, not of any one host: every
 	// host's ports are a floor rather than a full answer. Marking each result as
@@ -102,10 +125,72 @@ func nativePortScan(ctx context.Context, hosts []string, metadata map[string]Nat
 	// scanned at all — and callers that count failures would then discard a set
 	// of results that is incomplete but still entirely valid. One extra entry
 	// carries the run-level fact without libelling the individual hosts.
-	if err := incompleteError(incomplete); err != nil {
+	if err := incompleteError(int(incomplete.Load())); err != nil {
 		out = append(out, HostResult{Err: err})
 	}
 	return out
+}
+
+func nativeTLSSettings(hosts []string, metadata map[string]NativeMetadata) (enrich.TLSConfig, int, bool) {
+	for _, host := range hosts {
+		m := metadata[host]
+		if !m.IdentifyTLS {
+			continue
+		}
+		limit := m.TLSMaxEndpoints
+		if limit <= 0 {
+			limit = defaultTLSMaxEndpoints
+		}
+		return m.TLSConfig, limit, true
+	}
+	return enrich.TLSConfig{}, 0, false
+}
+
+func enrichNativeTLS(ctx context.Context, results []sweep.PortResult, metadata map[string]NativeMetadata, cfg enrich.TLSConfig, limit int) {
+	endpoints := make([]string, 0, min(limit, len(results)))
+	targets := make(map[string]struct {
+		host string
+		port int
+	})
+	for _, result := range results {
+		for _, port := range result.Ports {
+			if len(endpoints) >= limit {
+				break
+			}
+			if !likelyTLSPort(port) {
+				continue
+			}
+			endpoint := net.JoinHostPort(result.IP, strconv.Itoa(port.Port))
+			endpoints = append(endpoints, endpoint)
+			targets[endpoint] = struct {
+				host string
+				port int
+			}{result.IP, port.Port}
+		}
+		if len(endpoints) >= limit {
+			break
+		}
+	}
+	for endpoint, cert := range enrich.LookupTLS(ctx, endpoints, cfg) {
+		target := targets[endpoint]
+		m := metadata[target.host]
+		if m.TLS == nil {
+			m.TLS = make(map[int]enrich.TLSInfo)
+		}
+		m.TLS[target.port] = cert
+		metadata[target.host] = m
+	}
+}
+
+func likelyTLSPort(port sweep.OpenPort) bool {
+	switch port.Port {
+	case 443, 465, 636, 989, 990, 993, 995, 5061, 8443:
+		return true
+	}
+	service := strings.ToLower(port.Service)
+	return strings.Contains(service, "tls") || strings.Contains(service, "ssl") ||
+		strings.Contains(service, "https") || strings.HasSuffix(service, "s") &&
+		(strings.Contains(service, "imap") || strings.Contains(service, "pop3") || strings.Contains(service, "smtp") || strings.Contains(service, "ldap"))
 }
 
 // syntheticXML renders a native port result as the subset of nmap's XML that

@@ -170,9 +170,13 @@ func (e *Engine) scanPorts(
 		// already delivered every row.
 		// The discovery sweep already timed each host's answer; passing it
 		// through here is what puts a value in the RTT column on the fast path.
-		meta := make(map[string]scan.NativeMetadata, len(rtts))
-		for ip, d := range rtts {
-			meta[ip] = scan.NativeMetadata{RTT: d}
+		// Metadata rides along with the port scan: the discovery sweep's timing,
+		// and — when asked — TLS identification of the ports it proves open. A
+		// host must appear here even with no recorded RTT, or asking for TLS on
+		// a host we timed nothing for would silently skip it.
+		meta := make(map[string]scan.NativeMetadata, len(live))
+		for _, ip := range live {
+			meta[ip] = scan.NativeMetadata{RTT: rtts[ip], IdentifyTLS: p.IdentifyTLS}
 		}
 		scan.NativePortScanWithMetadata(ctx, live, meta, cfg, func(done, total int) {
 			emit.scanPhase(done, total, true)

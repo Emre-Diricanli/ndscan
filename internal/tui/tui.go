@@ -410,10 +410,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshActiveView()
 
 		var cmds []tea.Cmd
-		// On a watch-mode rescan, alert on any change via desktop notification.
-		if m.watchRescan && m.notify && !msg.cancelled {
-			if title, body, ok := notifySummary(m.diff, m.rows); ok {
-				cmds = append(cmds, notifyCmd(title, body))
+		// Notify on what the user's rules called noteworthy, not on any change
+		// at all. Watch mode reruns every minute, so alerting on every diff
+		// trains a person to dismiss the notification that mattered.
+		if m.notify && !msg.cancelled {
+			for _, a := range msg.alerts {
+				cmds = append(cmds, notifyCmd(a.Title, a.Body))
 			}
 		}
 		m.watchRescan = false
