@@ -164,8 +164,13 @@ type Model struct {
 	timing    string
 	scanError string
 	failed    int
-	filterIn  textinput.Model
-	sortBy    sortKey
+	// warnings are the engine's non-fatal persistence problems from the last
+	// scan. Kept as a field (not folded into scanError) because they are not
+	// scan failures: the scan went fine, its consequences just could not be
+	// persisted.
+	warnings []string
+	filterIn textinput.Model
+	sortBy   sortKey
 
 	// discover: a focused deep scan of a single host, shown in an overlay
 	disco discoverState
@@ -402,6 +407,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scanError = compactScanError(msg.firstErr.Error())
 		} else {
 			m.scanError = ""
+		}
+		m.warnings = msg.warnings
+		// Persistence warnings ride in the summary block because that is the
+		// one results-screen field composed here; viewResults lives in view.go,
+		// which this change does not own, and it only renders fields that
+		// already exist. A warning is exactly what the summary block exists
+		// for: the scan went fine, but its consequences could not be saved.
+		// TODO(internal/tui/view.go): render m.warnings as a dedicated
+		// warnStyle block next to scanError/notice instead, matching the "Δ"
+		// diff styling, and drop this composition into m.summary.
+		for _, w := range msg.warnings {
+			m.summary += "\n  ⚠ " + w
 		}
 		if msg.fallbacks > 0 {
 			m.notice = fmt.Sprintf("SYN unavailable for %d host(s); used TCP connect fallback", msg.fallbacks)
@@ -763,6 +780,7 @@ func (m Model) startWithParams(p scanParams) (tea.Model, tea.Cmd) {
 	m.failed = 0
 	m.timing = ""
 	m.scanError = ""
+	m.warnings = nil
 	m.events, m.cancel = runScan(p)
 	m.screen = screenRunning
 	m.phase = "discover"
