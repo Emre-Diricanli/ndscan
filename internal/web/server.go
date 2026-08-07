@@ -563,6 +563,7 @@ func (s *Server) scanPlan(targets []string, preset string, fast bool) engine.Pla
 		HostTimeout:  20 * time.Second,
 		Fast:         fast,
 		Hostnames:    true,
+		Multicast:    true,
 	}
 }
 

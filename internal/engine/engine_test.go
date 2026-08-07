@@ -278,3 +278,26 @@ func TestEnrichmentReportsUpdatesNotArrivals(t *testing.T) {
 		t.Error("enrichment should report its revision so front ends can refresh")
 	}
 }
+
+// Multicast discovery is opt-in. A plan that does not ask for it must not pay
+// its timeout — it runs on every scan of every front end that enables it, and a
+// silent network is the common case.
+func TestMulticastIsOptIn(t *testing.T) {
+	r := &fakeRunner{up: []string{"192.0.2.1"}, ports: hostXML("192.0.2.1")}
+	p := nmapPlan("192.0.2.1")
+	p.Hostnames = true // enrichment on, multicast off
+
+	start := time.Now()
+	out := testEngine(r).Run(context.Background(), p, nil)
+	elapsed := time.Since(start)
+
+	if out.Status != StatusComplete {
+		t.Fatalf("status = %v", out.Status)
+	}
+	// The default multicast budget is seconds; PTR against a fake runner is
+	// near-instant. Anything approaching a second means we paid for a pass we
+	// never asked for.
+	if elapsed > time.Second {
+		t.Errorf("a plan with Multicast=false took %v: multicast is not opt-in", elapsed)
+	}
+}

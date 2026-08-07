@@ -270,11 +270,25 @@ func TestAbsorbMDNSPacket(t *testing.T) {
 		assertMap(t, results, map[string]string{"192.168.1.50": "Living-Room-TV"})
 	})
 
-	t.Run("PTR target falls back to source IP", func(t *testing.T) {
+	// A PTR target names a service, not the host that sent the datagram. A
+	// packet carrying no address record identifies nobody, and guessing the
+	// sender mislabels every gateway and AP that relays mDNS between segments —
+	// on a real network that named a UniFi gateway "Canon MF460 Series".
+	t.Run("PTR target alone identifies nobody", func(t *testing.T) {
 		results := make(map[string]string)
 		src := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 60), Port: 5353}
 		absorbMDNSPacket(results, src, mdnsResponse("Office-Printer._ipp._tcp.local", "", nil))
-		assertMap(t, results, map[string]string{"192.168.1.60": "Office-Printer"})
+		assertMap(t, results, map[string]string{})
+	})
+
+	// The relay case stated directly: an announcement forwarded by a router
+	// asserts an address of its own, and that address is what must be labelled.
+	t.Run("relayed announcement labels the subject not the relay", func(t *testing.T) {
+		results := make(map[string]string)
+		relay := &net.UDPAddr{IP: net.IPv4(192, 168, 2, 1), Port: 5353}
+		absorbMDNSPacket(results, relay, mdnsResponse(
+			"Canon-MF460._ipp._tcp.local", "Canon-MF460.local", net.IPv4(192, 168, 0, 241)))
+		assertMap(t, results, map[string]string{"192.168.0.241": "Canon-MF460"})
 	})
 
 	t.Run("malformed packet ignored", func(t *testing.T) {

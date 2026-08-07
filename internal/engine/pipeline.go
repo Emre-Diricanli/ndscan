@@ -191,7 +191,7 @@ func (e *Engine) scanPorts(
 //
 // It runs last because the rows are already on screen by then, so it fills a
 // column rather than delaying anything. A miss just leaves the field blank.
-func (e *Engine) enrich(ctx context.Context, emit Emit, out *Outcome) {
+func (e *Engine) enrich(ctx context.Context, p Plan, emit Emit, out *Outcome) {
 	if len(out.Rows) == 0 {
 		return
 	}
@@ -199,6 +199,23 @@ func (e *Engine) enrich(ctx context.Context, emit Emit, out *Outcome) {
 	ips := make([]string, 0, len(out.Rows))
 	for _, r := range out.Rows {
 		ips = append(ips, r.IP)
+	}
+
+	// Multicast discovery first, because ApplyHostnames only fills a name that
+	// is still empty and the best name should get there first. A device that
+	// advertises itself as "Living-Room-TV" is telling us what it is; a PTR
+	// record, where one exists at all, usually just spells the address back.
+	//
+	// Both passes are opt-in per plan and strictly bounded, so a network where
+	// nothing answers costs their timeout and nothing else.
+	if p.Multicast {
+		names := enrich.LookupMDNS(ctx, enrich.MDNSConfig{})
+		for ip, label := range enrich.LookupSSDP(ctx, enrich.SSDPConfig{}) {
+			if _, ok := names[ip]; !ok {
+				names[ip] = label // mDNS names are friendlier; SSDP fills gaps
+			}
+		}
+		ui.ApplyHostnames(out.Rows, names)
 	}
 	ui.ApplyHostnames(out.Rows, enrich.LookupPTR(ctx, ips, enrich.Config{}))
 	// These rows were already delivered by the port scan; enrichment only filled

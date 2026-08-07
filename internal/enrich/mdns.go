@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,23 +81,47 @@ func LookupMDNS(ctx context.Context, cfg MDNSConfig) map[string]string {
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
-	conn, err := openMDNSListener()
-	if err != nil {
+	conns := openMDNSListeners()
+	if len(conns) == 0 {
 		return map[string]string{}
 	}
-	defer conn.Close()
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
 
-	results := runMDNS(ctx, cfg, conn, &net.UDPAddr{IP: net.ParseIP(mdnsGroup4), Port: mdnsPort})
-	if cfg.IPv6 {
-		// IPv6 mDNS is a bonus pass on the same listener; its failure changes
-		// nothing about the IPv4 results already gathered.
-		dst := &net.UDPAddr{IP: net.ParseIP(mdnsGroup6), Port: mdnsPort}
-		for ip, name := range runMDNS(ctx, cfg, conn, dst) {
+	// Every joined interface is queried concurrently. A responder answers on
+	// the interface the query arrived on, so listening on only one means
+	// hearing only that segment — and the first joinable interface on a Mac is
+	// loopback, where nothing on the LAN will ever reply.
+	var (
+		mu      sync.Mutex
+		results = map[string]string{}
+		wg      sync.WaitGroup
+	)
+	merge := func(from map[string]string) {
+		mu.Lock()
+		defer mu.Unlock()
+		for ip, name := range from {
 			if _, ok := results[ip]; !ok {
 				results[ip] = name
 			}
 		}
 	}
+	for _, c := range conns {
+		wg.Add(1)
+		go func(c *net.UDPConn) {
+			defer wg.Done()
+			merge(runMDNS(ctx, cfg, c, &net.UDPAddr{IP: net.ParseIP(mdnsGroup4), Port: mdnsPort}))
+			if cfg.IPv6 {
+				// A bonus pass on the same listener; its failure changes
+				// nothing about the IPv4 results already gathered.
+				merge(runMDNS(ctx, cfg, c, &net.UDPAddr{IP: net.ParseIP(mdnsGroup6), Port: mdnsPort}))
+			}
+		}(c)
+	}
+	wg.Wait()
 	return results
 }
 
@@ -115,29 +140,48 @@ func runMDNS(ctx context.Context, cfg MDNSConfig, conn *net.UDPConn, dst *net.UD
 	return results
 }
 
-// openMDNSListener binds the mDNS port joined to the IPv4 multicast group,
-// trying every multicast-capable interface because responders answer on the
-// interface the query arrived on. Every fallback is deliberate: partial
-// discovery beats no discovery.
-func openMDNSListener() (*net.UDPConn, error) {
+// openMDNSListeners joins the mDNS group on every multicast-capable interface
+// that could carry LAN traffic.
+//
+// Joining just one is not enough, and joining the *first* is actively wrong:
+// responders answer on the interface the query arrived on, and on macOS the
+// first multicast-capable interface is loopback, where nothing on the network
+// will ever reply. That failure is silent — the socket binds, the query sends,
+// and no packet ever arrives.
+//
+// Loopback is skipped for the same reason. Every fallback is deliberate:
+// partial discovery beats no discovery.
+func openMDNSListeners() []*net.UDPConn {
 	group := &net.UDPAddr{IP: net.ParseIP(mdnsGroup4), Port: mdnsPort}
+	var conns []*net.UDPConn
+
 	if ifaces, err := net.Interfaces(); err == nil {
 		for i := range ifaces {
 			ifi := &ifaces[i]
 			if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagMulticast == 0 {
 				continue
 			}
+			if ifi.Flags&net.FlagLoopback != 0 {
+				continue // no responders live here
+			}
 			if conn, err := net.ListenMulticastUDP("udp4", ifi, group); err == nil {
-				return conn, nil
+				conns = append(conns, conn)
 			}
 		}
 	}
+	if len(conns) > 0 {
+		return conns
+	}
+
 	// No joinable interface (or the port is taken): a plain bind still receives
 	// unicast replies when we set the QU bit on questions.
 	if conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: mdnsPort}); err == nil {
-		return conn, nil
+		return []*net.UDPConn{conn}
 	}
-	return net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+	if conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0}); err == nil {
+		return []*net.UDPConn{conn}
+	}
+	return nil
 }
 
 // readUntil absorbs packets until ctx is done or the socket breaks. Read
@@ -337,15 +381,14 @@ func absorbMDNSPacket(results map[string]string, src *net.UDPAddr, msg []byte) {
 			}
 		}
 	}
-	srcIP := src.IP.String()
-	if _, ok := results[srcIP]; !ok {
-		for _, target := range parsed.ptrTargets {
-			if clean := cleanMDNSName(target); clean != "" {
-				results[srcIP] = clean
-				break
-			}
-		}
-	}
+	// Deliberately no fallback to the packet's source address. A PTR target
+	// names a service, not the host that sent the datagram, and the two differ
+	// exactly where it matters: a gateway or AP that relays mDNS between
+	// segments would be labelled with whatever it last forwarded. On a real
+	// network that produced a UniFi gateway confidently named "Canon MF460
+	// Series". Only an address the packet actually asserts — an A or AAAA
+	// record — identifies a host.
+	_ = src
 }
 
 // cleanMDNSName turns a DNS-SD name into a display name: 'Living-Room-TV.

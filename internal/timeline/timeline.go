@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
 
@@ -43,21 +44,7 @@ type Event struct {
 
 var appendMu sync.Mutex
 
-func configDir() string {
-	if d := os.Getenv("NDSCAN_CONFIG_DIR"); d != "" {
-		return d
-	}
-	if d := os.Getenv("NDSCAN_USER_CONFIG_DIR"); d != "" {
-		return filepath.Join(d, "ndscan")
-	}
-	if d, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(d, "ndscan")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "ndscan")
-}
-
-func timelineDir() string { return filepath.Join(configDir(), "timeline") }
+func timelineDir() string { return filepath.Join(config.Dir(), "timeline") }
 
 // Daily files make retention predictable without producing enough files to
 // matter for the expected few thousand records.
