@@ -15,7 +15,14 @@ func routedModel(t *testing.T, rows ...ui.Row) Model {
 	m := New("test")
 	m.width, m.height = 100, 40
 	m.screen = screenResults
-	m.netLocals = []netinfo.Network{{Interface: "en0", CIDR: "192.168.2.0/24", Addr: "192.168.2.157"}}
+	locals := []netinfo.Network{{Interface: "en0", CIDR: "192.168.2.0/24", Addr: "192.168.2.157"}}
+	m.netLocals = locals
+	// The sweep deliberately re-reads the interface table rather than trusting
+	// the startup snapshot, so pinning netLocals alone is not enough: without
+	// this the test picks up whatever networks the host machine really has.
+	// That passes on a developer laptop on 192.168.x and fails on CI, where the
+	// runner's Docker and Azure interfaces crowd out the expected candidates.
+	m.localsFn = func() []netinfo.Network { return locals }
 	m.netGateway = netinfo.Gateway{IP: "192.168.2.1", Interface: "en0"}
 	m.view = viewTopology
 	m.rows = rows
