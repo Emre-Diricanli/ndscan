@@ -7,7 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/enrich"
 	"github.com/Emre-Diricanli/ndscan/internal/sweep"
 )
 
@@ -187,6 +189,40 @@ func TestSyntheticXML_EscapesHostileValues(t *testing.T) {
 	x := string(res[0].XMLBytes)
 	if !strings.HasPrefix(x, "<nmaprun>") || !strings.HasSuffix(x, "</nmaprun>") {
 		t.Errorf("malformed envelope: %s", x)
+	}
+}
+
+func TestSyntheticXML_RoundTripsRTT(t *testing.T) {
+	want := 3800 * time.Microsecond
+	xmlBytes := syntheticXML(sweep.PortResult{IP: "192.0.2.1"}, want)
+	nr, err := ParseOne(xmlBytes)
+	if err != nil {
+		t.Fatalf("ParseOne: %v", err)
+	}
+	if len(nr.Hosts) != 1 {
+		t.Fatalf("hosts = %d, want 1", len(nr.Hosts))
+	}
+	if got := nr.Hosts[0].RTT(); got != want {
+		t.Fatalf("RTT = %v, want %v (XML: %s)", got, want, xmlBytes)
+	}
+}
+
+func TestSyntheticXML_RoundTripsTLSCertificate(t *testing.T) {
+	expiry := time.Date(2030, 4, 5, 6, 7, 8, 0, time.UTC)
+	xmlBytes := syntheticXMLWithMetadata(sweep.PortResult{IP: "192.0.2.1", Ports: []sweep.OpenPort{{Port: 443, Service: "https"}}}, NativeMetadata{
+		TLS: map[int]enrich.TLSInfo{443: {Organization: "GLKVM", CommonName: "device", Issuer: "issuer", NotAfter: expiry}},
+	})
+	nr, err := ParseOne(xmlBytes)
+	if err != nil {
+		t.Fatalf("ParseOne: %v", err)
+	}
+	p := nr.Hosts[0].Ports.List[0]
+	if p.Service.Tunnel != "ssl" || p.Service.Product != "GLKVM" {
+		t.Fatalf("service = %+v", p.Service)
+	}
+	cert := p.TLSCert()
+	if cert == nil || cert.Organization != "GLKVM" || cert.CommonName != "device" || cert.Issuer != "issuer" || cert.NotAfter != "2030-04-05T06:07:08" {
+		t.Fatalf("certificate = %+v (XML: %s)", cert, xmlBytes)
 	}
 }
 

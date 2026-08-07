@@ -136,6 +136,9 @@ func TestRun_TCPFindsRealListener(t *testing.T) {
 	if got[0].OpenPort != port {
 		t.Errorf("OpenPort = %d, want %d", got[0].OpenPort, port)
 	}
+	if got[0].RTT <= 0 || got[0].RTT > 2*time.Second {
+		t.Errorf("RTT = %v, want a plausible non-zero connect duration", got[0].RTT)
+	}
 }
 
 // A closed port yields no host — no false positives.
