@@ -109,13 +109,6 @@ func LoadChecked() ([]Rule, error) {
 // still means Defaults. Corrupt no longer does — see LoadChecked. Refusing to
 // invent a policy is the lesser evil: no rules evaluate to no alerts, and the
 // broken file stays put in the config directory until it is repaired.
-//
-// TODO(internal/engine): engine/alerts.go calls this non-erroring form, so a
-// corrupt rules.json currently fails closed but unreported. It should call
-// LoadChecked and append the error to engine.Record.Warnings, the way failed
-// history and device writes already are — only then does the failure reach
-// the user. internal/engine is owned by another change and is not editable
-// from here.
 func Load() []Rule {
 	rules, err := LoadChecked()
 	if err != nil {

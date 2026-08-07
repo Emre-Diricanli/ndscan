@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,5 +194,31 @@ func TestArrivalAfterFirstInventoryStillAlerts(t *testing.T) {
 	}
 	if !got {
 		t.Errorf("a real arrival was suppressed: %+v", rec.Alerts)
+	}
+}
+
+// A corrupt device store must not read as "no devices known" inside a scan.
+// That is what let a later save overwrite it and destroy user-assigned names,
+// and the user has to be told rather than left with silent identity loss.
+func TestCorruptDeviceStoreWarnsRatherThanPretendingEmpty(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NDSCAN_CONFIG_DIR", dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "devices.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := New().Persist(complete(
+		ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"},
+	), recordPlan(), time.Now(), vendor.DB{})
+
+	var warned bool
+	for _, w := range rec.Warnings {
+		if strings.Contains(w, "device records could not be read") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("a corrupt device store produced no warning: %+v", rec.Warnings)
 	}
 }

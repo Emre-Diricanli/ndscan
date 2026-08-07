@@ -79,7 +79,16 @@ func (e *Engine) evaluateAlerts(rec *Record, out Outcome, gatewayIP string, now 
 	if firstInventory {
 		newKeys = nil
 	}
-	alerts := alert.Evaluate(alert.Load(), rec.Diff, rec.Devices, newKeys, curMAC, prevMAC, now)
+	// LoadChecked: invalid rules must not silently become the defaults, which
+	// would re-enable alerting a user deliberately turned off. On a broken file
+	// we say so and evaluate nothing rather than assume.
+	rules, err := alert.LoadChecked()
+	if err != nil {
+		rec.Warnings = append(rec.Warnings,
+			"alert rules could not be read, so no alerts were raised for this scan: "+err.Error())
+		return nil
+	}
+	alerts := alert.Evaluate(rules, rec.Diff, rec.Devices, newKeys, curMAC, prevMAC, now)
 
 	if curMAC != "" {
 		if err := saveGatewayState(gatewayState{IP: gatewayIP, MAC: curMAC, Seen: now}); err != nil {

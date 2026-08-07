@@ -57,11 +57,13 @@ func newDevicesListCmd() *cobra.Command {
 }
 
 func listDevices(w io.Writer, jsonOut bool) error {
-	// TODO(merge): delegate/kimi makes device.Load error-returning so a corrupt
-	// store is refused rather than read as empty. Take the erroring form here
-	// at integration — a user asking to see their devices must be told the file
-	// is unreadable, not shown an empty list.
-	devices := device.Load()
+	// LoadChecked rather than Load: a user asking to see their devices must be
+	// told the file is unreadable, not shown an empty list that looks like an
+	// answer.
+	devices, err := device.LoadChecked()
+	if err != nil {
+		return err
+	}
 	if len(devices) == 0 {
 		fmt.Fprintln(w, "no devices recorded yet — run a scan first:")
 		fmt.Fprintln(w, "  ndscan scan <targets>")
@@ -118,7 +120,10 @@ type deviceDetail struct {
 }
 
 func showDevice(w io.Writer, key string, jsonOut bool) error {
-	devices := device.Load() // TODO(merge): erroring form, see listDevices
+	devices, err := device.LoadChecked()
+	if err != nil {
+		return err
+	}
 	rec, ok := devices[key]
 	if !ok {
 		return fmt.Errorf("no device recorded with key %q — run 'ndscan devices list' to see the keys", key)

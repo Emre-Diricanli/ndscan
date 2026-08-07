@@ -100,7 +100,15 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 	// artefact of having just started looking rather than an event — a small
 	// home network produced four notifications on its first run, which is how
 	// a person learns to turn alerting off.
-	known := device.Load()
+	// LoadChecked: a corrupt store must not read as "no devices known", which
+	// is what let a later Save overwrite it and destroy user-assigned names.
+	// The scan still completes — losing identity tracking for one run is better
+	// than failing a scan that otherwise worked — but the user is told.
+	known, err := device.LoadChecked()
+	if err != nil {
+		rec.Warnings = append(rec.Warnings,
+			"device records could not be read, so identity tracking is paused for this scan: "+err.Error())
+	}
 	firstInventory := len(known) == 0
 	devices, added := device.Apply(known, device.FromRows(out.Rows, out.MACs, now), oui)
 	rec.Devices, rec.NewDevices = devices, added
