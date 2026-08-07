@@ -197,7 +197,10 @@ func (e *Engine) enrich(ctx context.Context, emit Emit, out *Outcome) {
 		ips = append(ips, r.IP)
 	}
 	ui.ApplyHostnames(out.Rows, enrich.LookupPTR(ctx, ips, enrich.Config{}))
-	emit.rows(out.Rows)
+	// These rows were already delivered by the port scan; enrichment only filled
+	// in a column. Re-announcing them as arrivals would duplicate every host in
+	// a front end that appends.
+	emit.rowsUpdated(out.Rows)
 }
 
 func sortRows(rows []ui.Row) {
