@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"time"
@@ -93,7 +95,7 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 		rec.Warnings = append(rec.Warnings, "device records could not be saved: "+err.Error())
 	}
 
-	rec.Events = e.appendTimeline(rec, out, now)
+	rec.Events = e.appendTimeline(rec, out, now, key.Scope())
 
 	// Alerting last: it reads the diff and the device set this run produced, so
 	// it has to come after both. The suppressor is per-Engine, which is what
@@ -122,7 +124,7 @@ func (e *Engine) suppressor() *alert.Suppressor {
 // *changed* rather than restating the whole network on every scan. A watch loop
 // running every minute would otherwise write thousands of identical "still
 // here" records a day and bury the events that matter.
-func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeline.Event {
+func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time, scope string) []timeline.Event {
 	// The first comparable scan of a signature has no previous snapshot, so
 	// every host would read as new. That is an artefact of having just started
 	// watching, not an event: recording it would date every device's arrival to
@@ -130,6 +132,11 @@ func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeli
 	if len(rec.Previous) == 0 {
 		return nil
 	}
+
+	// One run identifier for every event this scan writes. Timestamp equality
+	// cannot serve as the batch boundary: two scans can finish in the same
+	// instant, and a scan's own events need not share a timestamp exactly.
+	run := runID(scope, now)
 
 	keyFor := deviceKeys(out)
 	var events []timeline.Event
@@ -142,17 +149,19 @@ func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeli
 		case d.New:
 			events = append(events, timeline.Event{
 				Type: timeline.EventHostSeen, Timestamp: now, DeviceKey: key, IP: ip,
+				Scope: scope, Run: run,
 			})
 		case d.Gone:
 			events = append(events, timeline.Event{
 				Type: timeline.EventHostGone, Timestamp: now, DeviceKey: key, IP: ip,
+				Scope: scope, Run: run,
 			})
 		}
 		for _, port := range d.PortsOpened {
-			events = append(events, portEvent(timeline.EventPortOpened, now, key, ip, port))
+			events = append(events, portEvent(timeline.EventPortOpened, now, key, ip, port, scope, run))
 		}
 		for _, port := range d.PortsClosed {
-			events = append(events, portEvent(timeline.EventPortClosed, now, key, ip, port))
+			events = append(events, portEvent(timeline.EventPortClosed, now, key, ip, port, scope, run))
 		}
 	}
 
@@ -181,11 +190,23 @@ func deviceKeys(out Outcome) map[string]string {
 	return keys
 }
 
-func portEvent(kind timeline.EventType, now time.Time, key, ip, port string) timeline.Event {
+func portEvent(kind timeline.EventType, now time.Time, key, ip, port, scope, run string) timeline.Event {
 	n, proto := splitPort(port)
 	return timeline.Event{
 		Type: kind, Timestamp: now, DeviceKey: key, IP: ip, Port: n, Protocol: proto,
+		Scope: scope, Run: run,
 	}
+}
+
+// runID derives a stable per-run identifier from the scan signature and the
+// moment the run is attributed to.
+//
+// It is a hash rather than a counter so it needs no shared state and no
+// coordination between processes: a CLI scan and the web server watching can
+// both write without agreeing on anything first.
+func runID(scope string, at time.Time) string {
+	h := sha1.Sum([]byte(scope + "|" + at.UTC().Format(time.RFC3339Nano)))
+	return hex.EncodeToString(h[:8])
 }
 
 // splitPort reads a port number and protocol out of a diff entry.
