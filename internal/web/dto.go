@@ -51,9 +51,13 @@ type nodeDTO struct {
 }
 
 type segmentDTO struct {
-	CIDR       string    `json:"cidr"`
-	Interface  string    `json:"interface,omitempty"`
-	SelfAddr   string    `json:"selfAddr,omitempty"`
+	CIDR      string `json:"cidr"`
+	Interface string `json:"interface,omitempty"`
+	SelfAddr  string `json:"selfAddr,omitempty"`
+	// Inferred marks a network boundary that was guessed rather than observed
+	// on an interface or supplied as a scan target. It must reach the browser
+	// so a guessed boundary can never render as a measured fact.
+	Inferred   bool      `json:"inferred"`
 	NotScanned bool      `json:"notScanned"`
 	RoutedVia  string    `json:"routedVia,omitempty"`
 	Nodes      []nodeDTO `json:"nodes"`
@@ -62,6 +66,11 @@ type segmentDTO struct {
 type topologyDTO struct {
 	Gateway  string       `json:"gateway,omitempty"`
 	Segments []segmentDTO `json:"segments"`
+	// Orphans are hosts that answered the scan but fall inside no attached
+	// network and no scan target. They stay out of Segments precisely because
+	// no CIDR honestly contains them — but dropping them entirely would make a
+	// live host vanish from the map, so they travel under their own key.
+	Orphans []nodeDTO `json:"orphans,omitempty"`
 }
 
 func toHostDTO(r ui.Row) hostDTO {
@@ -88,22 +97,31 @@ func toHostDTO(r ui.Row) hostDTO {
 }
 
 // toTopologyDTO converts the internal map to the wire format. Nodes is always
-// a non-nil slice so the frontend can iterate without a null check.
+// a non-nil slice so the frontend can iterate without a null check; Orphans is
+// the opposite — omitted when empty, so a map without orphans emits no section
+// for them at all.
 func toTopologyDTO(m topology.Map) topologyDTO {
 	out := topologyDTO{Gateway: m.Gateway, Segments: make([]segmentDTO, 0, len(m.Segments))}
 	for _, s := range m.Segments {
 		seg := segmentDTO{
 			CIDR: s.CIDR, Interface: s.Interface, SelfAddr: s.SelfAddr,
-			NotScanned: s.NotScanned, RoutedVia: s.RoutedVia,
+			Inferred: s.Inferred, NotScanned: s.NotScanned, RoutedVia: s.RoutedVia,
 			Nodes: make([]nodeDTO, 0, len(s.Nodes)),
 		}
 		for _, n := range s.Nodes {
-			seg.Nodes = append(seg.Nodes, nodeDTO{
-				IsGateway: n.IsGateway, IsSelf: n.IsSelf,
-				Severity: n.Severity, Host: toHostDTO(n.Row),
-			})
+			seg.Nodes = append(seg.Nodes, toNodeDTO(n))
 		}
 		out.Segments = append(out.Segments, seg)
 	}
+	for _, n := range m.Orphans {
+		out.Orphans = append(out.Orphans, toNodeDTO(n))
+	}
 	return out
+}
+
+func toNodeDTO(n topology.Node) nodeDTO {
+	return nodeDTO{
+		IsGateway: n.IsGateway, IsSelf: n.IsSelf,
+		Severity: n.Severity, Host: toHostDTO(n.Row),
+	}
 }

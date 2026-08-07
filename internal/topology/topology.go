@@ -45,9 +45,6 @@ type Segment struct {
 	RoutedVia string
 }
 
-// TODO(web): expose Segment.Inferred in segmentDTO before any caller starts
-// producing inferred segments, so guessed boundaries cannot render as facts.
-
 // Attached reports whether this machine has an interface on the segment.
 // Routed and orphan segments are not attached.
 func (s Segment) Attached() bool { return s.Interface != "" }

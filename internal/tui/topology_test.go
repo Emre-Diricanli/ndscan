@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
+	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 )
 
@@ -105,6 +106,71 @@ func TestTopologyView_RemoteSubnetUsesScannedPrefix(t *testing.T) {
 	}
 	if strings.Contains(out, "10.20.30.0/24") {
 		t.Errorf("map invented a /24 that was never scanned:\n%s", out)
+	}
+}
+
+func TestRenderTopology_UnknownPlacementAndBoundaries(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := New("test")
+	cases := []struct {
+		name    string
+		mapData topology.Map
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "orphan is shown without a fabricated network",
+			mapData: topology.Map{Orphans: []topology.Node{
+				{Row: ui.Row{IP: "203.0.113.9", Host: "answering-host", Up: true}},
+				{Row: ui.Row{IP: "198.51.100.4", Host: "first-by-address", Up: true}},
+			}},
+			want:    []string{"answered hosts outside known networks", "198.51.100.4", "first-by-address", "203.0.113.9", "answering-host"},
+			notWant: []string{"203.0.113.0/24"},
+		},
+		{
+			name: "no orphan section when none exist",
+			mapData: topology.Map{Segments: []topology.Segment{
+				{CIDR: "192.168.1.0/24"},
+			}},
+			notWant: []string{"answered hosts outside known networks"},
+		},
+		{
+			name: "inferred boundary is visibly marked",
+			mapData: topology.Map{Segments: []topology.Segment{
+				{CIDR: "10.0.0.0/24", Inferred: true},
+			}},
+			want: []string{glyphInferred + " inferred boundary"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := m.renderTopology(tc.mapData)
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("map missing %q:\n%s", want, out)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(out, notWant) {
+					t.Errorf("map unexpectedly contains %q:\n%s", notWant, out)
+				}
+			}
+			if tc.name == "orphan is shown without a fabricated network" &&
+				strings.Index(out, "198.51.100.4") > strings.Index(out, "203.0.113.9") {
+				t.Errorf("orphan hosts are not rendered in address order:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestTopologyLegend_ExplainsUncertainData(t *testing.T) {
+	m := mapModel(t)
+	out := m.topologyView()
+	for _, want := range []string{"inferred boundary", "outside known networks", "no known network"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("legend missing %q:\n%s", want, out)
+		}
 	}
 }
 
