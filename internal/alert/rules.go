@@ -10,6 +10,7 @@ package alert
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,17 +81,45 @@ func Defaults() []Rule {
 	}
 }
 
-// Load reads rules.json, falling back to Defaults when the file is missing or
-// unreadable. A fresh install must do something useful out of the box, and a
-// corrupt file should degrade to sensible behaviour rather than to silence.
-func Load() []Rule {
+// LoadChecked reads rules.json, distinguishing the states Load used to merge.
+// A missing file means a fresh install and yields Defaults with no error — a
+// fresh install must do something useful out of the box. An unparseable file
+// is refused: substituting Defaults for a file the user edited would silently
+// re-enable rules they deliberately turned off.
+//
+// An empty rule list is still treated as unusable rather than as "alert on
+// nothing": an explicitly empty file would silence all alerting, which is
+// exactly what a truncated write looks like, so it degrades to Defaults.
+func LoadChecked() ([]Rule, error) {
 	b, err := os.ReadFile(rulesPath())
 	if err != nil {
-		return Defaults()
+		return Defaults(), nil
 	}
 	var rules []Rule
-	if json.Unmarshal(b, &rules) != nil || len(rules) == 0 {
-		return Defaults()
+	if err := json.Unmarshal(b, &rules); err != nil {
+		return nil, fmt.Errorf("rules.json is corrupt: fix or delete %s: %w", rulesPath(), err)
+	}
+	if len(rules) == 0 {
+		return Defaults(), nil
+	}
+	return rules, nil
+}
+
+// Load reads rules.json for callers that cannot surface an error. Missing
+// still means Defaults. Corrupt no longer does — see LoadChecked. Refusing to
+// invent a policy is the lesser evil: no rules evaluate to no alerts, and the
+// broken file stays put in the config directory until it is repaired.
+//
+// TODO(internal/engine): engine/alerts.go calls this non-erroring form, so a
+// corrupt rules.json currently fails closed but unreported. It should call
+// LoadChecked and append the error to engine.Record.Warnings, the way failed
+// history and device writes already are — only then does the failure reach
+// the user. internal/engine is owned by another change and is not editable
+// from here.
+func Load() []Rule {
+	rules, err := LoadChecked()
+	if err != nil {
+		return nil
 	}
 	return rules
 }

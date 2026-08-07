@@ -325,6 +325,48 @@ func TestWatchRescanFiresNotifyCmd(t *testing.T) {
 	}
 }
 
+// The engine reports failed persistence (full disk, root-owned config dir, a
+// corrupt store it refused to overwrite) as warnings. The CLI and web both
+// show them; the TUI must not drop them on the floor.
+func TestDoneMsgCarriesWarnings(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	done := doneMsg{
+		rows: []ui.Row{{IP: "10.0.0.9", Up: true}},
+		warnings: []string{
+			"scan history could not be saved, so changes since this scan will not be detected: disk full",
+			"device records could not be saved: devices.json is corrupt",
+		},
+	}
+	var tm tea.Model = m
+	out, _ := tm.Update(done)
+	mm := out.(Model)
+	if len(mm.warnings) != len(done.warnings) {
+		t.Fatalf("model kept %d warning(s), want %d", len(mm.warnings), len(done.warnings))
+	}
+	for _, w := range done.warnings {
+		if !strings.Contains(mm.summary, w) {
+			t.Errorf("results summary does not surface warning %q\nsummary: %q", w, mm.summary)
+		}
+	}
+}
+
+// A new scan clears the previous run's warnings: they describe one run's
+// persistence, not a permanent state.
+func TestStartWithParamsClearsWarnings(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	m := resultsModel(t)
+	m.warnings = []string{"stale warning"}
+	tm, _ := m.startWithParams(scanParams{targets: []string{"127.0.0.1"}, concurrency: 1})
+	mm := tm.(Model)
+	if len(mm.warnings) != 0 {
+		t.Fatalf("startWithParams kept stale warnings: %v", mm.warnings)
+	}
+	if mm.cancel != nil {
+		mm.cancel()
+	}
+}
+
 func TestExportJSONAndCSV(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	t.Setenv("NDSCAN_NO_OPEN", "1") // don't spawn a browser in tests
