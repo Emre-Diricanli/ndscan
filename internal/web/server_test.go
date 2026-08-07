@@ -258,6 +258,30 @@ func TestToTopologyDTO_MatchesContract(t *testing.T) {
 	}
 }
 
+// The state endpoint must carry the honesty flags through to the browser:
+// an inferred boundary marked as such, and orphans present at all — a host
+// that answered must never be dropped by the web layer.
+func TestState_ServesInferredAndOrphans(t *testing.T) {
+	s := NewServer("test")
+	s.topo = &topology.Map{
+		Segments: []topology.Segment{{CIDR: "192.0.2.0/24", Inferred: true}},
+		Orphans:  []topology.Node{{Row: ui.Row{IP: "203.0.113.10", Up: true}}},
+	}
+	srv := startServer(t, s)
+	resp, err := http.Get(srv.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	js := string(body)
+	for _, want := range []string{`"inferred":true`, `"orphans"`, `"ip":"203.0.113.10"`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("state JSON missing %s: %s", want, js)
+		}
+	}
+}
+
 // The frontend route must respond even before the SPA is embedded.
 func TestFrontend_RespondsWithoutEmbeddedApp(t *testing.T) {
 	srv := newTestServer(t)

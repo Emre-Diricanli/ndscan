@@ -231,6 +231,11 @@
   #graph-legend .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
   #graph-legend .line { width: 16px; height: 0; border-top: 2px solid var(--muted); flex: none; }
   #graph-legend .line.dashed { border-top-style: dashed; border-color: var(--sev-warn); }
+  /* Chip glyphs mirror the two dashed segment borders drawn on the graph:
+     warn-dashed for an inferred boundary, muted-dashed for no known network. */
+  #graph-legend .chipbox { width: 14px; height: 10px; border: 1px solid var(--border); border-radius: 3px; flex: none; }
+  #graph-legend .chipbox.inferred { border-style: dashed; border-color: var(--sev-warn); }
+  #graph-legend .chipbox.orphan { border-style: dashed; border-color: var(--muted); }
 
   .node circle { stroke: rgba(255,255,255,0.25); stroke-width: 1.5; cursor: pointer; }
   .node.selected circle { stroke: #fff; stroke-width: 2.5; }
@@ -245,6 +250,9 @@
   }
   .edge { stroke: #3a4756; stroke-width: 1.5; }
   .edge.routed { stroke: var(--sev-warn); stroke-dasharray: 6 5; opacity: 0.85; }
+  /* Orphan edges are dashed too, but muted: the host answered, so the link is
+     real — what is unknown is which network it belongs to. */
+  .edge.orphan { stroke: var(--muted); stroke-dasharray: 3 4; opacity: 0.8; }
   .edge.hl { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
   .muted-note { color: var(--muted); font-style: italic; font-size: 12px; }
   .detail-actions { padding: 10px 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -257,6 +265,11 @@
   .node { cursor: pointer; }
   .node.hl circle, .node.hl .chip { stroke: var(--accent); stroke-width: 2.5; }
   .node .chip { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
+  /* A dashed chip border reuses the graph's existing "not directly observed"
+     vocabulary: warn-dashed matches routed edges (a boundary we inferred),
+     muted-dashed matches the unknown-segment circle (no known network). */
+  .node .chip.inferred { stroke: var(--sev-warn); stroke-dasharray: 6 5; }
+  .node .chip.orphan { stroke: var(--muted); stroke-dasharray: 4 3; }
   .node.selected .chip { stroke: #fff; stroke-width: 2; }
   .node.selected.hl circle { stroke: #fff; stroke-width: 2.5; }
   .chip-text { pointer-events: none; }
@@ -514,6 +527,8 @@
       <div class="row"><span class="dot" style="background:var(--sev-none)"></span> no findings</div>
       <div class="row"><span class="line"></span> directly attached</div>
       <div class="row"><span class="line dashed"></span> routed via gateway</div>
+      <div class="row"><span class="chipbox inferred"></span> network boundary inferred, not observed</div>
+      <div class="row"><span class="chipbox orphan"></span> answered, but on no known network</div>
       <div class="row hint">click parent: collapse/expand · double-click: zoom · / filter · Esc clear</div>
     </div>
   </section>
@@ -675,6 +690,20 @@ const DEMO_DATA = {
         routedVia: "",
         nodes: []
       }
+    ],
+    // A host that answered but belongs to no attached network and no scan
+    // target — shown on its own, never under a fabricated CIDR.
+    orphans: [
+      {
+        isGateway: false, isSelf: false, severity: "info",
+        host: {
+          ip: "203.0.113.10", hostname: "vps-backup", mac: "", vendor: "",
+          os: "Linux 6.X", rtt: "48.3ms", up: true,
+          ports: [
+            { port: 22, proto: "tcp", service: "ssh", severity: "info", risk: "SSH reachable from here" }
+          ]
+        }
+      }
     ]
   }
 };
@@ -774,6 +803,11 @@ function applyState(st) {
       for (const n of seg.nodes || []) {
         if (n.host && n.host.ip) S.hosts.set(n.host.ip, n.host);
       }
+    }
+    // Orphans answered the scan, so they belong in the table like any other
+    // host — leaving them out would hide a live host from every view.
+    for (const n of S.topology.orphans || []) {
+      if (n.host && n.host.ip) S.hosts.set(n.host.ip, n.host);
     }
   }
   applyTargetPrefill(st);
@@ -1255,6 +1289,9 @@ function runDemoScan() {
     if (seg.notScanned) continue;
     for (const n of seg.nodes) if (n.host && n.host.ip) allHosts.push(n.host);
   }
+  for (const n of DEMO_DATA.topology.orphans || []) {
+    if (n.host && n.host.ip) allHosts.push(n.host);
+  }
   const total = allHosts.length * 20;
   let done = 0, idx = 0;
   const phases = ["discover", "resolve", "ports"];
@@ -1367,6 +1404,9 @@ function buildGraph(topology) {
     }
 
     const routed = !!seg.routedVia;
+    // An inferred boundary is a guess, not a measurement: the chip is drawn
+    // dashed and labelled so it can never read as an observed network.
+    const inferred = !!seg.inferred;
 
     // Attachment point for this segment: gateway if routed or if the gateway
     // lives in this segment, otherwise this machine.
@@ -1389,8 +1429,9 @@ function buildGraph(topology) {
       // above, or a correct empty result reads as a misfire.
       const empty = add({
         id: "seg:" + seg.cidr, label: seg.cidr, kind: "segment", severity: "",
-        host: null, r: 0, count: 0,
-        sub: "no hosts found" + (routed ? " · via " + seg.routedVia : "")
+        host: null, r: 0, count: 0, inferred,
+        sub: "no hosts found" + (routed ? " · via " + seg.routedVia : "") +
+          (inferred ? " · boundary inferred" : "")
       });
       edges.push({ a: parent, b: empty, routed });
       continue;
@@ -1406,12 +1447,42 @@ function buildGraph(topology) {
     }
     const segNode = add({
       id: "seg:" + seg.cidr, label: seg.cidr, kind: "segment", severity: worst,
-      host: null, r: 0, count: hosts.length,
+      host: null, r: 0, count: hosts.length, inferred,
       sub: hosts.length + (hosts.length === 1 ? " host" : " hosts") +
-        (routed ? " · via " + seg.routedVia : "")
+        (routed ? " · via " + seg.routedVia : "") +
+        (inferred ? " · boundary inferred" : "")
     });
     edges.push({ a: parent, b: segNode, routed });
     for (const h of hosts) edges.push({ a: segNode, b: h, routed });
+  }
+
+  // Orphans answered the scan but fall inside no attached network and no scan
+  // target. They get their own plainly-labelled group — never a fabricated
+  // CIDR — because a host that answered must not vanish from the map, and the
+  // whole point of the group is that no network is claimed for it.
+  const orphans = [];
+  for (const n of topology.orphans || []) {
+    if (!n.host || !n.host.ip) continue;
+    if (byId.has(n.host.ip)) continue; // self / gateway already added
+    orphans.push(add({
+      id: n.host.ip, label: n.host.hostname || n.host.ip,
+      kind: "host", severity: n.severity || "", host: n.host, r: 10,
+      orphan: true
+    }));
+  }
+  if (orphans.length) {
+    let worst = "";
+    for (const h of orphans) {
+      if ((SEV_ORDER[h.severity] || 0) > (SEV_ORDER[worst] || 0)) worst = h.severity;
+    }
+    const grp = add({
+      id: "orphans", label: "no known network", kind: "orphans", severity: worst,
+      host: null, r: 0, count: orphans.length,
+      sub: orphans.length + (orphans.length === 1 ? " host" : " hosts") +
+        " · matched no network or target"
+    });
+    edges.push({ a: selfNode, b: grp, routed: false, orphan: true });
+    for (const h of orphans) edges.push({ a: grp, b: h, routed: false, orphan: true });
   }
 
   return { nodes, edges };
@@ -1440,7 +1511,7 @@ function visibleKids(n) {
 function textW(s) { return String(s || "").length * 6.4 + 14; }
 
 function labelW(n) {
-  if (n.kind === "segment") {
+  if (n.kind === "segment" || n.kind === "orphans") {
     n._chipW = Math.max(textW(n.label), textW(n.sub)) + 34;
     return n._chipW;
   }
@@ -1612,7 +1683,7 @@ function paintGraph() {
     }
     edgesG.appendChild(svgEl("path", {
       d: elbowD(e.a.x, e.a.y, e.b.x, e.b.y, midY),
-      class: "edge" + (e.routed ? " routed" : "") + (hlEdges.has(e.a.id + "→" + e.b.id) ? " hl" : ""),
+      class: "edge" + (e.routed ? " routed" : "") + (e.orphan ? " orphan" : "") + (hlEdges.has(e.a.id + "→" + e.b.id) ? " hl" : ""),
       fill: "none"
     }));
     if (e.label) {
@@ -1632,9 +1703,10 @@ function paintGraph() {
       transform: "translate(" + n.x + "," + n.y + ")"
     });
 
-    if (n.kind === "segment") {
+    if (n.kind === "segment" || n.kind === "orphans") {
       const w = n._chipW || 90, h = CHIP_H;
-      g.appendChild(svgEl("rect", { class: "chip", x: -w / 2, y: -h / 2, width: w, height: h, rx: 6 }));
+      const chipClass = "chip" + (n.kind === "orphans" ? " orphan" : n.inferred ? " inferred" : "");
+      g.appendChild(svgEl("rect", { class: chipClass, x: -w / 2, y: -h / 2, width: w, height: h, rx: 6 }));
       g.appendChild(svgEl("circle", { cx: -w / 2 + 12, cy: 0, r: 4.5, fill: nodeFill(n), stroke: "none" }));
       const t1 = svgEl("text", { class: "chip-text", x: -w / 2 + 23, y: -2, style: "font-size:11px;font-weight:600;text-anchor:start;stroke:none" });
       t1.textContent = n.label;
@@ -1661,8 +1733,9 @@ function paintGraph() {
 
     if (collapsed) {
       const n2 = hiddenCount(n);
-      const bx = n.kind === "segment" ? (n._chipW || 90) / 2 : n.r * 0.85;
-      const by = n.kind === "segment" ? -CHIP_H / 2 : -n.r * 0.85;
+      const isChip = n.kind === "segment" || n.kind === "orphans";
+      const bx = isChip ? (n._chipW || 90) / 2 : n.r * 0.85;
+      const by = isChip ? -CHIP_H / 2 : -n.r * 0.85;
       g.appendChild(svgEl("circle", { class: "badge-c", cx: bx, cy: by, r: 9 }));
       const bt = svgEl("text", { class: "badge-t", x: bx, y: by + 3 });
       bt.textContent = "+" + n2;
@@ -1705,7 +1778,10 @@ function renderGraph() {
   const hasHosts = S.hosts.size > 0;
 
   $("graph-empty").classList.toggle("on", !t);
-  $("graph-none").classList.toggle("on", !!t && !hasSegs || (!!t && hasSegs && !hasHosts && !S.scanning &&
+  // Orphans count as found hosts even when no segment holds them — they are
+  // already in S.hosts, and a segments-less map with orphans is not "nothing".
+  $("graph-none").classList.toggle("on", !!t && !hasSegs && !(t.orphans || []).length ||
+    (!!t && hasSegs && !hasHosts && !S.scanning &&
     (t.segments || []).every((s) => s.notScanned || !(s.nodes || []).length)));
 
   if (!t) { G.nodes = []; G.edges = []; paintGraph(); return; }
@@ -1880,11 +1956,26 @@ function selectNode(n) {
       "<dt>Segment</dt><dd>" + esc(n.label) + "</dd>" +
       "<dt>Hosts</dt><dd>" + n.count + "</dd>" +
       "<dt>Link</dt><dd>" + (e && e.routed ? "routed via gateway" : "directly attached") + "</dd>" +
+      (n.inferred ? "<dt>Boundary</dt><dd>inferred — not observed on an interface or given as a scan target</dd>" : "") +
       "<dt>Worst severity</dt><dd><span class=\"pill " + (n.severity || "none") + "\">" + (n.severity || "none") + "</span></dd>" +
       "</dl>" +
       '<div class="placeholder">' + (n.count
         ? "Click the chip to collapse or expand its hosts."
         : "The scan covered this segment; no hosts answered.") + "</div>";
+    renderTable();
+    paintGraph();
+    return;
+  }
+  if (n.kind === "orphans") {
+    S.selectedIp = null;
+    $("detail-body").innerHTML =
+      '<dl class="kv">' +
+      "<dt>Group</dt><dd>" + esc(n.label) + "</dd>" +
+      "<dt>Hosts</dt><dd>" + n.count + "</dd>" +
+      "<dt>Worst severity</dt><dd><span class=\"pill " + (n.severity || "none") + "\">" + (n.severity || "none") + "</span></dd>" +
+      "</dl>" +
+      '<div class="placeholder">These hosts answered the scan but fall inside no attached network and no scan target. ' +
+      "Nothing is claimed about which network they are on.</div>";
     renderTable();
     paintGraph();
     return;
@@ -1926,6 +2017,11 @@ function renderDetail(h, kind, node) {
     ["Role", kind === "self" ? "this machine" : kind === "gateway" ? "gateway" : "host"],
     ["Severity", '<span class="pill ' + (sev || "none") + '">' + (sev || "none") + "</span>"]
   ];
+  // An orphan's detail must not imply a network: the host answered, but no
+  // attached network or scan target contains it, and saying so is the point.
+  if (node && node.orphan) {
+    rows.push(["Network", '<span class="muted-note">no known network — matched no attached network or scan target</span>']);
+  }
   let html = '<dl class="kv">';
   for (const [k, v] of rows) html += "<dt>" + k + "</dt><dd>" + v + "</dd>";
   html += "</dl>";
