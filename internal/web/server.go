@@ -442,17 +442,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		}
 	}
 
-	plan := engine.Plan{
-		Targets:     targets,
-		Preset:      preset,
-		Ports:       s.portsFor(preset),
-		ShowMAC:     true,
-		ShowVendors: true,
-		Concurrency: 64,
-		HostTimeout: 20 * time.Second,
-		Fast:        fast,
-		Hostnames:   true,
-	}
+	plan := s.scanPlan(targets, preset, fast)
 	out := engine.New().Run(ctx, plan, emit)
 	discover.flush()
 	ports.flush()
@@ -556,11 +546,36 @@ func (s *Server) publishDone(out engine.Outcome, start time.Time) {
 	})
 }
 
-// portsFor returns the port specification a preset implies. The web UI does not
-// expose a free-form port box, so the preset is the whole of the port selection
-// — but it still has to enter the history key, because a quick scan and a deep
-// scan of the same network legitimately find different ports and must not be
-// compared against each other.
+// scanPlan builds the plan a web-initiated scan runs under.
+//
+// Ports is deliberately empty: the web exposes no port box, so the preset owns
+// the port selection entirely. The preset still has to reach the history key,
+// which is what HistoryPorts is for — passing that label as Ports would ask the
+// scanner for ports named "preset:quick" and quietly scan nothing.
+func (s *Server) scanPlan(targets []string, preset string, fast bool) engine.Plan {
+	return engine.Plan{
+		Targets:      targets,
+		Preset:       preset,
+		HistoryPorts: s.portsFor(preset),
+		ShowMAC:      true,
+		ShowVendors:  true,
+		Concurrency:  64,
+		HostTimeout:  20 * time.Second,
+		Fast:         fast,
+		Hostnames:    true,
+	}
+}
+
+// portsFor returns the history-key discriminator for a preset.
+//
+// The web UI has no free-form port box, so the preset is the whole of the port
+// selection. It still has to enter the history key, because a quick scan and a
+// deep scan of the same network legitimately find different ports and must not
+// be compared against each other.
+//
+// This is deliberately not a port specification: it is a label, and feeding it
+// to a scanner as one would ask for ports named "preset:quick" and find
+// nothing. The scan itself passes no ports at all and lets the preset choose.
 func (s *Server) portsFor(preset string) string { return "preset:" + preset }
 
 // ListenAndServe starts the HTTP server on addr until ctx is cancelled.

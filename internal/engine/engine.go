@@ -31,7 +31,15 @@ type Plan struct {
 	SSHTarget string
 	Targets   []string
 	Preset    string
-	Ports     string
+	// Ports is a port specification the scanner will parse ("22,80" or
+	// "1-1024"). Empty means "let the preset choose".
+	Ports string
+	// HistoryPorts overrides how Ports appears in the history key. A front end
+	// that selects ports indirectly — the web picks them via the preset alone —
+	// needs the key to distinguish those selections even though the scan itself
+	// passes no port spec. It must never be fed to the scanner: it is a label,
+	// not a port list.
+	HistoryPorts string
 
 	ShowMAC     bool
 	ShowVendors bool
@@ -127,9 +135,13 @@ func (o Outcome) Comparable() bool {
 
 // ScanKey is the signature this run should be filed under in scan history.
 func (o Outcome) ScanKey(p Plan) config.ScanKey {
+	ports := p.Ports
+	if p.HistoryPorts != "" {
+		ports = p.HistoryPorts
+	}
 	return config.ScanKey{
 		Targets: p.Targets,
-		Ports:   p.Ports,
+		Ports:   ports,
 		Preset:  p.Preset,
 		Fast:    o.Fast,
 	}
@@ -176,6 +188,12 @@ type Event struct {
 	// whose contents changed and should replace their existing entries.
 	Rows []ui.Row
 
+	// Native reports, on a PhaseScan event, whether the port scan is running
+	// natively rather than through nmap. A front end that words its progress
+	// differently for the two needs to know which is running, and recomputing
+	// that decision outside the engine would mean two copies of it that drift.
+	Native bool
+
 	// Warning is a non-fatal problem worth telling the user about.
 	Warning string
 }
@@ -214,6 +232,13 @@ type Emit func(Event)
 func (e Emit) phase(p Phase, done, total int) {
 	if e != nil {
 		e(Event{Kind: EventPhase, Phase: p, Done: done, Total: total})
+	}
+}
+
+// scanPhase reports port-scan progress along with which engine is doing it.
+func (e Emit) scanPhase(done, total int, native bool) {
+	if e != nil {
+		e(Event{Kind: EventPhase, Phase: PhaseScan, Done: done, Total: total, Native: native})
 	}
 }
 

@@ -193,11 +193,6 @@ Otherwise, nmap runs locally.`,
 				Concurrency: concurrency, HostTimeout: time.Duration(hostTimeoutSec) * time.Second,
 				Fast: fastDiscover, DiscoverOnly: discoverOnly, Hostnames: true,
 			}
-			nativeScan := fastDiscover && scan.NativePortScanViable(scan.Config{
-				Preset: preset, Ports: ports, UseSYN: rootScan, Concurrency: concurrency,
-				HostTimeout: time.Duration(hostTimeoutSec) * time.Second,
-			}, scan.NewRunner(sshTarget))
-
 			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
 			var progressMu sync.Mutex
 			liveCount := 0
@@ -226,7 +221,10 @@ Otherwise, nmap runs locally.`,
 					sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", ev.Total, preset, ev.Total))
 					scanStarted = true
 				}
-				if nativeScan {
+				// Which scanner is running is the engine's decision, reported
+				// on the event rather than recomputed here — a second copy of
+				// that rule would drift the first time the engine's changed.
+				if ev.Native {
 					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (native)… %d/%d", ev.Total, ev.Done, ev.Total))
 				} else {
 					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", ev.Total, preset, ev.Done, ev.Total))

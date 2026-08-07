@@ -455,11 +455,30 @@ func TestFinishScanSeparatesFastAndNmapHistory(t *testing.T) {
 // webPlan mirrors the plan runScan builds, so tests file history under the same
 // key the server really uses.
 func webPlan(targets []string) engine.Plan {
-	s := NewServer("test")
-	return engine.Plan{Targets: targets, Preset: "quick", Ports: s.portsFor("quick")}
+	return NewServer("test").scanPlan(targets, "quick", false)
 }
 
 // okOutcome is a clean, complete run of the given rows.
 func okOutcome(rows []ui.Row) engine.Outcome {
 	return engine.Outcome{Status: engine.StatusComplete, Rows: rows}
+}
+
+// The history key needs a discriminator for the preset, because the web has no
+// port box and every preset would otherwise share one baseline. That
+// discriminator is a label, not a port list — feeding it to the scanner asks
+// for ports named "preset:quick", which matches nothing and silently scans no
+// ports at all.
+func TestScanPlanDoesNotPassTheHistoryLabelAsPorts(t *testing.T) {
+	plan := webPlan([]string{"192.0.2.1"})
+
+	if plan.Ports != "" {
+		t.Errorf("Plan.Ports = %q, want empty so the preset chooses", plan.Ports)
+	}
+	if plan.HistoryPorts == "" {
+		t.Error("the preset must still reach the history key")
+	}
+	// The key must carry the discriminator so two presets never share a baseline.
+	if got := (engine.Outcome{}).ScanKey(plan); got.Ports != plan.HistoryPorts {
+		t.Errorf("ScanKey ports = %q, want the history label %q", got.Ports, plan.HistoryPorts)
+	}
 }
