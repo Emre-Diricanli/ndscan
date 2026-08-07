@@ -55,6 +55,14 @@ func dir() string {
 	return filepath.Join(home, ".config", "ndscan")
 }
 
+// Dir is the directory ndscan keeps its state in.
+//
+// Exported so sibling packages store their data alongside config and history
+// rather than each re-deriving the location. Three copies of this resolution
+// would drift the first time the override rules change, and the symptom would
+// be state silently written somewhere nobody looks.
+func Dir() string { return dir() }
+
 func configPath() string { return filepath.Join(dir(), "config.json") }
 func historyDir() string { return filepath.Join(dir(), "history") }
 
@@ -217,6 +225,17 @@ func SaveHistory(k ScanKey, snaps []HostSnapshot) error {
 // truth discards a good baseline in favour of a useless one.
 func SaveEligible(cancelled bool, failed int, hosts int) bool {
 	return !cancelled && failed == 0 && hosts > 0
+}
+
+// WriteFileAtomic writes data to path via a temp file and a rename, skipping
+// the write entirely when the contents already match.
+//
+// Exported for sibling packages that persist state alongside config: the
+// same-contents check is what keeps watch mode from rewriting files every
+// interval, and the rename is what stops an interrupted write from leaving
+// truncated JSON behind.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeIfChanged(path, data, perm)
 }
 
 // writeIfChanged avoids watch-mode disk churn and replaces files atomically,

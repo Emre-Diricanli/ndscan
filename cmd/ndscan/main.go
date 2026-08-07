@@ -73,6 +73,7 @@ func main() {
 		noOpen         bool
 		discoverOnly   bool
 		fastDiscover   bool
+		mdns           bool
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
@@ -192,6 +193,7 @@ Otherwise, nmap runs locally.`,
 				ShowMAC: showMac, ShowVendors: showVendors, RootScan: rootScan,
 				Concurrency: concurrency, HostTimeout: time.Duration(hostTimeoutSec) * time.Second,
 				Fast: fastDiscover, DiscoverOnly: discoverOnly, Hostnames: true,
+				Multicast: mdns,
 			}
 			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
 			var progressMu sync.Mutex
@@ -344,6 +346,7 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
 	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
 	scanCmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open HTML reports in the browser")
+	scanCmd.Flags().BoolVar(&mdns, "mdns", false, "ask the network for its own names via mDNS/SSDP (adds a few seconds)")
 	scanCmd.Flags().BoolVar(&fastDiscover, "fast", false, "native ARP+TCP host discovery (no nmap, no root) — much faster on a LAN")
 	scanCmd.Flags().BoolVar(&discoverOnly, "discover", false, "only list live hosts (skip the port scan) — fastest")
 	scanCmd.Flags().BoolVar(&showMac, "show-mac", false, "include MAC addresses (same L2 only)")

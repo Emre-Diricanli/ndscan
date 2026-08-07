@@ -54,6 +54,11 @@ type Plan struct {
 	DiscoverOnly bool
 	// Hostnames runs reverse-DNS enrichment once the rows are built.
 	Hostnames bool
+	// Multicast additionally asks the network what it calls itself, via mDNS
+	// and SSDP. It finds names PTR cannot — most LANs have no reverse zone —
+	// and it is the only pass that learns anything about devices which never
+	// answer a TCP probe. Bounded by its own timeouts.
+	Multicast bool
 }
 
 // Status describes how a run ended. It exists so that "we looked and found
@@ -327,7 +332,7 @@ func (e *Engine) Run(ctx context.Context, p Plan, emit Emit) Outcome {
 		return out
 	}
 	if p.Hostnames {
-		e.enrich(ctx, emit, &out)
+		e.enrich(ctx, p, emit, &out)
 	}
 
 	sortRows(out.Rows)

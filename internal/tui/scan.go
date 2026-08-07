@@ -109,6 +109,9 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			Fast: true,
 			// The TUI has always resolved hostnames once the rows are built.
 			Hostnames: true,
+			// Ask the network what it calls itself: the map is far more
+			// useful with "Living-Room-TV" than another bare address.
+			Multicast: true,
 		}
 
 		emit := func(e engine.Event) {
