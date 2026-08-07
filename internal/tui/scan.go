@@ -5,16 +5,14 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
-	"github.com/Emre-Diricanli/ndscan/internal/enrich"
-	"github.com/Emre-Diricanli/ndscan/internal/scan"
+	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
-	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
 // scanParams is the resolved configuration captured from the form.
@@ -33,7 +31,7 @@ type scanParams struct {
 // ----- messages streamed from the scan goroutine into the Bubble Tea loop -----
 
 type phaseMsg struct {
-	phase string // "discover" | "mac" | "scan"
+	phase string // "discover" | "mac" | "scan" | "enrich"
 	done  int
 	total int
 }
@@ -84,6 +82,10 @@ func nmapAvailable(sshTarget string) bool {
 
 // runScan launches the scan in a background goroutine, returning the channel
 // that progress and result messages are delivered on, plus a cancel func.
+//
+// The pipeline itself — discover, merge the ARP cache, scan ports, enrich
+// hostnames — lives in internal/engine; this adapter translates scanParams
+// into an engine.Plan and engine events into the Bubble Tea messages above.
 func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 	ch := make(chan tea.Msg, 64)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -91,218 +93,83 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 	go func() {
 		defer close(ch)
 		defer cancel()
-		start := time.Now()
-		var timings phaseTimings
-		var firstScanErr error
-		fallbacks := 0
-		var runner scan.Runner
-		if p.sshTarget != "" {
-			runner = scan.NewRunner(p.sshTarget)
-		} else {
-			runner = scan.NewLocalRunner()
+
+		plan := engine.Plan{
+			SSHTarget:   p.sshTarget,
+			Targets:     p.targets,
+			Preset:      p.preset,
+			Ports:       p.ports,
+			ShowMAC:     p.showMac,
+			ShowVendors: p.showVendors,
+			RootScan:    p.rootScan,
+			Concurrency: p.concurrency,
+			HostTimeout: p.hostTimeout,
+			// Fast is a preference, not a guarantee: the engine runs the
+			// native sweep only where it is viable (not over SSH) and reports
+			// what actually ran via Outcome.Fast, which feeds the history key.
+			Fast: true,
+			// The TUI has always resolved hostnames once the rows are built.
+			Hostnames: true,
 		}
 
-		// Which discovery path ran is only known once the switch below picks one,
-		// and it belongs in the history key: the native sweep and an nmap scan
-		// legitimately find different hosts, so comparing one against the other
-		// invents arrivals and departures that never happened.
-		usedFast := false
-
-		finish := func(rows []ui.Row, failed int, cancelled bool) {
-			key := config.ScanKey{Targets: p.targets, Ports: p.ports, Preset: p.preset, Fast: usedFast}
-			prev := config.LoadHistory(key)
-			cur := make([]config.HostSnapshot, 0, len(rows))
-			for _, r := range rows {
-				cur = append(cur, config.HostSnapshot{IP: r.IP, Host: r.Host, Up: r.Up, Ports: r.Ports})
-			}
-			var diff map[string]config.HostDiff
-			// failed/partial scans must not poison history, and neither may a
-			// scan that found nothing at all — zero hosts is far more often a
-			// dropped VPN than an empty network.
-			if config.SaveEligible(cancelled, failed, len(cur)) {
-				diff = config.Diff(prev, cur)
-				_ = config.SaveHistory(key, cur)
-			}
-			ch <- doneMsg{
-				rows:      rows,
-				failed:    failed,
-				elapsed:   time.Since(start),
-				cancelled: cancelled,
-				diff:      diff,
-				timings:   timings,
-				firstErr:  firstScanErr,
-				fallbacks: fallbacks,
-			}
-		}
-
-		ch <- phaseMsg{phase: "discover"}
-		discoveryStart := time.Now()
-		nmapMACWorthwhile := p.sshTarget != "" || scan.IsRoot()
-		var live []string
-		var discoveredMACs map[string]string
-		var err error
-		switch {
-		case scan.NativeDiscoverySupported(runner):
-			// Native ARP + TCP sweep: no nmap, no root, and roughly 15-20x
-			// faster than `nmap -sn` on a LAN because the timeout policy is
-			// ours. Only valid locally — over SSH the probes would originate
-			// from the wrong machine.
-			usedFast = true
-			live, discoveredMACs, err = scan.NativeDiscovery(ctx, p.targets, runner,
-				func(done, total int) {
-					// Non-blocking: the sweep fans out across thousands of
-					// goroutines, and a full channel (or a cancelled scan whose
-					// reader has stopped) must never stall them.
-					select {
-					case ch <- phaseMsg{phase: "discover", done: done, total: total}:
-					default:
-					}
-				})
-		case p.showMac && nmapMACWorthwhile:
-			live, discoveredMACs, err = scan.HostDiscoveryWithMACs(ctx, p.targets, runner)
-		default:
-			live, err = scan.HostDiscovery(ctx, p.targets, runner)
-		}
-		if err != nil {
-			if ctx.Err() != nil {
-				finish(nil, 0, true)
-				return
-			}
-			ch <- errMsg{err}
-			return
-		}
-		// Native discovery reports cancellation by returning early rather than
-		// by erroring, so check the context directly — otherwise a cancelled
-		// scan would be reported as a completed one.
-		if ctx.Err() != nil {
-			finish(nil, 0, true)
-			return
-		}
-		timings.discovery = time.Since(discoveryStart)
-
-		// ARP-cache fallback: recover neighbors and MACs that unprivileged
-		// nmap misses. Always read it — MACs are free and require no root.
-		enrichmentStart := time.Now()
-		arpMap := scan.ARPCache(ctx, runner)
-		live = scan.MergeARPHosts(live, p.targets, arpMap)
-
-		if len(live) == 0 {
-			finish(nil, 0, false)
-			return
-		}
-
-		// Build the MAC map. The ARP cache already covers every L2 neighbor
-		// for free, so we only run the extra nmap -sn MAC sweep when it can do
-		// better: as root locally (a real ARP scan), or over SSH (the remote
-		// host's privileges/cache, which we can't introspect from here).
-		// A local unprivileged nmap pass just duplicates the ARP data at the
-		// cost of a whole extra sweep, so we skip it.
-		macMap := map[string]string{}
-		if p.showMac && nmapMACWorthwhile {
-			for ip, mac := range discoveredMACs {
-				macMap[ip] = mac
-			}
-		}
-		for ip, mac := range arpMap {
-			if _, ok := macMap[ip]; !ok {
-				macMap[ip] = mac
-			}
-		}
-
-		var oui vendor.DB
-		if p.showMac && p.showVendors {
-			oui = vendor.LoadDefault()
-		}
-		timings.enrichment = time.Since(enrichmentStart)
-
-		// Stream each host's parsed rows as its scan completes.
-		var mu sync.Mutex
-		var streamed []ui.Row
-		failed := 0
-		cfg := scan.Config{
-			Preset:         p.preset,
-			Ports:          p.ports,
-			UseSYN:         p.rootScan,
-			Concurrency:    p.concurrency,
-			HostTimeout:    p.hostTimeout,
-			DisableVendors: !(p.showMac && p.showVendors),
-			NeedMAC:        p.showMac,
-			BatchSize:      16,
-			DiscardResults: true,
-			Progress: func(done, total int) {
-				ch <- phaseMsg{phase: "scan", done: done, total: total}
-			},
-			OnResult: func(r scan.HostResult) {
-				if r.Err != nil {
-					mu.Lock()
-					if ctx.Err() == nil {
-						failed += maxInt(1, len(r.Targets))
-						if firstScanErr == nil {
-							firstScanErr = r.Err
-						}
-					}
-					mu.Unlock()
-					return
-				}
-				if r.Fallback {
-					mu.Lock()
-					fallbacks += maxInt(1, len(r.Targets))
-					mu.Unlock()
-				}
-				rows := ui.BuildRows([]scan.HostResult{r}, oui, p.showMac, p.showVendors, macMap)
-				if len(rows) == 0 {
-					return
-				}
-				mu.Lock()
-				streamed = append(streamed, rows...)
-				mu.Unlock()
-				ch <- hostRowMsg{rows: rows}
-			},
-		}
-		ch <- phaseMsg{phase: "scan", done: 0, total: len(live)}
-
-		portStart := time.Now()
-		if scan.NativePortScanViable(cfg, runner) {
-			// Native connect scan: ~70x faster than shelling out to nmap for
-			// the same port set, because every probe runs concurrently under one
-			// timeout policy. cfg.OnResult fires as each host finishes, so rows
-			// appear while the slowest addresses are still timing out — the
-			// returned slice is deliberately discarded, since consuming it would
-			// mean waiting for exactly that laggard before drawing anything.
-			scan.NativePortScan(ctx, live, cfg, func(done, total int) {
+		// inEnrich gates row forwarding: the enrich phase re-emits the full row
+		// set with hostnames filled in, and the running screen appends what it
+		// receives, so forwarding those would draw every host twice. The final
+		// rows arrive with doneMsg regardless.
+		var inEnrich atomic.Bool
+		emit := func(e engine.Event) {
+			switch e.Kind {
+			case engine.EventPhase:
+				inEnrich.Store(e.Phase == engine.PhaseEnrich)
+				// Non-blocking: the sweep fans out across thousands of
+				// goroutines, and a full channel (or a cancelled scan whose
+				// reader has stopped) must never stall them.
 				select {
-				case ch <- phaseMsg{phase: "scan", done: done, total: total}:
+				case ch <- phaseMsg{phase: string(e.Phase), done: e.Done, total: e.Total}:
 				default:
 				}
-			})
-		} else {
-			_, err = scan.ScanHosts(ctx, live, cfg, runner)
+			case engine.EventRows:
+				if inEnrich.Load() {
+					return
+				}
+				ch <- hostRowMsg{rows: e.Rows}
+			}
 		}
-		timings.ports = time.Since(portStart)
-		mu.Lock()
-		rows := append([]ui.Row(nil), streamed...)
-		nFailed := failed
-		mu.Unlock()
 
-		if ctx.Err() != nil {
-			finish(rows, nFailed, true)
-			return
-		}
-		if err != nil {
-			ch <- errMsg{err}
+		out := engine.New().Run(ctx, plan, emit)
+		if out.Status == engine.StatusFailed {
+			ch <- errMsg{err: out.Err}
 			return
 		}
 
-		// Hostnames come last: the native path learns none during the scan, and
-		// resolving them up front would trade the streaming latency we just
-		// bought for a column of names. Bounded internally, so a stalled
-		// resolver cannot hold up the result.
-		//
-		// The enriched rows go out via finish rather than a second hostRowMsg —
-		// the running screen appends what it receives, so re-sending would show
-		// every host twice.
-		ui.ApplyHostnames(rows, enrich.LookupPTR(ctx, rowIPs(rows), enrich.Config{}))
-		finish(rows, nFailed, false)
+		// History: only a complete, non-empty run may become the baseline that
+		// later scans are compared against — a cancelled, partial, or empty run
+		// is indistinguishable from a network where everything vanished, and
+		// saving it would make the next scan report the whole network as new.
+		// The key carries Outcome.Fast because the native sweep and an nmap
+		// scan legitimately find different hosts.
+		key := out.ScanKey(plan)
+		prev := config.LoadHistory(key)
+		var diff map[string]config.HostDiff
+		if out.Comparable() {
+			cur := out.Snapshots()
+			diff = config.Diff(prev, cur)
+			_ = config.SaveHistory(key, cur)
+		}
+		ch <- doneMsg{
+			rows:      out.Rows,
+			failed:    out.Failed,
+			elapsed:   out.Timings.Total,
+			cancelled: out.Status == engine.StatusCancelled,
+			diff:      diff,
+			timings: phaseTimings{
+				discovery:  out.Timings.Discovery,
+				enrichment: out.Timings.Enrichment,
+				ports:      out.Timings.Ports,
+			},
+			firstErr:  out.FirstErr,
+			fallbacks: out.Fallbacks,
+		}
 	}()
 
 	return ch, cancel
@@ -346,13 +213,4 @@ func localCIDR() string {
 		}
 	}
 	return ""
-}
-
-// rowIPs collects the addresses from a row set, for lookups keyed by IP.
-func rowIPs(rows []ui.Row) []string {
-	out := make([]string, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.IP)
-	}
-	return out
 }
