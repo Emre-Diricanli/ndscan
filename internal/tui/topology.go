@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -15,13 +16,14 @@ import (
 // Glyphs for the map. Kept in one place so the visual language stays
 // consistent, and so a future ASCII-only fallback has a single switch point.
 const (
-	glyphSelf    = "▚" // this machine
-	glyphGateway = "⌂" // default gateway
-	glyphHost    = "▪" // ordinary host
-	glyphScanned = "◆" // segment was scanned
-	glyphUnknown = "○" // segment attached but not scanned
-	glyphRisk    = "⚠"
-	glyphRouted  = "⇢" // segment reached through the gateway, not attached
+	glyphSelf     = "▚" // this machine
+	glyphGateway  = "⌂" // default gateway
+	glyphHost     = "▪" // ordinary host
+	glyphScanned  = "◆" // segment was scanned
+	glyphUnknown  = "○" // segment attached but not scanned
+	glyphRisk     = "⚠"
+	glyphRouted   = "⇢" // segment reached through the gateway, not attached
+	glyphInferred = "≈" // network boundary was inferred rather than observed
 )
 
 // topologyView renders the network map: every network this machine is attached
@@ -44,7 +46,7 @@ func (m Model) renderTopology(tm topology.Map) string {
 	locals := m.netLocals
 	gw := m.netGateway
 
-	if len(tm.Segments) == 0 {
+	if len(tm.Segments) == 0 && len(tm.Orphans) == 0 {
 		return hintStyle.Render("  No networks detected. Run a scan to populate the map.")
 	}
 
@@ -53,6 +55,7 @@ func (m Model) renderTopology(tm topology.Map) string {
 	b.WriteString("  " + hintStyle.Render(fmt.Sprintf(
 		"%s this machine   %s gateway   %s host   %s routed   %s risk",
 		glyphSelf, glyphGateway, glyphHost, glyphRouted, glyphRisk)) + "\n")
+	b.WriteString("  " + hintStyle.Render(glyphInferred+" inferred boundary = guessed network boundary   outside known networks = answered hosts with no known network") + "\n")
 	b.WriteString("  " + hintStyle.Render("press ") + keyStyle.Render("S") +
 		hintStyle.Render(" to sweep sibling subnets (VLANs beyond your own)") + "\n\n")
 
@@ -61,11 +64,14 @@ func (m Model) renderTopology(tm topology.Map) string {
 	b.WriteString("  " + hintStyle.Render("│") + "\n")
 
 	for si, seg := range tm.Segments {
-		last := si == len(tm.Segments)-1
+		last := si == len(tm.Segments)-1 && len(tm.Orphans) == 0
 		b.WriteString(m.renderSegment(seg, last, gw))
 		if !last {
 			b.WriteString("  " + hintStyle.Render("│") + "\n")
 		}
+	}
+	if len(tm.Orphans) > 0 {
+		b.WriteString(m.renderOrphans(tm.Orphans))
 	}
 	return b.String()
 }
@@ -215,6 +221,9 @@ func (m Model) renderSegment(seg topology.Segment, last bool, gw netinfo.Gateway
 	} else {
 		head += "  " + okStyle.Render(fmt.Sprintf("%s scanned · %d host(s)", glyphScanned, seg.HostCount()))
 	}
+	if seg.Inferred {
+		head += "  " + hintStyle.Render(glyphInferred+" inferred boundary")
+	}
 	b.WriteString(head + "\n")
 
 	if seg.NotScanned {
@@ -252,6 +261,41 @@ func (m Model) renderSegment(seg topology.Segment, last bool, gw netinfo.Gateway
 			branch = "└─"
 		}
 		b.WriteString(hintStyle.Render("  "+cont+" "+branch+" ") + m.renderNode(n, seg, addrW, nameW) + "\n")
+	}
+	return b.String()
+}
+
+// renderOrphans keeps answered hosts outside the segment tree because placing
+// them beneath any CIDR would turn an unknown relationship into a claimed one.
+// It comes last so a large set of unknowns cannot push observed networks out of
+// a short viewport while every host that answered remains individually visible.
+func (m Model) renderOrphans(nodes []topology.Node) string {
+	nodes = append([]topology.Node(nil), nodes...)
+	sort.SliceStable(nodes, func(i, j int) bool {
+		return ui.IPLess(nodes[i].Row.IP, nodes[j].Row.IP)
+	})
+
+	var b strings.Builder
+	b.WriteString(hintStyle.Render("  └─ ") + labelFocusedStyle.Render("answered hosts outside known networks") + "\n")
+	addrW, nameW := 0, 0
+	for _, n := range nodes {
+		if w := lipgloss.Width(n.Row.IP); w > addrW {
+			addrW = w
+		}
+		if w := lipgloss.Width(nodeName(n)); w > nameW {
+			nameW = w
+		}
+	}
+	if nameW > 18 {
+		nameW = 18
+	}
+	for i, n := range nodes {
+		branch := "├─"
+		if i == len(nodes)-1 {
+			branch = "└─"
+		}
+		b.WriteString(hintStyle.Render("       "+branch+" ") +
+			m.renderNode(n, topology.Segment{}, addrW, nameW) + "\n")
 	}
 	return b.String()
 }
