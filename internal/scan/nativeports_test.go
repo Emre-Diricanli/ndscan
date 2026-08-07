@@ -2,10 +2,17 @@ package scan
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,6 +231,214 @@ func TestSyntheticXML_RoundTripsTLSCertificate(t *testing.T) {
 	if cert == nil || cert.Organization != "GLKVM" || cert.CommonName != "device" || cert.Issuer != "issuer" || cert.NotAfter != "2030-04-05T06:07:08" {
 		t.Fatalf("certificate = %+v (XML: %s)", cert, xmlBytes)
 	}
+}
+
+func TestNativePortScan_TLSIdentificationRoundTripsCertificate(t *testing.T) {
+	ln, port, connections := tlsTestListener(t, "GLKVM")
+	stubNativePortResult(t, sweep.PortResult{IP: "127.0.0.1", Ports: []sweep.OpenPort{{Port: port, Service: "https"}}})
+	metadata := map[string]NativeMetadata{"127.0.0.1": {IdentifyTLS: true}}
+
+	results := NativePortScanWithMetadata(context.Background(), []string{"127.0.0.1"}, metadata,
+		Config{Ports: strconv.Itoa(port), Concurrency: 1}, nil)
+	if connections.Load() != 1 {
+		t.Fatalf("TLS handshakes = %d, want 1", connections.Load())
+	}
+	nr, err := ParseOne(results[0].XMLBytes)
+	if err != nil {
+		t.Fatalf("ParseOne: %v", err)
+	}
+	parsed := nr.Hosts[0].Ports.List[0]
+	cert := parsed.TLSCert()
+	if cert == nil || cert.Organization != "GLKVM" {
+		t.Fatalf("certificate = %+v (XML: %s)", cert, results[0].XMLBytes)
+	}
+	if parsed.Service.Tunnel != "ssl" || parsed.Service.Product != "GLKVM" {
+		t.Fatalf("service = %+v", parsed.Service)
+	}
+	ln.Close()
+}
+
+func TestNativePortScan_TLSDisabledByDefault(t *testing.T) {
+	ln, port, connections := tlsTestListener(t, "must-not-connect")
+	stubNativePortResult(t, sweep.PortResult{IP: "127.0.0.1", Ports: []sweep.OpenPort{{Port: port, Service: "https"}}})
+
+	NativePortScanWithMetadata(context.Background(), []string{"127.0.0.1"},
+		map[string]NativeMetadata{"127.0.0.1": {}}, Config{Ports: strconv.Itoa(port)}, nil)
+	time.Sleep(50 * time.Millisecond)
+	if connections.Load() != 0 {
+		t.Fatalf("TLS disabled but listener accepted %d connections", connections.Load())
+	}
+	ln.Close()
+}
+
+func TestNativePortScan_NonTLSPortIsOmittedWithoutHang(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			conn.Write([]byte("not tls\n"))
+			conn.Close()
+		}
+	}()
+	port := listenerPort(t, ln)
+	stubNativePortResult(t, sweep.PortResult{IP: "127.0.0.1", Ports: []sweep.OpenPort{{Port: port, Service: "https"}}})
+	metadata := map[string]NativeMetadata{"127.0.0.1": {
+		IdentifyTLS: true,
+		TLSConfig:   enrich.TLSConfig{HostTimeout: 200 * time.Millisecond, OverallTimeout: time.Second},
+	}}
+	started := time.Now()
+	results := NativePortScanWithMetadata(context.Background(), []string{"127.0.0.1"}, metadata, Config{Ports: strconv.Itoa(port)}, nil)
+	if time.Since(started) > time.Second {
+		t.Fatal("non-TLS endpoint held up the scan")
+	}
+	nr, err := ParseOne(results[0].XMLBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert := nr.Hosts[0].Ports.List[0].TLSCert(); cert != nil {
+		t.Fatalf("non-TLS endpoint produced certificate %+v", cert)
+	}
+}
+
+func TestNativePortScan_TLSPerScanEndpointCap(t *testing.T) {
+	var listeners []net.Listener
+	var ports []int
+	var accepted []*atomic.Int32
+	for range 3 {
+		ln, port, count := tlsTestListener(t, "capped")
+		listeners = append(listeners, ln)
+		ports = append(ports, port)
+		accepted = append(accepted, count)
+	}
+	t.Cleanup(func() {
+		for _, ln := range listeners {
+			ln.Close()
+		}
+	})
+	open := make([]sweep.OpenPort, 0, len(ports))
+	for _, port := range ports {
+		open = append(open, sweep.OpenPort{Port: port, Service: "https"})
+	}
+	stubNativePortResult(t, sweep.PortResult{IP: "127.0.0.1", Ports: open})
+	metadata := map[string]NativeMetadata{"127.0.0.1": {IdentifyTLS: true, TLSMaxEndpoints: 2}}
+	NativePortScanWithMetadata(context.Background(), []string{"127.0.0.1"}, metadata, Config{Ports: "443"}, nil)
+	var total int32
+	for _, count := range accepted {
+		total += count.Load()
+	}
+	if total != 2 {
+		t.Fatalf("TLS handshakes = %d, want cap of 2", total)
+	}
+}
+
+func TestNativePortScan_CancellationStopsTLSEnrichment(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(accepted)
+		buf := make([]byte, 1)
+		conn.Read(buf)
+	}()
+	port := listenerPort(t, ln)
+	stubNativePortResult(t, sweep.PortResult{IP: "127.0.0.1", Ports: []sweep.OpenPort{{Port: port, Service: "https"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NativePortScanWithMetadata(ctx, []string{"127.0.0.1"}, map[string]NativeMetadata{"127.0.0.1": {
+			IdentifyTLS: true,
+			TLSConfig:   enrich.TLSConfig{HostTimeout: 10 * time.Second, OverallTimeout: 10 * time.Second},
+		}}, Config{Ports: strconv.Itoa(port)}, nil)
+	}()
+	select {
+	case <-accepted:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("TLS connection was not attempted")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scan did not stop after cancellation")
+	}
+}
+
+func stubNativePortResult(t *testing.T, result sweep.PortResult) {
+	t.Helper()
+	original := scanNativePorts
+	t.Cleanup(func() { scanNativePorts = original })
+	scanNativePorts = func(_ context.Context, _ []string, cfg sweep.PortConfig) []sweep.PortResult {
+		if cfg.Progress != nil {
+			cfg.Progress(1, 1)
+		}
+		return []sweep.PortResult{result}
+	}
+}
+
+func tlsTestListener(t *testing.T, organization string) (net.Listener, int, *atomic.Int32) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "device", Organization: []string{organization}},
+		Issuer:       pkix.Name{CommonName: "test issuer"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections := &atomic.Int32{}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			go func() {
+				defer conn.Close()
+				tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}}).Handshake()
+			}()
+		}
+	}()
+	return ln, listenerPort(t, ln), connections
+}
+
+func listenerPort(t *testing.T, ln net.Listener) int {
+	t.Helper()
+	_, portString, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 func TestNativePortScanViable(t *testing.T) {
