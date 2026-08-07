@@ -2,23 +2,25 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jedib0t/go-pretty/v6/text"
 	"github.com/spf13/cobra"
 
-	"github.com/Emre-Diricanli/ndscan/internal/enrich"
+	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/update"
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
-	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 	"github.com/Emre-Diricanli/ndscan/internal/web"
 )
 
@@ -170,13 +172,6 @@ Otherwise, nmap runs locally.`,
 			ui.Banner(version)
 			start := time.Now()
 
-			// Choose runner (local or ssh)
-			var runner scan.Runner
-			if sshTarget != "" {
-				runner = scan.NewRunner(sshTarget)
-			} else {
-				runner = scan.NewLocalRunner()
-			}
 			where := "locally"
 			if sshTarget != "" {
 				where = "via " + sshTarget
@@ -192,118 +187,98 @@ Otherwise, nmap runs locally.`,
 				return err
 			}
 
-			cfg := scan.Config{
-				Preset:         preset,      // quick|default|udp|deep
-				Ports:          ports,       // "22,80,443" or "1-1024"
-				UseSYN:         rootScan,    // -sS (root) vs -sT
-				Concurrency:    concurrency, // per-host workers
-				HostTimeout:    time.Duration(hostTimeoutSec) * time.Second,
-				DisableVendors: !(showMac && showVendors),
-				NeedMAC:        showMac,
-				BatchSize:      16,
+			plan := engine.Plan{
+				SSHTarget: sshTarget, Targets: targets, Preset: preset, Ports: ports,
+				ShowMAC: showMac, ShowVendors: showVendors, RootScan: rootScan,
+				Concurrency: concurrency, HostTimeout: time.Duration(hostTimeoutSec) * time.Second,
+				Fast: fastDiscover, DiscoverOnly: discoverOnly, Hostnames: true,
 			}
-
-			// 1) host discovery first (runs where runner points)
 			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
-			nmapMACWorthwhile := sshTarget != "" || scan.IsRoot()
-			var live []string
-			var discoveredMACs map[string]string
-			var err error
-			switch {
-			case fastDiscover && scan.NativeDiscoverySupported(runner):
-				// Native ARP + TCP sweep: no nmap, no root, ~20x faster on a LAN.
-				live, discoveredMACs, err = scan.NativeDiscovery(ctx, targets, runner, nil)
-			case showMac && nmapMACWorthwhile:
-				live, discoveredMACs, err = scan.HostDiscoveryWithMACs(ctx, targets, runner)
-			default:
-				live, err = scan.HostDiscovery(ctx, targets, runner)
+			var progressMu sync.Mutex
+			liveCount := 0
+			scanStarted := false
+			emit := func(ev engine.Event) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
+				if ev.Kind == engine.EventRows && liveCount == 0 {
+					liveCount = len(ev.Rows)
+				}
+				if ev.Kind == engine.EventWarning {
+					ui.Warnf("%s", ev.Warning)
+					return
+				}
+				if ev.Kind != engine.EventPhase || ev.Phase != engine.PhaseScan {
+					return
+				}
+				liveCount = ev.Total
+				if showMac {
+					// The engine owns MAC collection, so its count is available only
+					// in the terminal Outcome. Preserve message ordering after Run.
+					return
+				}
+				if !scanStarted {
+					sp.Success(fmt.Sprintf("Found %d live host(s)", ev.Total))
+					sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", ev.Total, preset, ev.Total))
+					scanStarted = true
+				}
+				// Which scanner is running is the engine's decision, reported
+				// on the event rather than recomputed here — a second copy of
+				// that rule would drift the first time the engine's changed.
+				if ev.Native {
+					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (native)… %d/%d", ev.Total, ev.Done, ev.Total))
+				} else {
+					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", ev.Total, preset, ev.Done, ev.Total))
+				}
 			}
-			if err != nil {
+			outcome := engine.New().Run(ctx, plan, emit)
+			if outcome.Status == engine.StatusFailed {
 				sp.Fail("Host discovery failed")
-				return err
+				return outcome.Err
 			}
-			// ARP-cache fallback: find neighbors + MACs unprivileged nmap misses.
-			arpMap := scan.ARPCache(ctx, runner)
-			live = scan.MergeARPHosts(live, targets, arpMap)
-			if len(live) == 0 {
+			if outcome.Status == engine.StatusCancelled {
+				sp.Fail("Port scan failed")
+				return ctx.Err()
+			}
+			if outcome.FirstErr != nil && outcome.Failed == 0 {
+				sp.Fail("Port scan failed")
+				return outcome.FirstErr
+			}
+			if len(outcome.Rows) == 0 {
 				sp.Fail("No live hosts found.")
 				return nil
 			}
-			sp.Success(fmt.Sprintf("Found %d live host(s)", len(live)))
-
-			// 1b) optional: collect MACs. The ARP cache covers every L2
-			// neighbor for free; only run the extra nmap -sn MAC sweep when it
-			// can do better (root locally, or over SSH where we can't tell).
-			var macMap map[string]string
-			if showMac {
-				sp = ui.StartSpinner("Collecting MAC addresses…")
-				macMap = map[string]string{}
-				if nmapMACWorthwhile {
-					for ip, mac := range discoveredMACs {
-						macMap[ip] = mac
-					}
-				}
-				for ip, mac := range arpMap {
-					if _, ok := macMap[ip]; !ok {
-						macMap[ip] = mac
-					}
-				}
-				sp.Success(fmt.Sprintf("Collected %d MAC address(es)", len(macMap)))
+			if liveCount == 0 {
+				liveCount = len(outcome.Rows)
 			}
-
-			// 2) parallel per-host scans (remote or local depending on runner).
-			// --discover skips the port scan entirely for a fast "who's up" view.
-			var results []scan.HostResult
+			if showMac {
+				sp.Success(fmt.Sprintf("Found %d live host(s)", liveCount))
+				sp = ui.StartSpinner("Collecting MAC addresses…")
+				sp.Success(fmt.Sprintf("Collected %d MAC address(es)", len(outcome.MACs)))
+			}
 			if discoverOnly {
+				if !showMac {
+					sp.Success(fmt.Sprintf("Found %d live host(s)", liveCount))
+				}
 				ui.Infof("Discover-only mode: skipping port scan")
-				results = scan.HostsUpResults(live)
 			} else {
-				sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… 0/%d", len(live), preset, len(live)))
-				cfg.Progress = func(done, total int) {
-					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", total, preset, done, total))
-				}
-				var err error
-				if fastDiscover && scan.NativePortScanViable(cfg, runner) {
-					// --fast means fast end-to-end: native connect scanning for
-					// ports too, not just discovery.
-					results = scan.NativePortScan(ctx, live, cfg, func(done, total int) {
-						sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (native)… %d/%d", total, done, total))
-					})
-				} else {
-					results, err = scan.ScanHosts(ctx, live, cfg, runner)
-				}
-				if err != nil {
-					sp.Fail("Port scan failed")
-					return err
+				if showMac {
+					sp = ui.StartSpinner(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", liveCount, preset, liveCount, liveCount))
 				}
 				sp.Success("Port scan complete")
-				if failed := countFailed(results); failed > 0 {
-					ui.Warnf("%d host(s) failed to scan (first error: %v)", failed, firstError(results))
+				if outcome.Failed > 0 {
+					ui.Warnf("%d host(s) failed to scan (first error: %v)", outcome.Failed, outcome.FirstErr)
 				}
-				if fallback := countFallback(results); fallback > 0 {
-					ui.Warnf("SYN unavailable for %d host(s); used TCP connect fallback", fallback)
+				if outcome.Fallbacks > 0 {
+					ui.Warnf("SYN unavailable for %d host(s); used TCP connect fallback", outcome.Fallbacks)
 				}
 			}
-
-			// 3) vendor DB (only if needed)
-			var oui vendor.DB
-			if showMac && showVendors {
-				oui = vendor.LoadDefault()
-			}
-
-			// Reverse-DNS enrichment. The native fast path never asks a
-			// resolver, so without this the hostname column is empty for
-			// exactly the scans users run most. Bounded internally, and
-			// registered once here so the table, tree, report, and JSON all
-			// render the same names.
-			ui.SetHostnames(enrich.LookupPTR(ctx, hostIPs(results), enrich.Config{}))
+			rows := outcome.Rows
 
 			// 4) output
 			// --report and --json are independent: passing both writes both.
 			// (The report branch used to return early, silently dropping the
 			// JSON file the user asked for.)
 			if reportOut != "" {
-				rows := ui.BuildRows(results, oui, showMac, showVendors, macMap)
 				rep := report.Report{
 					Targets:   strings.Join(targets, ", "),
 					Preset:    preset,
@@ -334,7 +309,14 @@ Otherwise, nmap runs locally.`,
 				}
 			}
 			if jsonOut != "" {
-				if err := ui.WriteJSONWithMACMap(results, oui, jsonOut, showMac, showVendors, macMap); err != nil {
+				b, err := json.MarshalIndent(rows, "", "  ")
+				if err != nil {
+					return err
+				}
+				if err := os.WriteFile(jsonOut, b, 0o644); err != nil {
+					return err
+				}
+				if err := userenv.Chown(jsonOut); err != nil {
 					return err
 				}
 				ui.Infof("Wrote JSON results to %s", jsonOut)
@@ -346,11 +328,11 @@ Otherwise, nmap runs locally.`,
 			fmt.Println()
 			switch view {
 			case "tree":
-				ui.PrintTreeWithMACMap(results, oui, showMac, showVendors, macMap)
+				ui.PrintTreeRows(rows, showMac, showVendors)
 			default:
-				ui.PrintTableWithMACMap(results, oui, showMac, showVendors, macMap)
+				ui.PrintTableRows(rows, showMac)
 			}
-			hostsUp, openPorts := ui.Summarize(results)
+			hostsUp, openPorts := ui.SummarizeRows(rows)
 			ui.PrintSummary(hostsUp, openPorts, time.Since(start))
 			return nil
 		},
@@ -484,38 +466,15 @@ func ensureRoot() (bool, error) {
 	return true, nil
 }
 
-func countFailed(results []scan.HostResult) int {
-	n := 0
-	for _, r := range results {
-		if r.Err != nil {
-			if len(r.Targets) > 0 {
-				n += len(r.Targets)
-			} else {
-				n++
-			}
-		}
-	}
-	return n
-}
-
-func countFallback(results []scan.HostResult) int {
-	n := 0
-	for _, r := range results {
-		if r.Fallback {
-			n += max(1, len(r.Targets))
-		}
-	}
-	return n
-}
-
-func firstError(results []scan.HostResult) error {
-	for _, r := range results {
-		if r.Err != nil {
-			return r.Err
-		}
-	}
-	return nil
-}
+var (
+	cliAccent = text.Colors{text.FgHiCyan}
+	cliBold   = text.Colors{text.Bold}
+	cliDim    = text.Colors{text.FgHiBlack}
+	cliOK     = text.Colors{text.FgHiGreen}
+	cliWarn   = text.Colors{text.FgHiYellow}
+	cliErr    = text.Colors{text.FgHiRed}
+	cliTitle  = text.Colors{text.FgHiCyan, text.Bold}
+)
 
 // validPresets and validViews are the accepted values for --preset and --view.
 // Unknown values used to fall through to a default, silently producing a scan
@@ -576,15 +535,4 @@ func looksLikeSSHTarget(s string) bool {
 		return false
 	}
 	return true
-}
-
-// hostIPs collects the addresses from a result set, for lookups keyed by IP.
-func hostIPs(res []scan.HostResult) []string {
-	out := make([]string, 0, len(res))
-	for _, r := range res {
-		if r.IP != "" {
-			out = append(out, r.IP)
-		}
-	}
-	return out
 }

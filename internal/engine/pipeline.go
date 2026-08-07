@@ -99,7 +99,11 @@ func (e *Engine) scanPorts(
 	}
 
 	portStart := time.Now()
-	emit.phase(PhaseScan, 0, len(live))
+	native := scan.NativePortScanViable(scan.Config{
+		Preset: p.Preset, Ports: p.Ports, UseSYN: p.RootScan,
+		Concurrency: p.Concurrency, HostTimeout: p.HostTimeout,
+	}, runner)
+	emit.scanPhase(0, len(live), native)
 
 	var (
 		mu      sync.Mutex
@@ -120,7 +124,7 @@ func (e *Engine) scanPorts(
 		// The raw XML is consumed by OnResult as each host lands, so retaining
 		// it would only grow memory across a large or deep scan.
 		DiscardResults: true,
-		Progress:       func(done, total int) { emit.phase(PhaseScan, done, total) },
+		Progress:       func(done, total int) { emit.scanPhase(done, total, native) },
 		OnResult: func(r scan.HostResult) {
 			// ScanHosts reports per-host failures through HostResult.Err rather
 			// than through its returned error, so a run can lose hosts and
@@ -158,13 +162,13 @@ func (e *Engine) scanPorts(
 		},
 	}
 
-	if scan.NativePortScanViable(cfg, runner) {
+	if native {
 		// Native connect scan: far faster than shelling out to nmap for the
 		// same port set, because every probe runs concurrently under one
 		// timeout policy. The returned slice is discarded because OnResult has
 		// already delivered every row.
 		scan.NativePortScan(ctx, live, cfg, func(done, total int) {
-			emit.phase(PhaseScan, done, total)
+			emit.scanPhase(done, total, true)
 		})
 	} else if _, err := scan.ScanHosts(ctx, live, cfg, runner); err != nil {
 		mu.Lock()

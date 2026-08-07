@@ -321,8 +321,16 @@ func extractPortNumber(label string) string {
 // ====== TABLE (port numbers only) ======
 
 func PrintTableWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, macMap map[string]string) {
-	rows := BuildRows(res, db, showMac, showVendors, macMap)
+	PrintTableRows(BuildRows(res, db, showMac, showVendors, macMap), showMac)
+}
 
+// PrintTableRows renders rows that have already been built.
+//
+// The scan pipeline hands its callers []Row rather than raw nmap results, so
+// the renderers have to start from the same place. Keeping one implementation
+// here — rather than a second copy in whichever front end needed rows — is what
+// stops the table drifting between the CLI and everything else.
+func PrintTableRows(rows []Row, showMac bool) {
 	t := table.NewWriter()
 	t.SetOutputMirror(os.Stdout)
 	t.SetStyle(table.StyleRounded)
@@ -391,6 +399,16 @@ func riskCell(ports []PortInfo) string {
 
 // Summarize returns the number of hosts that are up and the total count of
 // open ports across all results, for the post-scan summary line.
+func SummarizeRows(rows []Row) (hostsUp, openPorts int) {
+	for _, r := range rows {
+		if r.Up {
+			hostsUp++
+		}
+		openPorts += len(r.Ports)
+	}
+	return
+}
+
 func Summarize(res []scan.HostResult) (hostsUp, openPorts int) {
 	for _, r := range flatten(res) {
 		if r.Up {
@@ -437,7 +455,11 @@ func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showM
 // ====== TREE (detailed labels) ======
 
 func PrintTreeWithMACMap(res []scan.HostResult, db vendor.DB, showMac, showVendors bool, macMap map[string]string) {
-	rows := BuildRows(res, db, showMac, showVendors, macMap)
+	PrintTreeRows(BuildRows(res, db, showMac, showVendors, macMap), showMac, showVendors)
+}
+
+// PrintTreeRows renders the tree view from rows that have already been built.
+func PrintTreeRows(rows []Row, showMac, showVendors bool) {
 
 	branch := cDim.Sprint("├─")
 	leaf := cDim.Sprint("└─")

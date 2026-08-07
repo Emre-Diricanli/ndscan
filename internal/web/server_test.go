@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -361,11 +362,11 @@ func TestFinishScanPersistsAndDiffsHistory(t *testing.T) {
 	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
 	targets := []string{"192.0.2.1"}
 	s := NewServer("test")
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+	s.finishScan(okOutcome([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}), webPlan(targets), time.Now(), netSnapshot{})
 	if got := config.LoadHistory(config.ScanKey{Targets: targets, Ports: s.portsFor("quick"), Preset: "quick"}); len(got) != 1 {
 		t.Fatalf("saved history = %+v", got)
 	}
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
+	s.finishScan(okOutcome([]ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"443/tcp https"}}}), webPlan(targets), time.Now(), netSnapshot{})
 	if !s.hasPrevious || s.diff["192.0.2.1"].PortsOpened[0] != "443" || s.diff["192.0.2.1"].PortsClosed[0] != "22" {
 		t.Errorf("history state: hasPrevious=%v diff=%+v", s.hasPrevious, s.diff)
 	}
@@ -392,19 +393,18 @@ func TestDiscoverRejectsNonIPs(t *testing.T) {
 func TestFinishScanDoesNotPersistIncompleteRuns(t *testing.T) {
 	targets := []string{"192.0.2.1"}
 	good := []ui.Row{{IP: "192.0.2.1", Up: true, Ports: []string{"22/tcp ssh"}}}
-	key := config.ScanKey{Targets: targets, Ports: "preset:quick", Preset: "quick"}
+	plan := webPlan(targets)
 
 	cases := []struct {
-		name    string
-		rows    []ui.Row
-		outcome scanOutcome
+		name string
+		out  engine.Outcome
 	}{
-		{"cancelled with no results", nil, scanOutcome{cancelled: true}},
-		{"cancelled with partial results", good, scanOutcome{cancelled: true}},
-		{"hosts failed to scan", good, scanOutcome{failed: 2}},
-		{"knowingly partial", good, scanOutcome{partial: true}},
+		{"cancelled with no results", engine.Outcome{Status: engine.StatusCancelled}},
+		{"cancelled with partial results", engine.Outcome{Status: engine.StatusCancelled, Rows: good}},
+		{"hosts failed to scan", engine.Outcome{Status: engine.StatusPartial, Rows: good, Failed: 2}},
+		{"outright failure", engine.Outcome{Status: engine.StatusFailed, Rows: good}},
 		// Finding nothing is nearly always a lost network, not an empty one.
-		{"found nothing", nil, scanOutcome{}},
+		{"found nothing", engine.Outcome{Status: engine.StatusComplete}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -413,15 +413,15 @@ func TestFinishScanDoesNotPersistIncompleteRuns(t *testing.T) {
 
 			// Establish a good baseline first, so the test proves the bad run is
 			// rejected rather than merely that nothing was ever written.
-			s.finishScan(good, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
-			base := config.LoadHistory(key)
+			s.finishScan(okOutcome(good), plan, time.Now(), netSnapshot{})
+			base := config.LoadHistory(engine.Outcome{}.ScanKey(plan))
 			if len(base) != 1 {
 				t.Fatalf("baseline not established: %+v", base)
 			}
 
-			s.finishScan(tc.rows, targets, "quick", false, time.Now(), tc.outcome, netSnapshot{})
+			s.finishScan(tc.out, plan, time.Now(), netSnapshot{})
 
-			if got := config.LoadHistory(key); !reflect.DeepEqual(got, base) {
+			if got := config.LoadHistory(engine.Outcome{}.ScanKey(plan)); !reflect.DeepEqual(got, base) {
 				t.Errorf("incomplete run overwrote the baseline: %+v", got)
 			}
 			if len(s.diff) != 0 {
@@ -438,12 +438,47 @@ func TestFinishScanSeparatesFastAndNmapHistory(t *testing.T) {
 	targets := []string{"192.0.2.1"}
 	s := NewServer("test")
 
-	s.finishScan([]ui.Row{{IP: "192.0.2.1", Up: true}}, targets, "quick", false, time.Now(), scanOutcome{}, netSnapshot{})
-	s.finishScan([]ui.Row{{IP: "192.0.2.9", Up: true}}, targets, "quick", true, time.Now(), scanOutcome{}, netSnapshot{})
+	nmapRun := okOutcome([]ui.Row{{IP: "192.0.2.1", Up: true}})
+	fastRun := okOutcome([]ui.Row{{IP: "192.0.2.9", Up: true}})
+	fastRun.Fast = true
+
+	s.finishScan(nmapRun, webPlan(targets), time.Now(), netSnapshot{})
+	s.finishScan(fastRun, webPlan(targets), time.Now(), netSnapshot{})
 
 	// The fast run is the first of its kind, so it has no previous scan to
 	// compare against and must not report the nmap run's host as departed.
 	if len(s.diff) != 0 {
 		t.Errorf("fast scan diffed against nmap history: %+v", s.diff)
+	}
+}
+
+// webPlan mirrors the plan runScan builds, so tests file history under the same
+// key the server really uses.
+func webPlan(targets []string) engine.Plan {
+	return NewServer("test").scanPlan(targets, "quick", false)
+}
+
+// okOutcome is a clean, complete run of the given rows.
+func okOutcome(rows []ui.Row) engine.Outcome {
+	return engine.Outcome{Status: engine.StatusComplete, Rows: rows}
+}
+
+// The history key needs a discriminator for the preset, because the web has no
+// port box and every preset would otherwise share one baseline. That
+// discriminator is a label, not a port list — feeding it to the scanner asks
+// for ports named "preset:quick", which matches nothing and silently scans no
+// ports at all.
+func TestScanPlanDoesNotPassTheHistoryLabelAsPorts(t *testing.T) {
+	plan := webPlan([]string{"192.0.2.1"})
+
+	if plan.Ports != "" {
+		t.Errorf("Plan.Ports = %q, want empty so the preset chooses", plan.Ports)
+	}
+	if plan.HistoryPorts == "" {
+		t.Error("the preset must still reach the history key")
+	}
+	// The key must carry the discriminator so two presets never share a baseline.
+	if got := (engine.Outcome{}).ScanKey(plan); got.Ports != plan.HistoryPorts {
+		t.Errorf("ScanKey ports = %q, want the history label %q", got.Ports, plan.HistoryPorts)
 	}
 }
