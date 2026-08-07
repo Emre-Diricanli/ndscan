@@ -17,6 +17,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
@@ -271,6 +272,28 @@ type Engine struct {
 	// NewRunner returns the runner for a plan. Defaults to scan.NewRunner,
 	// which picks SSH or local based on Plan.SSHTarget.
 	NewRunner func(sshTarget string) scan.Runner
+
+	// Now supplies the current time. Tests substitute it to exercise cache
+	// expiry without sleeping.
+	Now func() time.Time
+
+	// Cached multicast names, guarded because watch mode and a manual scan can
+	// both be in enrichment at once.
+	mcMu    sync.Mutex
+	mcNames map[string]string
+	mcAt    time.Time
+}
+
+// multicastTTL is how long a multicast discovery pass is reused. Device names
+// change on the order of days; a minute of staleness is invisible next to the
+// seconds each pass costs.
+const multicastTTL = 5 * time.Minute
+
+func (e *Engine) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
 }
 
 // New returns an Engine wired to the real scanner.
@@ -295,7 +318,7 @@ func (e *Engine) Run(ctx context.Context, p Plan, emit Emit) Outcome {
 	out := Outcome{MACs: map[string]string{}}
 	runner := e.runnerFor(p)
 
-	live, macs, fast, t, err := e.discover(ctx, p, runner, emit)
+	live, macs, rtts, fast, t, err := e.discover(ctx, p, runner, emit)
 	out.Fast = fast
 	out.Timings = t
 	if err != nil {
@@ -324,7 +347,7 @@ func (e *Engine) Run(ctx context.Context, p Plan, emit Emit) Outcome {
 		return out
 	}
 
-	e.scanPorts(ctx, p, runner, live, macs, emit, &out)
+	e.scanPorts(ctx, p, runner, live, macs, rtts, emit, &out)
 
 	if ctx.Err() != nil {
 		out.Status = StatusCancelled

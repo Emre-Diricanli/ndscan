@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/enrich"
 	"github.com/Emre-Diricanli/ndscan/internal/sweep"
 )
 
@@ -32,6 +33,28 @@ var scanNativePorts = sweep.ScanPorts
 // milliseconds. The returned slice is still complete, for callers that only want
 // the final answer.
 func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress func(done, total int)) []HostResult {
+	return nativePortScan(ctx, hosts, nil, cfg, progress)
+}
+
+// NativeMetadata is enrichment to embed in one host's synthetic nmap XML.
+type NativeMetadata struct {
+	RTT time.Duration
+	TLS map[int]enrich.TLSInfo
+}
+
+// NativePortScanWithMetadata preserves discovery timing and TLS identification
+// through the native scan's existing XML/parser/rendering path.
+//
+// The engine supplies the metadata: the discovery sweep already timed each
+// host's answer, and passing that through here is what puts a value in the RTT
+// column on the fast path. TLS identification is not yet wired — it needs the
+// proven-open endpoint set, which means splitting port collection from
+// rendering, and that is a larger change than this one.
+func NativePortScanWithMetadata(ctx context.Context, hosts []string, metadata map[string]NativeMetadata, cfg Config, progress func(done, total int)) []HostResult {
+	return nativePortScan(ctx, hosts, metadata, cfg, progress)
+}
+
+func nativePortScan(ctx context.Context, hosts []string, metadata map[string]NativeMetadata, cfg Config, progress func(done, total int)) []HostResult {
 	ports, err := parsePortSpec(cfg.Ports)
 	if err != nil {
 		out := make([]HostResult, 0, len(hosts))
@@ -51,7 +74,7 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 	var onResult func(sweep.PortResult)
 	if cfg.OnResult != nil {
 		onResult = func(r sweep.PortResult) {
-			cfg.OnResult(HostResult{IP: r.IP, XMLBytes: syntheticXML(r)})
+			cfg.OnResult(HostResult{IP: r.IP, XMLBytes: syntheticXMLWithMetadata(r, metadata[r.IP])})
 		}
 	}
 
@@ -70,7 +93,7 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 	for _, r := range results {
 		out = append(out, HostResult{
 			IP:       r.IP,
-			XMLBytes: syntheticXML(r),
+			XMLBytes: syntheticXMLWithMetadata(r, metadata[r.IP]),
 		})
 	}
 	// Descriptor exhaustion is a property of the run, not of any one host: every
@@ -88,24 +111,82 @@ func NativePortScan(ctx context.Context, hosts []string, cfg Config, progress fu
 // syntheticXML renders a native port result as the subset of nmap's XML that
 // ndscan's parser reads. Values are escaped so a hostile service name or
 // address can't produce malformed output.
-func syntheticXML(r sweep.PortResult) []byte {
+func syntheticXML(r sweep.PortResult, measuredRTT ...time.Duration) []byte {
+	metadata := NativeMetadata{}
+	if len(measuredRTT) > 0 {
+		metadata.RTT = measuredRTT[0]
+	}
+	return syntheticXMLWithMetadata(r, metadata)
+}
+
+func syntheticXMLWithMetadata(r sweep.PortResult, metadata NativeMetadata) []byte {
 	var b strings.Builder
 	b.WriteString(`<nmaprun><host><status state="up"/><address addr="`)
 	xml.EscapeText(&b, []byte(r.IP))
-	b.WriteString(`" addrtype="ipv4"/><ports>`)
+	b.WriteString(`" addrtype="ipv4"/>`)
+	if metadata.RTT > 0 {
+		// nmap's srtt unit is microseconds. Round up so a real sub-microsecond
+		// loopback connect never turns into the sentinel value zero.
+		us := (metadata.RTT + time.Microsecond - 1) / time.Microsecond
+		b.WriteString(`<times srtt="`)
+		b.WriteString(strconv.FormatInt(int64(us), 10))
+		b.WriteString(`"/>`)
+	}
+	b.WriteString(`<ports>`)
 	for _, p := range r.Ports {
 		b.WriteString(`<port protocol="tcp" portid="`)
 		b.WriteString(strconv.Itoa(p.Port))
 		b.WriteString(`"><state state="open"/>`)
-		if p.Service != "" {
+		cert, hasCert := metadata.TLS[p.Port]
+		if p.Service != "" || hasCert {
 			b.WriteString(`<service name="`)
 			xml.EscapeText(&b, []byte(p.Service))
+			if hasCert {
+				b.WriteString(`" tunnel="ssl`)
+				if cert.Organization != "" {
+					b.WriteString(`" product="`)
+					xml.EscapeText(&b, []byte(cert.Organization))
+				}
+			}
 			b.WriteString(`"/>`)
+		}
+		if hasCert {
+			writeTLSCertXML(&b, cert)
 		}
 		b.WriteString(`</port>`)
 	}
 	b.WriteString(`</ports></host></nmaprun>`)
 	return []byte(b.String())
+}
+
+// SynthesizeNativeResult exposes the no-I/O XML conversion for pipeline code
+// that enriches a completed open-port result before handing it to renderers.
+func SynthesizeNativeResult(r sweep.PortResult, metadata NativeMetadata) HostResult {
+	return HostResult{IP: r.IP, XMLBytes: syntheticXMLWithMetadata(r, metadata)}
+}
+
+func writeTLSCertXML(b *strings.Builder, cert enrich.TLSInfo) {
+	b.WriteString(`<script id="ssl-cert"><table key="subject">`)
+	writeCertElem(b, "commonName", cert.CommonName)
+	writeCertElem(b, "organizationName", cert.Organization)
+	b.WriteString(`</table><table key="issuer">`)
+	writeCertElem(b, "commonName", cert.Issuer)
+	b.WriteString(`</table><table key="validity">`)
+	if !cert.NotAfter.IsZero() {
+		writeCertElem(b, "notAfter", cert.NotAfter.Format("2006-01-02T15:04:05"))
+	}
+	b.WriteString(`</table></script>`)
+}
+
+func writeCertElem(b *strings.Builder, key, value string) {
+	if value == "" {
+		return
+	}
+	b.WriteString(`<elem key="`)
+	b.WriteString(key)
+	b.WriteString(`">`)
+	xml.EscapeText(b, []byte(value))
+	b.WriteString(`</elem>`)
 }
 
 // ValidatePorts reports whether a port specification is usable, without running

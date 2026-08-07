@@ -87,6 +87,14 @@ type Config struct {
 // Result is one discovered host.
 type Result struct {
 	IP string
+	// RTT is the duration of the first successful TCP connect used to discover
+	// this host, and zero when no connect was needed.
+	//
+	// On a directly-attached segment most hosts are recovered from the ARP
+	// cache without a probe, so a zero here is usually "we did not have to ask"
+	// rather than "the host is slow". That is the honest reading: inventing a
+	// latency for a host we never dialled would be worse than an empty column.
+	RTT time.Duration
 	// MAC is set when the ARP cache knew this host (L2 neighbours only).
 	MAC string
 	// ViaARP is true when the ARP cache reported the host. ViaTCP is true when
@@ -164,6 +172,9 @@ func Run(ctx context.Context, targets []string, cfg Config) []Result {
 		for _, hit := range stagedSweep(ctx, addrs, cfg) {
 			r := get(hit.ip)
 			r.ViaTCP = true
+			if r.RTT == 0 {
+				r.RTT = hit.rtt
+			}
 			if r.OpenPort == 0 {
 				r.OpenPort = hit.port
 			}
@@ -209,6 +220,7 @@ func withDefaults(cfg Config) Config {
 type hit struct {
 	ip   string
 	port int
+	rtt  time.Duration
 	// refused is true when the address answered with a TCP reset rather than an
 	// accepted connection. Something is there; no port is open.
 	refused bool
@@ -360,11 +372,13 @@ func (s *sweepState) dial(ctx context.Context, ip string, port int) {
 		return
 	}
 
+	started := time.Now()
 	conn, err := s.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	rtt := time.Since(started)
 	switch {
 	case err == nil:
 		conn.Close()
-		s.record(hit{ip: ip, port: port})
+		s.record(hit{ip: ip, port: port, rtt: rtt})
 	case s.cfg.Attached && isRefused(err):
 		// A reset means a TCP stack replied. On a directly-attached segment that
 		// stack belongs to the host itself, so this is solid proof of liveness

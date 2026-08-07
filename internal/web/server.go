@@ -47,6 +47,9 @@ type Server struct {
 	cancel      context.CancelFunc
 	watch       watchState
 	oui         vendor.DB
+	// eng is held rather than constructed per scan so its multicast name cache
+	// survives between scans, including watch-mode rescans.
+	eng *engine.Engine
 
 	bus *eventBus
 }
@@ -57,7 +60,7 @@ type Server struct {
 // prefixes, and resolving vendor names is the difference between a map of bare
 // IPs and one that tells you a host is a Ubiquiti AP or an Apple laptop.
 func NewServer(version string) *Server {
-	return &Server{version: version, bus: newEventBus(), oui: vendor.LoadDefault()}
+	return &Server{version: version, bus: newEventBus(), oui: vendor.LoadDefault(), eng: engine.New()}
 }
 
 // Handler returns the HTTP routes: the JSON API plus the embedded frontend,
@@ -443,7 +446,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	}
 
 	plan := s.scanPlan(targets, preset, fast)
-	out := engine.New().Run(ctx, plan, emit)
+	out := s.eng.Run(ctx, plan, emit)
 	discover.flush()
 	ports.flush()
 
@@ -478,15 +481,20 @@ func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Tim
 		Coverage: plan.Targets,
 	})
 	now := time.Now()
-	cur := out.Snapshots()
-	key := out.ScanKey(plan)
-	prev := config.LoadHistory(key)
 
-	// An incomplete run is indistinguishable from a network where everything
-	// vanished. Diffing it would report the whole network as gone, and saving it
-	// would make the *next* scan report the whole network as new — one
-	// cancellation corrupting change detection twice over.
-	if !out.Comparable() {
+	// Persist owns the decision about whether this run may update the baseline,
+	// and records device identity and the timeline from the same run. The web
+	// keeping its own copy of that rule is exactly how a cancelled scan came to
+	// overwrite history.
+	rec := s.eng.Persist(out, plan, start, s.oui)
+	for _, w := range rec.Warnings {
+		// A failed write is not fatal to this scan but silently disables change
+		// detection for every future one, which is indistinguishable from
+		// "nothing changed" — so it has to be said out loud.
+		s.bus.publish("warning", map[string]string{"warning": w})
+	}
+
+	if !rec.Comparable() {
 		s.mu.Lock()
 		s.topo = &m
 		s.lastScan = &now
@@ -496,19 +504,7 @@ func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Tim
 		s.publishDone(out, start)
 		return
 	}
-
-	diff := config.Diff(prev, cur)
-	// A failed save is not fatal to this scan, but it silently disables change
-	// detection for every future one — the next scan finds no previous snapshot
-	// and reports nothing as new. That is indistinguishable from "nothing
-	// changed", so it has to be said out loud. Running the server once under
-	// sudo is enough to leave a root-owned history directory behind and make
-	// every later unprivileged run fail this way.
-	if err := config.SaveHistory(key, cur); err != nil {
-		s.bus.publish("warning", map[string]string{
-			"warning": "scan history could not be saved, so changes since this scan will not be detected: " + err.Error(),
-		})
-	}
+	prev, diff := rec.Previous, rec.Diff
 
 	s.mu.Lock()
 	s.topo = &m

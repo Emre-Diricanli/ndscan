@@ -18,7 +18,7 @@ import (
 // Plan.Fast: native discovery is unavailable over SSH, where the probes would
 // originate from the wrong machine.
 func (e *Engine) discover(ctx context.Context, p Plan, runner scan.Runner, emit Emit) (
-	live []string, macs map[string]string, fast bool, t Timings, err error,
+	live []string, macs map[string]string, rtts map[string]time.Duration, fast bool, t Timings, err error,
 ) {
 	emit.phase(PhaseDiscover, 0, 0)
 	discoveryStart := time.Now()
@@ -35,7 +35,7 @@ func (e *Engine) discover(ctx context.Context, p Plan, runner scan.Runner, emit 
 		// Native ARP + TCP sweep: no nmap, no root, and roughly 15-20x faster
 		// than `nmap -sn` on a LAN because the timeout policy is ours.
 		fast = true
-		live, discoveredMACs, err = scan.NativeDiscovery(ctx, p.Targets, runner,
+		live, discoveredMACs, rtts, err = scan.NativeDiscoveryTimed(ctx, p.Targets, runner,
 			func(done, total int) { emit.phase(PhaseDiscover, done, total) })
 	case p.ShowMAC && nmapMACWorthwhile:
 		emit.phase(PhaseMAC, 0, 0)
@@ -44,13 +44,13 @@ func (e *Engine) discover(ctx context.Context, p Plan, runner scan.Runner, emit 
 		live, err = scan.HostDiscovery(ctx, p.Targets, runner)
 	}
 	if err != nil {
-		return nil, nil, fast, t, err
+		return nil, nil, nil, fast, t, err
 	}
 	// Native discovery reports cancellation by returning early rather than by
 	// erroring, so the context is checked directly — otherwise a cancelled scan
 	// would be reported as a completed one.
 	if ctx.Err() != nil {
-		return nil, nil, fast, t, nil
+		return nil, nil, nil, fast, t, nil
 	}
 	t.Discovery = time.Since(discoveryStart)
 
@@ -73,7 +73,7 @@ func (e *Engine) discover(ctx context.Context, p Plan, runner scan.Runner, emit 
 	}
 	t.Enrichment = time.Since(enrichmentStart)
 
-	return live, macs, fast, t, nil
+	return live, macs, rtts, fast, t, nil
 }
 
 // scanPorts probes the live hosts and accumulates rows onto the outcome.
@@ -83,7 +83,8 @@ func (e *Engine) discover(ctx context.Context, p Plan, runner scan.Runner, emit 
 // instead of waiting for the slowest address in the scan to finish timing out.
 func (e *Engine) scanPorts(
 	ctx context.Context, p Plan, runner scan.Runner,
-	live []string, macs map[string]string, emit Emit, out *Outcome,
+	live []string, macs map[string]string, rtts map[string]time.Duration,
+	emit Emit, out *Outcome,
 ) {
 	if p.DiscoverOnly {
 		// Discover-only still produces rows, just without port data, so every
@@ -167,7 +168,13 @@ func (e *Engine) scanPorts(
 		// same port set, because every probe runs concurrently under one
 		// timeout policy. The returned slice is discarded because OnResult has
 		// already delivered every row.
-		scan.NativePortScan(ctx, live, cfg, func(done, total int) {
+		// The discovery sweep already timed each host's answer; passing it
+		// through here is what puts a value in the RTT column on the fast path.
+		meta := make(map[string]scan.NativeMetadata, len(rtts))
+		for ip, d := range rtts {
+			meta[ip] = scan.NativeMetadata{RTT: d}
+		}
+		scan.NativePortScanWithMetadata(ctx, live, meta, cfg, func(done, total int) {
 			emit.scanPhase(done, total, true)
 		})
 	} else if _, err := scan.ScanHosts(ctx, live, cfg, runner); err != nil {
@@ -209,19 +216,42 @@ func (e *Engine) enrich(ctx context.Context, p Plan, emit Emit, out *Outcome) {
 	// Both passes are opt-in per plan and strictly bounded, so a network where
 	// nothing answers costs their timeout and nothing else.
 	if p.Multicast {
-		names := enrich.LookupMDNS(ctx, enrich.MDNSConfig{})
-		for ip, label := range enrich.LookupSSDP(ctx, enrich.SSDPConfig{}) {
-			if _, ok := names[ip]; !ok {
-				names[ip] = label // mDNS names are friendlier; SSDP fills gaps
-			}
-		}
-		ui.ApplyHostnames(out.Rows, names)
+		ui.ApplyHostnames(out.Rows, e.multicastNames(ctx))
 	}
 	ui.ApplyHostnames(out.Rows, enrich.LookupPTR(ctx, ips, enrich.Config{}))
 	// These rows were already delivered by the port scan; enrichment only filled
 	// in a column. Re-announcing them as arrivals would duplicate every host in
 	// a front end that appends.
 	emit.rowsUpdated(out.Rows)
+}
+
+// multicastNames asks the network what it calls itself, reusing a recent answer
+// rather than asking again.
+//
+// A discovery pass costs seconds of listening, and watch mode rescans every 60
+// — paying that every interval would make the scan mostly waiting, to re-learn
+// names that change on the order of days. The cache is per-Engine, so a
+// long-lived process shares it while each CLI invocation starts fresh.
+func (e *Engine) multicastNames(ctx context.Context) map[string]string {
+	e.mcMu.Lock()
+	defer e.mcMu.Unlock()
+
+	if e.mcNames != nil && e.now().Sub(e.mcAt) < multicastTTL {
+		return e.mcNames
+	}
+	names := enrich.LookupMDNS(ctx, enrich.MDNSConfig{})
+	for ip, label := range enrich.LookupSSDP(ctx, enrich.SSDPConfig{}) {
+		if _, ok := names[ip]; !ok {
+			names[ip] = label // mDNS names are friendlier; SSDP fills gaps
+		}
+	}
+	// A pass that found nothing is not cached: the usual cause is a transient
+	// network condition, and remembering the emptiness would extend a momentary
+	// failure into minutes of blank names.
+	if len(names) > 0 {
+		e.mcNames, e.mcAt = names, e.now()
+	}
+	return names
 }
 
 func sortRows(rows []ui.Row) {

@@ -12,6 +12,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
+	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
 
 // scanParams is the resolved configuration captured from the form.
@@ -85,6 +86,11 @@ func nmapAvailable(sshTarget string) bool {
 // The pipeline itself — discover, merge the ARP cache, scan ports, enrich
 // hostnames — lives in internal/engine; this adapter translates scanParams
 // into an engine.Plan and engine events into the Bubble Tea messages above.
+// sharedEngine is process-wide so its multicast cache survives across scans.
+// Watch mode rescans every 60 seconds, and a fresh engine each time would pay
+// the multicast listening budget on every one of them.
+var sharedEngine = engine.New()
+
 func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 	ch := make(chan tea.Msg, 64)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -134,7 +140,9 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			}
 		}
 
-		out := engine.New().Run(ctx, plan, emit)
+		eng := sharedEngine
+		scanStart := time.Now()
+		out := eng.Run(ctx, plan, emit)
 		if out.Status == engine.StatusFailed {
 			ch <- errMsg{err: out.Err}
 			return
@@ -144,16 +152,16 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		// later scans are compared against — a cancelled, partial, or empty run
 		// is indistinguishable from a network where everything vanished, and
 		// saving it would make the next scan report the whole network as new.
-		// The key carries Outcome.Fast because the native sweep and an nmap
-		// scan legitimately find different hosts.
-		key := out.ScanKey(plan)
-		prev := config.LoadHistory(key)
-		var diff map[string]config.HostDiff
-		if out.Comparable() {
-			cur := out.Snapshots()
-			diff = config.Diff(prev, cur)
-			_ = config.SaveHistory(key, cur)
+		// Persist owns that decision for every front end, and also records
+		// device identity and the timeline from the same run.
+		// Vendors only matter when the user asked to see them; loading the
+		// ~39k-prefix OUI table otherwise is pure cost.
+		var oui vendor.DB
+		if p.showMac && p.showVendors {
+			oui = vendor.LoadDefault()
 		}
+		rec := eng.Persist(out, plan, scanStart, oui)
+		diff := rec.Diff
 		ch <- doneMsg{
 			rows:      out.Rows,
 			failed:    out.Failed,
