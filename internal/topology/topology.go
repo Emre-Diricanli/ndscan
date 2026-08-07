@@ -208,6 +208,13 @@ func Build(rows []ui.Row, in Input) Map {
 	return m
 }
 
+// coverageSegments groups hosts that fall outside every attached network into
+// the scan target that covered them.
+//
+// RoutedVia is deliberately not set here. Coverage records which prefix a scan
+// asked about, not which path the answers took; a host can sit outside every
+// attached network for reasons other than the default gateway. Claiming a route
+// we did not observe is the class of guess this package is being cured of.
 func coverageSegments(orphans []Node, covered []netip.Prefix) ([]Segment, []Node) {
 	byNet := make(map[netip.Prefix][]Node)
 	remaining := make([]Node, 0)
