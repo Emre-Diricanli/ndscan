@@ -15,14 +15,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
-	"github.com/Emre-Diricanli/ndscan/internal/enrich"
+	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
@@ -411,107 +410,58 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		s.mu.Unlock()
 	}()
 
-	runner := scan.NewLocalRunner()
-	// Batch as the TUI does: without BatchSize a non-fast scan runs one nmap
-	// process per host, up to 64 concurrent at ~10-40MB RSS each. DiscardResults
-	// keeps the raw XML from being retained after OnResult has consumed it.
-	cfg := scan.Config{Preset: preset, Concurrency: 64, HostTimeout: 20 * time.Second, BatchSize: 16, DiscardResults: true}
-
+	// One throttle per phase: the sweep reports progress from thousands of
+	// goroutines, and forwarding every update would flood the SSE stream with
+	// more messages than a browser can usefully render.
 	discover := newPhaseThrottle(s.bus, "discover", 100*time.Millisecond)
+	ports := newPhaseThrottle(s.bus, "scan", 100*time.Millisecond)
 	s.bus.publish("phase", map[string]any{"phase": "discover", "done": 0, "total": 0})
 
-	var live []string
-	var macs map[string]string
-	var err error
-	if fast && scan.NativeDiscoverySupported(runner) {
-		live, macs, err = scan.NativeDiscovery(ctx, targets, runner, discover.update)
-	} else {
-		live, err = scan.HostDiscovery(ctx, targets, runner)
+	emit := func(e engine.Event) {
+		switch e.Kind {
+		case engine.EventPhase:
+			switch e.Phase {
+			case engine.PhaseDiscover:
+				discover.update(e.Done, e.Total)
+			case engine.PhaseScan:
+				if e.Total > 0 && e.Done == 0 {
+					discover.flush()
+					s.bus.publish("phase", map[string]any{"phase": "scan", "done": 0, "total": e.Total})
+					return
+				}
+				ports.update(e.Done, e.Total)
+			}
+		case engine.EventRows:
+			// Each host reaches the browser the moment it resolves, rather than
+			// after the slowest address in the scan has finished timing out.
+			for _, row := range e.Rows {
+				s.bus.publish("host", toHostDTO(row))
+			}
+		case engine.EventWarning:
+			s.bus.publish("warning", map[string]string{"warning": e.Warning})
+		}
 	}
+
+	plan := engine.Plan{
+		Targets:     targets,
+		Preset:      preset,
+		Ports:       s.portsFor(preset),
+		ShowMAC:     true,
+		ShowVendors: true,
+		Concurrency: 64,
+		HostTimeout: 20 * time.Second,
+		Fast:        fast,
+		Hostnames:   true,
+	}
+	out := engine.New().Run(ctx, plan, emit)
 	discover.flush()
-	if err != nil {
-		s.bus.publish("error", map[string]string{"error": err.Error()})
+	ports.flush()
+
+	if out.Status == engine.StatusFailed {
+		s.bus.publish("error", map[string]string{"error": out.Err.Error()})
 		return
 	}
-	if ctx.Err() != nil {
-		s.finishScan(nil, targets, preset, fast, start, scanOutcome{cancelled: true}, netSnapshot{locals: locals, gateway: gateway})
-		return
-	}
-
-	arp := scan.ARPCache(ctx, runner)
-	live = scan.MergeARPHosts(live, targets, arp)
-	if macs == nil {
-		macs = map[string]string{}
-	}
-	for ip, mac := range arp {
-		if _, ok := macs[ip]; !ok {
-			macs[ip] = mac
-		}
-	}
-
-	progress := newPhaseThrottle(s.bus, "scan", 100*time.Millisecond)
-	s.bus.publish("phase", map[string]any{"phase": "scan", "done": 0, "total": len(live)})
-
-	// Both paths stream through OnResult so a host reaches the browser the
-	// moment it resolves, rather than after the slowest address in the scan has
-	// finished timing out. It fires from worker goroutines, so the row slice
-	// needs the mutex.
-	//
-	// ScanHosts reports a per-batch failure through HostResult.Err rather than
-	// through its returned error, so a run can lose hosts and still look like it
-	// succeeded. Counting them here is what lets the outcome say "partial"
-	// instead of quietly presenting a short list as the whole network.
-	var (
-		mu     sync.Mutex
-		rows   []ui.Row
-		failed int
-	)
-	cfg.OnResult = func(r scan.HostResult) {
-		if r.Err != nil {
-			mu.Lock()
-			failed++
-			mu.Unlock()
-			return
-		}
-		built := ui.BuildRows([]scan.HostResult{r}, s.oui, true, true, macs)
-		if len(built) == 0 {
-			return
-		}
-		mu.Lock()
-		rows = append(rows, built...)
-		mu.Unlock()
-		for _, row := range built {
-			s.bus.publish("host", toHostDTO(row))
-		}
-	}
-	cfg.Progress = progress.update
-
-	if fast && scan.NativePortScanViable(cfg, runner) {
-		scan.NativePortScan(ctx, live, cfg, progress.update)
-	} else if _, err = scan.ScanHosts(ctx, live, cfg, runner); err != nil {
-		s.bus.publish("error", map[string]string{"error": err.Error()})
-		return
-	}
-	progress.flush()
-
-	mu.Lock()
-	final := append([]ui.Row(nil), rows...)
-	failedHosts := failed
-	mu.Unlock()
-	sort.Slice(final, func(i, j int) bool { return ui.IPLess(final[i].IP, final[j].IP) })
-
-	// Hostnames last: rows are already on screen by now, so this only fills a
-	// column rather than delaying anything. Bounded internally, and a miss just
-	// leaves the field blank.
-	if ctx.Err() == nil {
-		ui.ApplyHostnames(final, enrich.LookupPTR(ctx, rowIPs(final), enrich.Config{}))
-		for _, row := range final {
-			s.bus.publish("host", toHostDTO(row))
-		}
-	}
-	s.finishScan(final, targets, preset, fast, start,
-		scanOutcome{cancelled: ctx.Err() != nil, failed: failedHosts},
-		netSnapshot{locals: locals, gateway: gateway})
+	s.finishScan(out, plan, start, netSnapshot{locals: locals, gateway: gateway})
 }
 
 // rowIPs collects the addresses from a row set, for lookups keyed by IP.
@@ -523,57 +473,37 @@ func rowIPs(rows []ui.Row) []string {
 	return out
 }
 
-// scanOutcome describes how a scan run terminated, which decides whether its
-// results may become the baseline that later scans are compared against.
-//
-// A bare "cancelled" flag was not enough: a run can also finish having failed
-// on some of its hosts, and those results are just as unsafe to persist. The
-// counts travel with the rows so the decision is made from what actually
-// happened rather than inferred at the point of saving.
-type scanOutcome struct {
-	cancelled bool
-	failed    int  // hosts whose scan returned an error
-	partial   bool // the scan knowingly did not probe everything it was asked to
-}
-
-// eligible reports whether this run may be written as the new baseline.
-func (o scanOutcome) eligible(hosts int) bool {
-	return !o.partial && config.SaveEligible(o.cancelled, o.failed, hosts)
-}
-
 // finishScan stores the resulting topology and announces completion.
-func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, fast bool, start time.Time, outcome scanOutcome, net netSnapshot) {
-	m := topology.Build(rows, topology.Input{
+//
+// Whether this run may become the baseline for future change detection is the
+// engine's answer, not one reconstructed here. Reconstructing it locally is
+// what let a cancelled scan overwrite history: the web had its own copy of the
+// rule and the copy was wrong.
+func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Time, net netSnapshot) {
+	m := topology.Build(out.Rows, topology.Input{
 		Locals:  net.locals,
 		Gateway: net.gateway,
 		// The scan's own targets are what makes an empty segment meaningful:
 		// covered-and-empty is a finding, uncovered is a gap.
-		Coverage: targets,
+		Coverage: plan.Targets,
 	})
 	now := time.Now()
-	cur := make([]config.HostSnapshot, 0, len(rows))
-	for _, row := range rows {
-		cur = append(cur, config.HostSnapshot{IP: row.IP, Host: row.Host, Up: row.Up, Ports: row.Ports})
-	}
-	// The key must describe everything that changes what a scan could find.
-	// Ports was previously passed as "" here while the TUI passed the real
-	// value, so the two front ends silently kept separate baselines and neither
-	// could see the other's history.
-	key := config.ScanKey{Targets: targets, Ports: s.portsFor(preset), Preset: preset, Fast: fast}
+	cur := out.Snapshots()
+	key := out.ScanKey(plan)
 	prev := config.LoadHistory(key)
 
 	// An incomplete run is indistinguishable from a network where everything
 	// vanished. Diffing it would report the whole network as gone, and saving it
 	// would make the *next* scan report the whole network as new — one
 	// cancellation corrupting change detection twice over.
-	if !outcome.eligible(len(cur)) {
+	if !out.Comparable() {
 		s.mu.Lock()
 		s.topo = &m
 		s.lastScan = &now
-		s.rows = append([]ui.Row(nil), rows...)
-		s.preset = preset
+		s.rows = append([]ui.Row(nil), out.Rows...)
+		s.preset = plan.Preset
 		s.mu.Unlock()
-		s.publishDone(rows, start, outcome)
+		s.publishDone(out, start)
 		return
 	}
 
@@ -593,35 +523,36 @@ func (s *Server) finishScan(rows []ui.Row, targets []string, preset string, fast
 	s.mu.Lock()
 	s.topo = &m
 	s.lastScan = &now
-	s.rows = append([]ui.Row(nil), rows...)
-	s.preset = preset
+	s.rows = append([]ui.Row(nil), out.Rows...)
+	s.preset = plan.Preset
 	s.previous = append([]config.HostSnapshot(nil), prev...)
 	s.hasPrevious = prev != nil
 	s.diff = diff
 	s.mu.Unlock()
 
-	s.publishDone(rows, start, outcome)
+	s.publishDone(out, start)
 }
 
 // publishDone announces the end of a scan. It reports how the run terminated so
 // the UI can distinguish "no changes" from "we did not look properly" — the two
 // are identical on screen otherwise, and only one of them is good news.
-func (s *Server) publishDone(rows []ui.Row, start time.Time, outcome scanOutcome) {
+func (s *Server) publishDone(out engine.Outcome, start time.Time) {
 	openPorts := 0
-	for _, r := range rows {
+	for _, r := range out.Rows {
 		openPorts += len(r.PortDetails)
 	}
 	s.bus.publish("done", map[string]any{
-		"hosts":     len(rows),
+		"hosts":     len(out.Rows),
 		"openPorts": openPorts,
 		"elapsedMs": time.Since(start).Milliseconds(),
-		"cancelled": outcome.cancelled,
-		"failed":    outcome.failed,
-		"partial":   outcome.partial,
+		"status":    out.Status.String(),
+		"cancelled": out.Status == engine.StatusCancelled,
+		"failed":    out.Failed,
+		"partial":   out.Status == engine.StatusPartial,
 		// Change detection is only meaningful when this run was trustworthy
 		// enough to become the new baseline. Saying so explicitly stops the UI
 		// presenting a cancelled scan's empty diff as "nothing changed".
-		"comparable": outcome.eligible(len(rows)),
+		"comparable": out.Comparable(),
 	})
 }
 

@@ -170,7 +170,10 @@ type Event struct {
 	Done  int
 	Total int
 
-	// Rows carries hosts that have finished scanning, for streaming front ends.
+	// Rows carries hosts for streaming front ends. What a consumer should do
+	// with them depends on Kind: EventRows means these hosts are new and should
+	// be appended, EventRowsUpdated means these are hosts already delivered
+	// whose contents changed and should replace their existing entries.
 	Rows []ui.Row
 
 	// Warning is a non-fatal problem worth telling the user about.
@@ -183,8 +186,18 @@ type EventKind int
 const (
 	// EventPhase reports entering a phase, or progress within it.
 	EventPhase EventKind = iota
-	// EventRows carries newly-scanned hosts as they complete.
+	// EventRows carries newly-scanned hosts as they complete. A consumer that
+	// accumulates rows should append these.
 	EventRows
+	// EventRowsUpdated carries hosts that were already delivered via EventRows
+	// and have since been revised — hostname enrichment fills a column on rows
+	// the front end is already showing.
+	//
+	// This is a separate kind because the two cannot be told apart from the
+	// payload alone, and treating an update as an arrival duplicates every row
+	// on screen. A front end keyed by IP may handle both identically; one that
+	// appends must not.
+	EventRowsUpdated
 	// EventWarning reports a non-fatal problem.
 	EventWarning
 )
@@ -207,6 +220,12 @@ func (e Emit) phase(p Phase, done, total int) {
 func (e Emit) rows(rows []ui.Row) {
 	if e != nil && len(rows) > 0 {
 		e(Event{Kind: EventRows, Rows: rows})
+	}
+}
+
+func (e Emit) rowsUpdated(rows []ui.Row) {
+	if e != nil && len(rows) > 0 {
+		e(Event{Kind: EventRowsUpdated, Rows: rows})
 	}
 }
 

@@ -240,3 +240,41 @@ func TestStatusString(t *testing.T) {
 		}
 	}
 }
+
+// Hostname enrichment revises rows the front end has already been given. If it
+// announced them as arrivals, a front end that appends would show every host
+// twice — so the two must be distinguishable from the event alone.
+func TestEnrichmentReportsUpdatesNotArrivals(t *testing.T) {
+	r := &fakeRunner{up: []string{"192.0.2.1"}, ports: hostXML("192.0.2.1")}
+	p := nmapPlan("192.0.2.1")
+	p.Hostnames = true
+
+	var mu sync.Mutex
+	var arrivals, updates int
+	emit := Emit(func(e Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch e.Kind {
+		case EventRows:
+			arrivals += len(e.Rows)
+		case EventRowsUpdated:
+			updates += len(e.Rows)
+		}
+	})
+
+	out := testEngine(r).Run(context.Background(), p, emit)
+	if out.Status != StatusComplete {
+		t.Fatalf("status = %v", out.Status)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// One host scanned means exactly one arrival, however many times its row is
+	// later revised.
+	if arrivals != 1 {
+		t.Errorf("arrivals = %d, want 1 (enrichment must not re-announce rows)", arrivals)
+	}
+	if updates == 0 {
+		t.Error("enrichment should report its revision so front ends can refresh")
+	}
+}
