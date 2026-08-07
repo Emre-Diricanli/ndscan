@@ -27,10 +27,10 @@ type Node struct {
 
 // Segment is one network, with the hosts found on it.
 type Segment struct {
-	CIDR       string // e.g. "192.168.2.0/24"
-	Interface  string // e.g. "en0" ("" when inferred from results alone)
-	SelfAddr   string // this machine's address on it, if any
-	Nodes []Node
+	CIDR      string // e.g. "192.168.2.0/24"
+	Interface string // e.g. "en0" ("" when inferred from results alone)
+	SelfAddr  string // this machine's address on it, if any
+	Nodes     []Node
 	// NotScanned means no scan covered this network — not that a scan looked
 	// and found nothing. Those are opposite facts and must not render alike:
 	// "I checked, it's empty" is a finding; "I never checked" is a gap.
