@@ -5,7 +5,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -112,15 +111,9 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			Hostnames: true,
 		}
 
-		// inEnrich gates row forwarding: the enrich phase re-emits the full row
-		// set with hostnames filled in, and the running screen appends what it
-		// receives, so forwarding those would draw every host twice. The final
-		// rows arrive with doneMsg regardless.
-		var inEnrich atomic.Bool
 		emit := func(e engine.Event) {
 			switch e.Kind {
 			case engine.EventPhase:
-				inEnrich.Store(e.Phase == engine.PhaseEnrich)
 				// Non-blocking: the sweep fans out across thousands of
 				// goroutines, and a full channel (or a cancelled scan whose
 				// reader has stopped) must never stall them.
@@ -129,10 +122,12 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 				default:
 				}
 			case engine.EventRows:
-				if inEnrich.Load() {
-					return
-				}
 				ch <- hostRowMsg{rows: e.Rows}
+			case engine.EventRowsUpdated:
+				// Rows revised after the fact — hostname enrichment filling a
+				// column on hosts already on screen. The running screen appends
+				// what it receives, so these are dropped rather than drawn
+				// twice; the final set arrives with doneMsg regardless.
 			}
 		}
 
