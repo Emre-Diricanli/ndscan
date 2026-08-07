@@ -55,6 +55,10 @@ release:
     name: ndscan
   draft: false
   replace_existing_draft: true
+  # Overwrite assets instead of colliding with them. A re-run — or a retag
+  # after a history rewrite — otherwise fails with 422 already_exists on every
+  # artifact, even though the release itself is fine.
+  replace_existing_artifacts: true
   mode: replace
   header: |
     ## ndscan {{ .Tag }}
