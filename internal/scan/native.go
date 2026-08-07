@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/sweep"
@@ -29,6 +30,29 @@ func NativeDiscovery(ctx context.Context, targets []string, runner Runner, progr
 		Attached: targetsAreAttached(targets),
 	})
 	return sweep.IPs(res), sweep.MACs(res), nil
+}
+
+// NativeDiscoveryTimed is NativeDiscovery plus the round-trip time each host
+// took to answer.
+//
+// The sweep already measures it — every discovery is a timed TCP connect — and
+// discarding it meant the RTT column stayed empty on exactly the fast path most
+// scans use. Reporting it costs no extra packets.
+func NativeDiscoveryTimed(ctx context.Context, targets []string, runner Runner, progress func(done, total int)) ([]string, map[string]string, map[string]time.Duration, error) {
+	res := sweep.Run(ctx, targets, sweep.Config{
+		ARP: func(c context.Context) map[string]string {
+			return ARPCache(c, runner)
+		},
+		Progress: progress,
+		Attached: targetsAreAttached(targets),
+	})
+	rtts := make(map[string]time.Duration, len(res))
+	for _, r := range res {
+		if r.RTT > 0 {
+			rtts[r.IP] = r.RTT
+		}
+	}
+	return sweep.IPs(res), sweep.MACs(res), rtts, nil
 }
 
 // targetsAreAttached reports whether every target lies inside a network this

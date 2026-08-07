@@ -86,6 +86,11 @@ func nmapAvailable(sshTarget string) bool {
 // The pipeline itself — discover, merge the ARP cache, scan ports, enrich
 // hostnames — lives in internal/engine; this adapter translates scanParams
 // into an engine.Plan and engine events into the Bubble Tea messages above.
+// sharedEngine is process-wide so its multicast cache survives across scans.
+// Watch mode rescans every 60 seconds, and a fresh engine each time would pay
+// the multicast listening budget on every one of them.
+var sharedEngine = engine.New()
+
 func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 	ch := make(chan tea.Msg, 64)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -135,7 +140,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			}
 		}
 
-		eng := engine.New()
+		eng := sharedEngine
 		scanStart := time.Now()
 		out := eng.Run(ctx, plan, emit)
 		if out.Status == engine.StatusFailed {

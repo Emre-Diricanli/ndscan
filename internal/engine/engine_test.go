@@ -301,3 +301,32 @@ func TestMulticastIsOptIn(t *testing.T) {
 		t.Errorf("a plan with Multicast=false took %v: multicast is not opt-in", elapsed)
 	}
 }
+
+// A multicast pass costs seconds of listening. Watch mode rescans every 60, so
+// repeating it every time would make a scan mostly waiting — to re-learn names
+// that change on the order of days.
+func TestMulticastNamesAreCachedBetweenScans(t *testing.T) {
+	e := New()
+	fixed := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	e.Now = func() time.Time { return fixed }
+
+	// Prime the cache directly: the point under test is reuse, not discovery.
+	e.mcNames = map[string]string{"192.0.2.1": "Living-Room-TV"}
+	e.mcAt = fixed
+
+	start := time.Now()
+	got := e.multicastNames(context.Background())
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Errorf("a cached lookup took %v; it listened again instead of reusing", elapsed)
+	}
+	if got["192.0.2.1"] != "Living-Room-TV" {
+		t.Errorf("cached names lost: %v", got)
+	}
+
+	// Past the TTL the cache must not be trusted — names do change eventually.
+	e.Now = func() time.Time { return fixed.Add(multicastTTL + time.Minute) }
+	e.mcNames = map[string]string{"192.0.2.1": "stale"}
+	if got := e.multicastNames(context.Background()); got["192.0.2.1"] == "stale" {
+		t.Error("an expired cache was served rather than refreshed")
+	}
+}

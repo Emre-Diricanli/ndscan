@@ -44,9 +44,12 @@ type NativeMetadata struct {
 
 // NativePortScanWithMetadata preserves discovery timing and TLS identification
 // through the native scan's existing XML/parser/rendering path.
-// TODO(engine): retain sweep.Result RTTs; split native port collection from
-// rendering so enrich.LookupTLS can receive only proven-open endpoints, then
-// synthesize each collected sweep.PortResult with SynthesizeNativeResult.
+//
+// The engine supplies the metadata: the discovery sweep already timed each
+// host's answer, and passing that through here is what puts a value in the RTT
+// column on the fast path. TLS identification is not yet wired — it needs the
+// proven-open endpoint set, which means splitting port collection from
+// rendering, and that is a larger change than this one.
 func NativePortScanWithMetadata(ctx context.Context, hosts []string, metadata map[string]NativeMetadata, cfg Config, progress func(done, total int)) []HostResult {
 	return nativePortScan(ctx, hosts, metadata, cfg, progress)
 }

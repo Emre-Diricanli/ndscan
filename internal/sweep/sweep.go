@@ -88,7 +88,12 @@ type Config struct {
 type Result struct {
 	IP string
 	// RTT is the duration of the first successful TCP connect used to discover
-	// this host. It is zero for ARP-only and refusal-only discoveries.
+	// this host, and zero when no connect was needed.
+	//
+	// On a directly-attached segment most hosts are recovered from the ARP
+	// cache without a probe, so a zero here is usually "we did not have to ask"
+	// rather than "the host is slow". That is the honest reading: inventing a
+	// latency for a host we never dialled would be worse than an empty column.
 	RTT time.Duration
 	// MAC is set when the ARP cache knew this host (L2 neighbours only).
 	MAC string

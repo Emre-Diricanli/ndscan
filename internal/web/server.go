@@ -47,6 +47,9 @@ type Server struct {
 	cancel      context.CancelFunc
 	watch       watchState
 	oui         vendor.DB
+	// eng is held rather than constructed per scan so its multicast name cache
+	// survives between scans, including watch-mode rescans.
+	eng *engine.Engine
 
 	bus *eventBus
 }
@@ -57,7 +60,7 @@ type Server struct {
 // prefixes, and resolving vendor names is the difference between a map of bare
 // IPs and one that tells you a host is a Ubiquiti AP or an Apple laptop.
 func NewServer(version string) *Server {
-	return &Server{version: version, bus: newEventBus(), oui: vendor.LoadDefault()}
+	return &Server{version: version, bus: newEventBus(), oui: vendor.LoadDefault(), eng: engine.New()}
 }
 
 // Handler returns the HTTP routes: the JSON API plus the embedded frontend,
@@ -443,7 +446,7 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 	}
 
 	plan := s.scanPlan(targets, preset, fast)
-	out := engine.New().Run(ctx, plan, emit)
+	out := s.eng.Run(ctx, plan, emit)
 	discover.flush()
 	ports.flush()
 
@@ -483,7 +486,7 @@ func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Tim
 	// and records device identity and the timeline from the same run. The web
 	// keeping its own copy of that rule is exactly how a cancelled scan came to
 	// overwrite history.
-	rec := engine.New().Persist(out, plan, start, s.oui)
+	rec := s.eng.Persist(out, plan, start, s.oui)
 	for _, w := range rec.Warnings {
 		// A failed write is not fatal to this scan but silently disables change
 		// detection for every future one, which is indistinguishable from
