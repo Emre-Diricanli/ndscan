@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Emre-Diricanli/ndscan/internal/alert"
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
@@ -282,7 +283,18 @@ type Engine struct {
 	mcMu    sync.Mutex
 	mcNames map[string]string
 	mcAt    time.Time
+
+	// The alert suppressor is held per-Engine so a long-lived watch loop stops
+	// repeating itself, while each CLI invocation starts clean.
+	alertMu  sync.Mutex
+	alertSup *alert.Suppressor
 }
+
+// alertCooldown is how long the same rule may not fire twice for the same
+// subject. Watch mode runs on the order of a minute, so this is chosen to be
+// long enough that a persistent condition is reported once per sitting rather
+// than once per interval.
+const alertCooldown = time.Hour
 
 // multicastTTL is how long a multicast discovery pass is reused. Device names
 // change on the order of days; a minute of staleness is invisible next to the

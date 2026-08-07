@@ -9,8 +9,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Emre-Diricanli/ndscan/internal/alert"
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/engine"
+	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
@@ -50,6 +52,9 @@ type doneMsg struct {
 	timings   phaseTimings
 	firstErr  error
 	fallbacks int
+	// alerts are the changes the user's rules said are worth interrupting for,
+	// already de-duplicated across watch intervals.
+	alerts []alert.Alert
 }
 
 type phaseTimings struct {
@@ -160,7 +165,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		if p.showMac && p.showVendors {
 			oui = vendor.LoadDefault()
 		}
-		rec := eng.Persist(out, plan, scanStart, oui)
+		rec := eng.PersistWithGateway(out, plan, scanStart, oui, netinfo.DefaultGateway().IP)
 		diff := rec.Diff
 		ch <- doneMsg{
 			rows:      out.Rows,
@@ -175,6 +180,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			},
 			firstErr:  out.FirstErr,
 			fallbacks: out.Fallbacks,
+			alerts:    rec.Alerts,
 		}
 	}()
 

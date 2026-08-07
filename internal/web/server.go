@@ -486,7 +486,16 @@ func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Tim
 	// and records device identity and the timeline from the same run. The web
 	// keeping its own copy of that rule is exactly how a cancelled scan came to
 	// overwrite history.
-	rec := s.eng.Persist(out, plan, start, s.oui)
+	rec := s.eng.PersistWithGateway(out, plan, start, s.oui, net.gateway.IP)
+	// Alerts reach the browser as their own event so the UI can surface a new
+	// device or a changed gateway MAC rather than leaving it in a diff table
+	// the user has to read to notice.
+	for _, a := range rec.Alerts {
+		s.bus.publish("alert", map[string]any{
+			"rule": a.Rule, "severity": a.Severity,
+			"title": a.Title, "body": a.Body, "subject": a.Subject,
+		})
+	}
 	for _, w := range rec.Warnings {
 		// A failed write is not fatal to this scan but silently disables change
 		// detection for every future one, which is indistinguishable from
