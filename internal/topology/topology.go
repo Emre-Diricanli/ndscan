@@ -28,19 +28,25 @@ type Node struct {
 // Segment is one network, with the hosts found on it.
 type Segment struct {
 	CIDR      string // e.g. "192.168.2.0/24"
-	Interface string // e.g. "en0" ("" when inferred from results alone)
+	Interface string // e.g. "en0" ("" when not attached)
 	SelfAddr  string // this machine's address on it, if any
 	Nodes     []Node
+	// Inferred distinguishes a guessed network boundary from one observed on
+	// an interface or supplied as a scan target. Build currently refuses to
+	// invent boundaries, but the distinction belongs in the model so future
+	// inference cannot silently become a measured fact.
+	Inferred bool
 	// NotScanned means no scan covered this network — not that a scan looked
 	// and found nothing. Those are opposite facts and must not render alike:
 	// "I checked, it's empty" is a finding; "I never checked" is a gap.
 	NotScanned bool
-	// RoutedVia is set on segments this machine is NOT attached to but reached
-	// through the gateway (a sibling VLAN, a remote SSH scan). It holds the
-	// gateway IP the traffic transited, so the map can show the segment nested
-	// under the gateway rather than as a peer of an attached network.
+	// RoutedVia is set only when the path to this segment was observed. A
+	// default gateway alone is not evidence that a particular host used it.
 	RoutedVia string
 }
+
+// TODO(web): expose Segment.Inferred in segmentDTO before any caller starts
+// producing inferred segments, so guessed boundaries cannot render as facts.
 
 // Attached reports whether this machine has an interface on the segment.
 // Routed and orphan segments are not attached.
@@ -156,7 +162,8 @@ func Build(rows []ui.Row, in Input) Map {
 		parsed = append(parsed, seg{net: ipnet, index: len(m.Segments) - 1})
 	}
 
-	// Place each scanned host into the first network that contains it.
+	// Place each scanned host into the most specific attached network. Interface
+	// order breaks equal-width ties because Locals carries that stable priority.
 	for _, r := range rows {
 		ip, ipOK := netip.ParseAddr(r.IP)
 		node := Node{
@@ -167,16 +174,18 @@ func Build(rows []ui.Row, in Input) Map {
 		}
 		placed := false
 		if ipOK == nil {
+			best := -1
 			for _, p := range parsed {
-				if !p.net.Contains(ip) {
-					continue
+				if p.net.Contains(ip) && (best == -1 || p.net.Bits() > parsed[best].net.Bits()) {
+					best = p.index
 				}
-				s := &m.Segments[p.index]
+			}
+			if best != -1 {
+				s := &m.Segments[best]
 				node.IsSelf = s.SelfAddr != "" && r.IP == s.SelfAddr
 				s.Nodes = append(s.Nodes, node)
 				s.NotScanned = false
 				placed = true
-				break
 			}
 		}
 		if !placed {
@@ -184,19 +193,13 @@ func Build(rows []ui.Row, in Input) Map {
 		}
 	}
 
-	// Group orphans into synthetic segments by /24 so a remote scan still
-	// renders as a network rather than a flat list. Hosts outside every
-	// attached network were reached through the gateway, so tag the resulting
-	// segments as routed-via that gateway (when we know it) — this is what
-	// lets the map draw them nested under the gateway rather than as peers of
-	// the local LAN.
+	// A scan target is evidence for its exact boundary. Prefer the narrowest
+	// matching target, just as routing does, and retain truly unmatched hosts as
+	// explicit unknowns rather than manufacturing a plausible-looking subnet.
 	if len(m.Orphans) > 0 {
-		routed := orphanSegments(m.Orphans)
-		for i := range routed {
-			routed[i].RoutedVia = in.Gateway.IP
-		}
+		routed, remaining := coverageSegments(m.Orphans, covered)
 		m.Segments = append(m.Segments, routed...)
-		m.Orphans = nil
+		m.Orphans = remaining
 	}
 
 	for i := range m.Segments {
@@ -205,27 +208,42 @@ func Build(rows []ui.Row, in Input) Map {
 	return m
 }
 
-// orphanSegments buckets hosts with no matching local network into /24 groups.
-func orphanSegments(orphans []Node) []Segment {
-	byNet := map[string][]Node{}
-	var order []string
+func coverageSegments(orphans []Node, covered []netip.Prefix) ([]Segment, []Node) {
+	byNet := make(map[netip.Prefix][]Node)
+	remaining := make([]Node, 0)
 	for _, n := range orphans {
 		ip, err := netip.ParseAddr(n.Row.IP)
-		key := "unknown"
-		if err == nil && ip.Is4() {
-			key = netip.PrefixFrom(ip, 24).Masked().String()
+		if err != nil {
+			remaining = append(remaining, n)
+			continue
 		}
-		if _, seen := byNet[key]; !seen {
-			order = append(order, key)
+		best := -1
+		for i, prefix := range covered {
+			if prefix.Contains(ip) && (best == -1 || prefix.Bits() > covered[best].Bits()) {
+				best = i
+			}
 		}
-		byNet[key] = append(byNet[key], n)
+		if best == -1 {
+			remaining = append(remaining, n)
+			continue
+		}
+		byNet[covered[best]] = append(byNet[covered[best]], n)
 	}
-	sort.Strings(order)
+	order := make([]netip.Prefix, 0, len(byNet))
+	for prefix := range byNet {
+		order = append(order, prefix)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if cmp := order[i].Addr().Compare(order[j].Addr()); cmp != 0 {
+			return cmp < 0
+		}
+		return order[i].Bits() < order[j].Bits()
+	})
 	out := make([]Segment, 0, len(order))
-	for _, key := range order {
-		out = append(out, Segment{CIDR: key, Nodes: byNet[key]})
+	for _, prefix := range order {
+		out = append(out, Segment{CIDR: prefix.String(), Nodes: byNet[prefix]})
 	}
-	return out
+	return out, remaining
 }
 
 // sortNodes orders hosts within a segment: gateway first (it anchors the
