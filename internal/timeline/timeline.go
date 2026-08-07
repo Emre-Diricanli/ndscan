@@ -40,7 +40,29 @@ type Event struct {
 	IP        string    `json:"ip"`
 	Port      int       `json:"port,omitempty"`
 	Protocol  string    `json:"protocol,omitempty"`
+	// Scope identifies which scan signature produced this event, so a query
+	// can be restricted to the network it asked about.
+	//
+	// Without it the log is a single undifferentiated stream, and a caller
+	// asking "what changed on 10.0.0.0/24" gets whatever was scanned most
+	// recently — which is exactly what `ndscan diff` did: it reported hosts
+	// from an entirely different subnet, confidently, in a command documented
+	// as safe for cron.
+	//
+	// Empty means the event predates scoping. Such events are real history and
+	// are kept, but they cannot be attributed to any signature, so a
+	// scope-filtered query must exclude rather than guess at them.
+	Scope string `json:"scope,omitempty"`
+	// Run groups the events of one scan. Timestamp equality is not a sound
+	// batch boundary: two scans can finish in the same instant, and the events
+	// of a single scan need not share a timestamp exactly.
+	Run string `json:"run,omitempty"`
 }
+
+// Scoped reports whether this event can be attributed to a scan signature.
+// Events written before scoping existed cannot be, and saying so is better than
+// silently folding them into someone else's network.
+func (e Event) Scoped() bool { return e.Scope != "" }
 
 var appendMu sync.Mutex
 
@@ -214,13 +236,74 @@ func PortHistory(deviceKey string, port int) ([]Event, error) {
 	}), nil
 }
 
-// Recent returns events at or after since in timestamp order.
-func Recent(since time.Time) ([]Event, error) {
+// recent returns events at or after since across every scan.
+//
+// Unexported: every caller wants a scope, and an unscoped read is the mistake
+// this package spent a wave fixing. Select is the supported entry point.
+func recent(since time.Time) ([]Event, error) {
+	return Select(Query{Since: since})
+}
+
+// Query narrows a timeline read. The zero value matches everything.
+type Query struct {
+	// Scope restricts results to one scan signature (config.ScanKey.Scope()).
+	// Empty means every scope.
+	//
+	// Events written before scoping existed carry no scope and are excluded
+	// whenever a Scope is given: they are real history, but attributing them to
+	// a signature we cannot verify is how the unscoped log came to report one
+	// network's changes as another's.
+	Scope string
+	// Run restricts results to a single scan run.
+	Run string
+	// Since keeps events at or after this time. Zero keeps everything.
+	Since time.Time
+	// DeviceKey restricts results to one device.
+	DeviceKey string
+}
+
+func (q Query) matches(e Event) bool {
+	if q.Scope != "" && e.Scope != q.Scope {
+		return false
+	}
+	if q.Run != "" && e.Run != q.Run {
+		return false
+	}
+	if q.DeviceKey != "" && e.DeviceKey != q.DeviceKey {
+		return false
+	}
+	return !e.Timestamp.Before(q.Since)
+}
+
+// Select returns the events matching q, in timestamp order.
+func Select(q Query) ([]Event, error) {
 	events, err := allEvents()
 	if err != nil {
 		return nil, err
 	}
-	return filter(events, func(e Event) bool { return !e.Timestamp.Before(since) }), nil
+	return filter(events, q.matches), nil
+}
+
+// LatestRun returns the events of the most recent run within a scope, and that
+// run's identifier.
+//
+// Grouping by run rather than by timestamp is what makes this correct: two
+// scans can finish in the same instant, and one scan's events need not share a
+// timestamp exactly, so timestamp equality is not a batch boundary.
+func LatestRun(scope string) ([]Event, string, error) {
+	events, err := Select(Query{Scope: scope})
+	if err != nil || len(events) == 0 {
+		return nil, "", err
+	}
+	// allEvents is timestamp-ordered, so the last run to appear is the latest.
+	run := events[len(events)-1].Run
+	if run == "" {
+		// Pre-run-ID events: fall back to the old timestamp grouping rather
+		// than returning nothing, since that is the best this data supports.
+		last := events[len(events)-1].Timestamp
+		return filter(events, func(e Event) bool { return e.Timestamp.Equal(last) }), "", nil
+	}
+	return filter(events, func(e Event) bool { return e.Run == run }), run, nil
 }
 
 func filter(events []Event, keep func(Event) bool) []Event {
@@ -254,6 +337,9 @@ func seenBound(deviceKey string, last bool) (time.Time, bool, error) {
 }
 
 // Devices returns every known opaque device key in lexical order.
+//
+// internal/device is the inventory of record; this answers the narrower
+// question of which devices the event log itself has heard of.
 func Devices() ([]string, error) {
 	events, err := allEvents()
 	if err != nil {

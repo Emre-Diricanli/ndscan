@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,5 +141,84 @@ func TestRoamingToANewNetworkIsNotASpoof(t *testing.T) {
 		if a.Rule == "gateway-mac-changed" {
 			t.Errorf("changing networks was reported as an ARP spoof: %+v", a)
 		}
+	}
+}
+
+// A fresh install sees every host on the network as new. That is the moment we
+// started looking, not a set of arrivals — a small home network produced four
+// notifications on its first run, which is how a person learns to turn
+// alerting off entirely.
+func TestFirstInventoryDoesNotStorm(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	e := New()
+
+	rec := e.Persist(complete(
+		ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"},
+		ui.Row{IP: "192.0.2.2", Up: true, MAC: "b8:27:eb:aa:bb:cc"},
+		ui.Row{IP: "192.0.2.3", Up: true, MAC: "a0:85:27:2f:9a:27"},
+		ui.Row{IP: "192.0.2.4", Up: true, MAC: "b0:be:83:50:58:b3"},
+	), recordPlan(), time.Now(), vendor.DB{})
+
+	for _, a := range rec.Alerts {
+		if a.Rule == "new-device" {
+			t.Errorf("the first inventory announced an arrival: %+v", a)
+		}
+	}
+	// The devices are still learned — we know they exist, we just have no
+	// evidence that any of them just showed up.
+	if len(rec.Devices) != 4 {
+		t.Errorf("devices = %d, want 4 learned on the first scan", len(rec.Devices))
+	}
+}
+
+// Once an inventory exists, a genuinely new device must still alert — the
+// suppression above must not swallow the signal it was meant to protect.
+func TestArrivalAfterFirstInventoryStillAlerts(t *testing.T) {
+	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
+	e := New()
+	t0 := time.Now().Add(-time.Hour)
+
+	e.Persist(complete(ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"}),
+		recordPlan(), t0, vendor.DB{})
+
+	rec := e.Persist(complete(
+		ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"},
+		ui.Row{IP: "192.0.2.9", Up: true, MAC: "b8:27:eb:aa:bb:cc"},
+	), recordPlan(), t0.Add(time.Hour), vendor.DB{})
+
+	var got bool
+	for _, a := range rec.Alerts {
+		if a.Rule == "new-device" {
+			got = true
+		}
+	}
+	if !got {
+		t.Errorf("a real arrival was suppressed: %+v", rec.Alerts)
+	}
+}
+
+// A corrupt device store must not read as "no devices known" inside a scan.
+// That is what let a later save overwrite it and destroy user-assigned names,
+// and the user has to be told rather than left with silent identity loss.
+func TestCorruptDeviceStoreWarnsRatherThanPretendingEmpty(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NDSCAN_CONFIG_DIR", dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "devices.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := New().Persist(complete(
+		ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"},
+	), recordPlan(), time.Now(), vendor.DB{})
+
+	var warned bool
+	for _, w := range rec.Warnings {
+		if strings.Contains(w, "device records could not be read") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("a corrupt device store produced no warning: %+v", rec.Warnings)
 	}
 }

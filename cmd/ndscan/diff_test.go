@@ -39,9 +39,17 @@ func seedDevice(t *testing.T, key, name, ip string) {
 	}
 }
 
+// seedEvent records an event as a scan of diffTestKey would have. The scope and
+// run must be stamped: diff reads the timeline scoped to one signature, so an
+// unscoped event is deliberately invisible to it.
 func seedEvent(t *testing.T, ts time.Time, typ timeline.EventType, key, ip string, port int) {
 	t.Helper()
-	ev := timeline.Event{Timestamp: ts, Type: typ, DeviceKey: key, IP: ip}
+	seedScopedEvent(t, diffTestKey.Scope(), "run-a", ts, typ, key, ip, port)
+}
+
+func seedScopedEvent(t *testing.T, scope, run string, ts time.Time, typ timeline.EventType, key, ip string, port int) {
+	t.Helper()
+	ev := timeline.Event{Timestamp: ts, Type: typ, DeviceKey: key, IP: ip, Scope: scope, Run: run}
 	if port != 0 {
 		ev.Port = port
 		ev.Protocol = "tcp"
@@ -79,11 +87,14 @@ func TestRunDiff(t *testing.T) {
 			seed: func(t *testing.T) {
 				seedHistory(t)
 				seedDevice(t, "ip:192.0.2.42", "kids-tablet", "192.0.2.42")
-				// An older batch, then the most recent scan's batch: only the
-				// latest may appear in the default view.
-				seedEvent(t, now.Add(-2*time.Hour), timeline.EventPortClosed, "ip:192.0.2.10", "192.0.2.10", 22)
-				seedEvent(t, now.Add(-1*time.Hour), timeline.EventHostSeen, "ip:192.0.2.42", "192.0.2.42", 0)
-				seedEvent(t, now.Add(-1*time.Hour), timeline.EventPortOpened, "ip:192.0.2.10", "192.0.2.10", 8080)
+				// An older scan, then the most recent one: only the latest run
+				// may appear in the default view. They are separate runs, which
+				// is what defines the boundary — two scans can share a
+				// timestamp, so the run identifier is what tells them apart.
+				scope := diffTestKey.Scope()
+				seedScopedEvent(t, scope, "run-old", now.Add(-2*time.Hour), timeline.EventPortClosed, "ip:192.0.2.10", "192.0.2.10", 22)
+				seedScopedEvent(t, scope, "run-new", now.Add(-1*time.Hour), timeline.EventHostSeen, "ip:192.0.2.42", "192.0.2.42", 0)
+				seedScopedEvent(t, scope, "run-new", now.Add(-1*time.Hour), timeline.EventPortOpened, "ip:192.0.2.10", "192.0.2.10", 8080)
 			},
 			wantCode:        diffExitChanged,
 			wantContains:    []string{"kids-tablet", "192.0.2.42", "appeared", "port opened", "8080"},

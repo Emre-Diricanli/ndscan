@@ -70,80 +70,111 @@ func TestBuild_UnscannedNetworkIsMarked(t *testing.T) {
 	}
 }
 
-// Hosts outside every local network (e.g. a remote SSH scan) must still be
-// grouped into a network rather than dropped or misattached.
-func TestBuild_OrphansGroupedBySubnet(t *testing.T) {
-	rows := []ui.Row{row("10.0.5.7"), row("10.0.5.9"), row("172.16.3.1")}
-	m := Build(rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
-
-	if len(m.Orphans) != 0 {
-		t.Errorf("orphans should be folded into segments, got %d", len(m.Orphans))
+func TestBuild_PrefixPlacement(t *testing.T) {
+	tests := []struct {
+		name      string
+		locals    []netinfo.Network
+		rows      []ui.Row
+		wantIface string
+		wantSelf  bool
+		wantHosts int
+	}{
+		{
+			name: "longest prefix beats earlier VPN",
+			locals: []netinfo.Network{
+				{Interface: "utun8", CIDR: "192.168.0.0/16", Addr: "192.168.50.1"},
+				{Interface: "en0", CIDR: "192.168.2.0/24", Addr: "192.168.2.10"},
+			},
+			wantIface: "en0",
+			wantSelf:  true,
+			rows:      []ui.Row{row("192.168.2.10"), row("192.168.2.99")},
+			wantHosts: 2,
+		},
+		{
+			name: "equal prefixes preserve interface order",
+			locals: []netinfo.Network{
+				{Interface: "first", CIDR: "192.168.2.0/24", Addr: "192.168.2.10"},
+				{Interface: "second", CIDR: "192.168.2.0/24", Addr: "192.168.2.11"},
+			},
+			wantIface: "first",
+			wantSelf:  true,
+			rows:      []ui.Row{row("192.168.2.10")},
+			wantHosts: 1,
+		},
 	}
-	var found10, found172 *Segment
-	for i := range m.Segments {
-		switch m.Segments[i].CIDR {
-		case "10.0.5.0/24":
-			found10 = &m.Segments[i]
-		case "172.16.3.0/24":
-			found172 = &m.Segments[i]
-		}
-	}
-	if found10 == nil || found10.HostCount() != 2 {
-		t.Errorf("10.0.5.0/24 segment = %+v, want 2 hosts", found10)
-	}
-	if found172 == nil || found172.HostCount() != 1 {
-		t.Errorf("172.16.3.0/24 segment = %+v, want 1 host", found172)
-	}
-}
-
-// Hosts on a sibling VLAN (reached through the gateway) must be tagged with the
-// gateway they transited, and must not be treated as attached.
-func TestBuild_RoutedSubnetTaggedViaGateway(t *testing.T) {
-	rows := []ui.Row{
-		row("192.168.1.10"),   // on the attached LAN
-		row("192.168.100.50"), // sibling VLAN, reached via the gateway
-		row("192.168.100.60"),
-	}
-	gw := netinfo.Gateway{IP: "192.168.1.1", Interface: "en0"}
-	m := Build(rows, Input{Locals: homeLAN, Gateway: gw})
-
-	var attached, routed *Segment
-	for i := range m.Segments {
-		switch m.Segments[i].CIDR {
-		case "192.168.1.0/24":
-			attached = &m.Segments[i]
-		case "192.168.100.0/24":
-			routed = &m.Segments[i]
-		}
-	}
-	if attached == nil || !attached.Attached() {
-		t.Fatalf("192.168.1.0/24 should be attached: %+v", attached)
-	}
-	if attached.RoutedVia != "" {
-		t.Errorf("attached network must not be RoutedVia: %q", attached.RoutedVia)
-	}
-	if routed == nil {
-		t.Fatalf("192.168.100.0/24 routed segment missing: %+v", m.Segments)
-	}
-	if routed.Attached() {
-		t.Errorf("routed VLAN must not report Attached()")
-	}
-	if routed.RoutedVia != "192.168.1.1" {
-		t.Errorf("routed VLAN RoutedVia = %q, want 192.168.1.1", routed.RoutedVia)
-	}
-	if routed.HostCount() != 2 {
-		t.Errorf("routed VLAN host count = %d, want 2", routed.HostCount())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Build(tt.rows, Input{Locals: tt.locals})
+			for _, segment := range m.Segments {
+				if segment.HostCount() > 0 {
+					if segment.Interface != tt.wantIface || segment.Nodes[0].IsSelf != tt.wantSelf {
+						t.Fatalf("host placed on %q (self=%v), want %q (self=%v)", segment.Interface, segment.Nodes[0].IsSelf, tt.wantIface, tt.wantSelf)
+					}
+					if segment.HostCount() != tt.wantHosts {
+						t.Fatalf("hosts on %q = %d, want %d", segment.Interface, segment.HostCount(), tt.wantHosts)
+					}
+					return
+				}
+			}
+			t.Fatalf("host was not placed: %+v", m)
+		})
 	}
 }
 
-// Without a known gateway, routed hosts still segment but carry no via label
-// (we can't claim a path we don't know).
-func TestBuild_RoutedWithoutGatewayHasNoVia(t *testing.T) {
-	m := Build([]ui.Row{row("10.9.9.9")}, Input{Locals: homeLAN, Gateway: netinfo.Gateway{}})
-	for i := range m.Segments {
-		if m.Segments[i].CIDR == "10.9.9.0/24" && m.Segments[i].RoutedVia != "" {
-			t.Errorf("no gateway known, but RoutedVia = %q", m.Segments[i].RoutedVia)
-		}
+func TestBuild_CoveragePlacement(t *testing.T) {
+	tests := []struct {
+		name        string
+		rows        []ui.Row
+		coverage    []string
+		wantCIDRs   []string
+		wantOrphans int
+	}{
+		{name: "one slash sixteen", rows: []ui.Row{row("10.20.1.1"), row("10.20.200.2")}, coverage: []string{"10.20.0.0/16"}, wantCIDRs: []string{"10.20.0.0/16"}},
+		{name: "bare address stays host observation", rows: []ui.Row{row("10.9.9.9")}, coverage: []string{"10.9.9.9"}, wantCIDRs: []string{"10.9.9.9/32"}},
+		{name: "most specific coverage", rows: []ui.Row{row("10.20.2.3")}, coverage: []string{"10.20.0.0/16", "10.20.2.0/24"}, wantCIDRs: []string{"10.20.2.0/24"}},
+		{name: "IPv6 coverage", rows: []ui.Row{row("2001:db8:abcd::7")}, coverage: []string{"2001:db8:abcd::/48"}, wantCIDRs: []string{"2001:db8:abcd::/48"}},
+		{name: "segments sort independently of map iteration", rows: []ui.Row{row("172.16.0.1"), row("10.0.0.1")}, coverage: []string{"172.16.0.0/16", "10.0.0.0/8"}, wantCIDRs: []string{"10.0.0.0/8", "172.16.0.0/16"}},
+		{name: "outside coverage remains orphan", rows: []ui.Row{row("172.16.3.1")}, coverage: []string{"10.20.0.0/16"}, wantOrphans: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Build(tt.rows, Input{Locals: homeLAN, Gateway: netinfo.Gateway{IP: "192.168.1.1"}, Coverage: tt.coverage})
+			var got []string
+			for _, segment := range m.Segments[1:] {
+				got = append(got, segment.CIDR)
+				if segment.RoutedVia != "" {
+					t.Errorf("coverage does not prove RoutedVia, got %q", segment.RoutedVia)
+				}
+				if segment.Inferred {
+					t.Errorf("scan target %q was incorrectly marked inferred", segment.CIDR)
+				}
+			}
+			if len(got) != len(tt.wantCIDRs) {
+				t.Fatalf("routed CIDRs = %v, want %v", got, tt.wantCIDRs)
+			}
+			for i := range got {
+				if got[i] != tt.wantCIDRs[i] {
+					t.Errorf("routed CIDR %d = %q, want %q", i, got[i], tt.wantCIDRs[i])
+				}
+			}
+			if len(m.Orphans) != tt.wantOrphans {
+				t.Errorf("orphans = %d, want %d", len(m.Orphans), tt.wantOrphans)
+			}
+		})
+	}
+}
+
+func TestBuild_ScannedEmptyDiffersFromNeverScanned(t *testing.T) {
+	locals := []netinfo.Network{
+		{Interface: "en0", CIDR: "192.168.1.0/24", Addr: "192.168.1.10"},
+		{Interface: "en1", CIDR: "192.168.2.0/24", Addr: "192.168.2.10"},
+	}
+	m := Build(nil, Input{Locals: locals, Coverage: []string{"192.168.1.0/24"}})
+	if m.Segments[0].NotScanned {
+		t.Error("covered empty segment must record that it was scanned")
+	}
+	if !m.Segments[1].NotScanned {
+		t.Error("uncovered empty segment must remain NotScanned")
 	}
 }
 

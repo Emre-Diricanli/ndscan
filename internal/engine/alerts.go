@@ -52,7 +52,7 @@ func saveGatewayState(g gatewayState) error {
 // the newly-seen keys already exist. Computing them a second time in each front
 // end is how the three of them drifted apart on history handling, and alerts
 // would drift the same way.
-func (e *Engine) evaluateAlerts(rec *Record, out Outcome, gatewayIP string, now time.Time) []alert.Alert {
+func (e *Engine) evaluateAlerts(rec *Record, out Outcome, gatewayIP string, now time.Time, firstInventory bool) []alert.Alert {
 	// The gateway's MAC comes from this scan's own ARP data rather than a
 	// separate lookup: it is the address we actually observed while scanning,
 	// which is the one an attacker would have had to poison.
@@ -70,7 +70,25 @@ func (e *Engine) evaluateAlerts(rec *Record, out Outcome, gatewayIP string, now 
 		prevMAC = ""
 	}
 
-	alerts := alert.Evaluate(alert.Load(), rec.Diff, rec.Devices, rec.NewDevices, curMAC, prevMAC, now)
+	// The scan that builds the first inventory sees every host as new. That is
+	// not a set of arrivals, it is the moment we started watching, and
+	// announcing it as arrivals is a notification storm on day one.
+	// appendTimeline already declines to record the equivalent for the same
+	// reason; alerting has to make the same distinction.
+	newKeys := rec.NewDevices
+	if firstInventory {
+		newKeys = nil
+	}
+	// LoadChecked: invalid rules must not silently become the defaults, which
+	// would re-enable alerting a user deliberately turned off. On a broken file
+	// we say so and evaluate nothing rather than assume.
+	rules, err := alert.LoadChecked()
+	if err != nil {
+		rec.Warnings = append(rec.Warnings,
+			"alert rules could not be read, so no alerts were raised for this scan: "+err.Error())
+		return nil
+	}
+	alerts := alert.Evaluate(rules, rec.Diff, rec.Devices, newKeys, curMAC, prevMAC, now)
 
 	if curMAC != "" {
 		if err := saveGatewayState(gatewayState{IP: gatewayIP, MAC: curMAC, Seen: now}); err != nil {

@@ -170,6 +170,17 @@ func (k ScanKey) signature() string {
 	return strings.Join(t, ",") + "|" + k.Ports + "|" + k.Preset + "|" + mode
 }
 
+// Scope is a stable identifier for "the same scan", suitable for tagging
+// records in other stores so they can be filtered back to the scan that
+// produced them.
+//
+// It is derived from the same canonical signature the history filename uses, so
+// a second store cannot drift into its own interpretation of what makes two
+// scans comparable — the timeline previously had no scope at all, and `ndscan
+// diff` consequently reported changes from whichever network happened to be
+// scanned last.
+func (k ScanKey) Scope() string { return historyKey(k) }
+
 // historyKey identifies "the same scan" across runs.
 func historyKey(k ScanKey) string {
 	h := sha1.Sum([]byte(k.signature()))

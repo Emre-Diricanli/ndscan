@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +44,11 @@ type Record struct {
 	// one, so it has to be said out loud rather than swallowed.
 	Warnings []string
 }
+
+// timelineRetention is how far back the event log is kept. Long enough that
+// "when did this first appear" stays answerable across a season, short enough
+// that an always-on watcher does not accumulate forever.
+const timelineRetention = 90 * 24 * time.Hour
 
 // Comparable reports whether this run updated the baseline.
 func (r Record) Comparable() bool { return r.Diff != nil }
@@ -87,18 +94,40 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 	// Device identity before the timeline, because timeline events are keyed by
 	// device: a host has to have an identity before anything can be recorded
 	// against it.
-	devices, added := device.Apply(device.Load(), device.FromRows(out.Rows, out.MACs, now), oui)
+	//
+	// firstInventory records whether we knew of any device at all before this
+	// scan. On a fresh install every host on the network is "new", which is an
+	// artefact of having just started looking rather than an event — a small
+	// home network produced four notifications on its first run, which is how
+	// a person learns to turn alerting off.
+	// LoadChecked: a corrupt store must not read as "no devices known", which
+	// is what let a later Save overwrite it and destroy user-assigned names.
+	// The scan still completes — losing identity tracking for one run is better
+	// than failing a scan that otherwise worked — but the user is told.
+	known, err := device.LoadChecked()
+	if err != nil {
+		rec.Warnings = append(rec.Warnings,
+			"device records could not be read, so identity tracking is paused for this scan: "+err.Error())
+	}
+	firstInventory := len(known) == 0
+	devices, added := device.Apply(known, device.FromRows(out.Rows, out.MACs, now), oui)
 	rec.Devices, rec.NewDevices = devices, added
 	if err := device.Save(devices); err != nil {
 		rec.Warnings = append(rec.Warnings, "device records could not be saved: "+err.Error())
 	}
 
-	rec.Events = e.appendTimeline(rec, out, now)
+	rec.Events = e.appendTimeline(rec, out, now, key.Scope())
+
+	// Retention. Nothing pruned the log before, so a watch-mode user accrued
+	// events indefinitely — the cost fell hardest on whoever adopted the
+	// feature most enthusiastically. Failure here is not worth reporting: the
+	// scan succeeded, and the next one tries again.
+	_ = timeline.Prune(now.Add(-timelineRetention))
 
 	// Alerting last: it reads the diff and the device set this run produced, so
 	// it has to come after both. The suppressor is per-Engine, which is what
 	// makes watch mode report a new device once rather than every interval.
-	for _, a := range e.evaluateAlerts(&rec, out, gatewayIP, now) {
+	for _, a := range e.evaluateAlerts(&rec, out, gatewayIP, now, firstInventory) {
 		if e.suppressor().Allow(a) {
 			rec.Alerts = append(rec.Alerts, a)
 		}
@@ -122,7 +151,7 @@ func (e *Engine) suppressor() *alert.Suppressor {
 // *changed* rather than restating the whole network on every scan. A watch loop
 // running every minute would otherwise write thousands of identical "still
 // here" records a day and bury the events that matter.
-func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeline.Event {
+func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time, scope string) []timeline.Event {
 	// The first comparable scan of a signature has no previous snapshot, so
 	// every host would read as new. That is an artefact of having just started
 	// watching, not an event: recording it would date every device's arrival to
@@ -130,6 +159,11 @@ func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeli
 	if len(rec.Previous) == 0 {
 		return nil
 	}
+
+	// One run identifier for every event this scan writes. Timestamp equality
+	// cannot serve as the batch boundary: two scans can finish in the same
+	// instant, and a scan's own events need not share a timestamp exactly.
+	run := runID(scope, now)
 
 	keyFor := deviceKeys(out)
 	var events []timeline.Event
@@ -142,17 +176,19 @@ func (e *Engine) appendTimeline(rec Record, out Outcome, now time.Time) []timeli
 		case d.New:
 			events = append(events, timeline.Event{
 				Type: timeline.EventHostSeen, Timestamp: now, DeviceKey: key, IP: ip,
+				Scope: scope, Run: run,
 			})
 		case d.Gone:
 			events = append(events, timeline.Event{
 				Type: timeline.EventHostGone, Timestamp: now, DeviceKey: key, IP: ip,
+				Scope: scope, Run: run,
 			})
 		}
 		for _, port := range d.PortsOpened {
-			events = append(events, portEvent(timeline.EventPortOpened, now, key, ip, port))
+			events = append(events, portEvent(timeline.EventPortOpened, now, key, ip, port, scope, run))
 		}
 		for _, port := range d.PortsClosed {
-			events = append(events, portEvent(timeline.EventPortClosed, now, key, ip, port))
+			events = append(events, portEvent(timeline.EventPortClosed, now, key, ip, port, scope, run))
 		}
 	}
 
@@ -181,11 +217,23 @@ func deviceKeys(out Outcome) map[string]string {
 	return keys
 }
 
-func portEvent(kind timeline.EventType, now time.Time, key, ip, port string) timeline.Event {
+func portEvent(kind timeline.EventType, now time.Time, key, ip, port, scope, run string) timeline.Event {
 	n, proto := splitPort(port)
 	return timeline.Event{
 		Type: kind, Timestamp: now, DeviceKey: key, IP: ip, Port: n, Protocol: proto,
+		Scope: scope, Run: run,
 	}
+}
+
+// runID derives a stable per-run identifier from the scan signature and the
+// moment the run is attributed to.
+//
+// It is a hash rather than a counter so it needs no shared state and no
+// coordination between processes: a CLI scan and the web server watching can
+// both write without agreeing on anything first.
+func runID(scope string, at time.Time) string {
+	h := sha1.Sum([]byte(scope + "|" + at.UTC().Format(time.RFC3339Nano)))
+	return hex.EncodeToString(h[:8])
 }
 
 // splitPort reads a port number and protocol out of a diff entry.

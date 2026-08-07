@@ -120,9 +120,9 @@ func TestQueries(t *testing.T) {
 			}
 		}},
 		{"recent inclusive", func(t *testing.T) {
-			got, err := Recent(at("2026-02-01", "13:00:00"))
+			got, err := recent(at("2026-02-01", "13:00:00"))
 			if err != nil || len(got) != 2 {
-				t.Fatalf("Recent() has %d events, err = %v", len(got), err)
+				t.Fatalf("recent() has %d events, err = %v", len(got), err)
 			}
 		}},
 		{"devices sorted", func(t *testing.T) {
@@ -183,11 +183,11 @@ func TestConcurrentAppend(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := Recent(time.Time{})
+	got, err := recent(time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != count {
-		t.Fatalf("Recent() has %d events, want %d", len(got), count)
+		t.Fatalf("recent() has %d events, want %d", len(got), count)
 	}
 }

@@ -55,6 +55,11 @@ type doneMsg struct {
 	// alerts are the changes the user's rules said are worth interrupting for,
 	// already de-duplicated across watch intervals.
 	alerts []alert.Alert
+	// warnings are non-fatal persistence problems from the engine (failed
+	// history/device writes, a corrupt store it refused to overwrite). The CLI
+	// and the web both show them; dropping them here would leave a TUI user
+	// with silently broken change detection.
+	warnings []string
 }
 
 type phaseTimings struct {
@@ -181,6 +186,7 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			firstErr:  out.FirstErr,
 			fallbacks: out.Fallbacks,
 			alerts:    rec.Alerts,
+			warnings:  rec.Warnings,
 		}
 	}()
 

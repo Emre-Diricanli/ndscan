@@ -92,12 +92,19 @@ func TestTopologyView_RiskIsSurfaced(t *testing.T) {
 	}
 }
 
-// Hosts outside the local networks (a remote scan) still get their own segment.
-func TestTopologyView_RemoteSubnetGetsSegment(t *testing.T) {
+// A host outside every local network is grouped by the target that covered it,
+// not by a /24 invented around its address. With no target to place it in it
+// stays an explicit unknown — the map no longer manufactures a plausible
+// subnet nobody scanned.
+func TestTopologyView_RemoteSubnetUsesScannedPrefix(t *testing.T) {
 	m := mapModel(t, ui.Row{IP: "10.20.30.5", Host: "remote", Up: true})
+	m.params.targets = []string{"10.20.0.0/16"}
 	out := m.topologyView()
-	if !strings.Contains(out, "10.20.30.0/24") {
-		t.Errorf("remote subnet should appear as its own segment:\n%s", out)
+	if !strings.Contains(out, "10.20.0.0/16") {
+		t.Errorf("routed host should render under the prefix that was scanned:\n%s", out)
+	}
+	if strings.Contains(out, "10.20.30.0/24") {
+		t.Errorf("map invented a /24 that was never scanned:\n%s", out)
 	}
 }
 

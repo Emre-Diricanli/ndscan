@@ -186,11 +186,20 @@ func runDiff(w io.Writer, o diffOptions) (int, error) {
 		Changes:  []changeEntry{},
 	}
 
+	// Every read is scoped to this exact scan signature. Reading the log
+	// unscoped is what made this command report one network's changes under
+	// another network's name — it asked for "the most recent events" and got
+	// whichever network happened to be scanned last.
+	scope := key.Scope()
+
 	var events []timeline.Event
 	if o.sinceSet {
 		out.Mode = "since"
 		out.Since = o.since.String()
-		ev, err := timeline.Recent(time.Now().Add(-o.since))
+		ev, err := timeline.Select(timeline.Query{
+			Scope: scope,
+			Since: time.Now().Add(-o.since),
+		})
 		if err != nil {
 			return diffExitUnchanged, err
 		}
@@ -200,14 +209,11 @@ func runDiff(w io.Writer, o diffOptions) (int, error) {
 		// Without a baseline for this exact signature there is nothing to
 		// diff against; the friendly empty state beats an invented one.
 		if out.Baseline {
-			// A zero since returns every recorded event; the timeline is the
-			// only durable record of what changed, written by the scans
-			// themselves as they ran.
-			all, err := timeline.Recent(time.Time{})
+			ev, _, err := timeline.LatestRun(scope)
 			if err != nil {
 				return diffExitUnchanged, err
 			}
-			events = latestBatch(all)
+			events = ev
 			if len(events) > 0 {
 				out.RecordedAt = events[0].Timestamp.Local().Format("2006-01-02 15:04:05")
 			}
@@ -224,22 +230,6 @@ func runDiff(w io.Writer, o diffOptions) (int, error) {
 		return diffExitChanged, nil
 	}
 	return diffExitUnchanged, nil
-}
-
-// latestBatch returns the events recorded by the most recent scan that saw a
-// difference. One scan stamps all of its events with the same timestamp, so
-// the newest timestamp identifies the batch. events must be timestamp-ordered
-// (as timeline.Recent returns them).
-func latestBatch(events []timeline.Event) []timeline.Event {
-	if len(events) == 0 {
-		return nil
-	}
-	last := events[len(events)-1].Timestamp
-	i := len(events) - 1
-	for i >= 0 && events[i].Timestamp.Equal(last) {
-		i--
-	}
-	return events[i+1:]
 }
 
 // changeEntries resolves device labels and orders events for display.

@@ -7,42 +7,61 @@ import (
 	"testing"
 )
 
-func TestLoadDefaultsWhenMissing(t *testing.T) {
-	t.Setenv("NDSCAN_CONFIG_DIR", t.TempDir())
-
-	got := Load()
-	want := Defaults()
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("missing file should yield defaults\ngot:  %+v\nwant: %+v", got, want)
+// Missing and invalid are different states: missing means a fresh install and
+// gets Defaults; invalid is refused, because substituting Defaults would
+// silently re-enable rules the user deliberately disabled. An empty list sits
+// in between — it looks exactly like a truncated write, so it still degrades
+// to Defaults.
+func TestLoadStates(t *testing.T) {
+	valid := []byte(`[{"name":"telnet-watch","kind":"port-opened","ports":[23]}]`)
+	cases := []struct {
+		name         string
+		contents     []byte // nil = file absent
+		wantErr      bool
+		wantDefaults bool
+	}{
+		{"missing file", nil, false, true},
+		{"invalid file", []byte("{not json"), true, false},
+		{"empty file", []byte(""), true, false},
+		{"empty list", []byte("[]"), false, true},
+		{"valid file", valid, false, false},
 	}
-	if len(got) == 0 {
-		t.Fatal("defaults must not be empty: a fresh install should do something useful")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("NDSCAN_CONFIG_DIR", dir)
+			if tc.contents != nil {
+				if err := os.WriteFile(filepath.Join(dir, "rules.json"), tc.contents, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := LoadChecked()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("LoadChecked() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantDefaults && !reflect.DeepEqual(got, Defaults()) {
+				t.Errorf("LoadChecked() = %+v, want Defaults", got)
+			}
+			if tc.wantDefaults && len(got) == 0 {
+				t.Error("defaults must not be empty: a fresh install should do something useful")
+			}
+			if !tc.wantErr && !tc.wantDefaults && len(got) == 0 {
+				t.Error("LoadChecked() of a valid file returned no rules")
+			}
 
-func TestLoadCorruptFallsBackToDefaults(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("NDSCAN_CONFIG_DIR", dir)
-	if err := os.WriteFile(filepath.Join(dir, "rules.json"), []byte("{not json"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := Load(); !reflect.DeepEqual(got, Defaults()) {
-		t.Fatalf("corrupt file should yield defaults, got %+v", got)
-	}
-}
-
-func TestLoadEmptyListFallsBackToDefaults(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("NDSCAN_CONFIG_DIR", dir)
-	if err := os.WriteFile(filepath.Join(dir, "rules.json"), []byte("[]"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// An explicitly empty file would silence all alerting, which is exactly
-	// what a corrupt/truncated write looks like — treat it as unusable.
-	if got := Load(); !reflect.DeepEqual(got, Defaults()) {
-		t.Fatalf("empty rule list should yield defaults, got %+v", got)
+			plain := Load()
+			switch {
+			case tc.wantErr:
+				// The non-erroring form must never substitute Defaults for a
+				// file the user edited: that silently re-enables rules they
+				// turned off. Refusing (no rules) is the honest failure.
+				if reflect.DeepEqual(plain, Defaults()) {
+					t.Error("Load() substituted Defaults for an invalid file")
+				}
+			case !reflect.DeepEqual(plain, got):
+				t.Errorf("Load() = %+v, want the LoadChecked result %+v", plain, got)
+			}
+		})
 	}
 }
 
