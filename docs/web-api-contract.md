@@ -117,17 +117,29 @@ Returns `404 Not Found` when the host produces no scan result.
       "cidr": "192.168.2.0/24",
       "interface": "en0",
       "selfAddr": "192.168.2.157",
+      "inferred": false,
       "notScanned": false,
       "routedVia": "",
       "nodes": [ /* Node */ ]
     }
-  ]
+  ],
+  "orphans": [ /* Node */ ]
 }
 ```
 `interface` is empty for segments not attached to this machine.
 `routedVia` is the gateway IP for subnets reached through it (a sibling VLAN);
 empty for attached segments. A segment with `notScanned: true` is attached but
 was not covered by the scan — render it as unknown, never as empty.
+
+A segment with `inferred: true` has a boundary that was guessed rather than
+observed on an interface or supplied as a scan target. Render it visibly
+differently: a guessed boundary must never read as a measured fact.
+
+`orphans` holds hosts that answered the scan but fall inside no attached
+network and no scan target. They are outside `segments` precisely because no
+CIDR honestly contains them, and they are omitted when empty. Render them —
+a host that answered must not disappear from the map — but do not place them
+under any network.
 
 ### Node
 ```json
