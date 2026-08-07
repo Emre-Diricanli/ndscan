@@ -89,7 +89,15 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 	// Device identity before the timeline, because timeline events are keyed by
 	// device: a host has to have an identity before anything can be recorded
 	// against it.
-	devices, added := device.Apply(device.Load(), device.FromRows(out.Rows, out.MACs, now), oui)
+	//
+	// firstInventory records whether we knew of any device at all before this
+	// scan. On a fresh install every host on the network is "new", which is an
+	// artefact of having just started looking rather than an event — a small
+	// home network produced four notifications on its first run, which is how
+	// a person learns to turn alerting off.
+	known := device.Load()
+	firstInventory := len(known) == 0
+	devices, added := device.Apply(known, device.FromRows(out.Rows, out.MACs, now), oui)
 	rec.Devices, rec.NewDevices = devices, added
 	if err := device.Save(devices); err != nil {
 		rec.Warnings = append(rec.Warnings, "device records could not be saved: "+err.Error())
@@ -100,7 +108,7 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 	// Alerting last: it reads the diff and the device set this run produced, so
 	// it has to come after both. The suppressor is per-Engine, which is what
 	// makes watch mode report a new device once rather than every interval.
-	for _, a := range e.evaluateAlerts(&rec, out, gatewayIP, now) {
+	for _, a := range e.evaluateAlerts(&rec, out, gatewayIP, now, firstInventory) {
 		if e.suppressor().Allow(a) {
 			rec.Alerts = append(rec.Alerts, a)
 		}

@@ -29,6 +29,17 @@ func newEventBus() *eventBus {
 	return &eventBus{subs: make(map[int]chan sseMessage)}
 }
 
+// listeners reports how many clients are attached.
+//
+// Alert delivery uses it to decide whether anyone is actually there: the watch
+// loop exists so monitoring survives a closed tab, so when the tab is closed
+// the alert has to reach the user some other way.
+func (b *eventBus) listeners() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs)
+}
+
 func (b *eventBus) subscribe() (int, <-chan sseMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

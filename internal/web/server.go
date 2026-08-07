@@ -23,6 +23,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/engine"
 	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
+	"github.com/Emre-Diricanli/ndscan/internal/notify"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/topology"
@@ -490,11 +491,21 @@ func (s *Server) finishScan(out engine.Outcome, plan engine.Plan, start time.Tim
 	// Alerts reach the browser as their own event so the UI can surface a new
 	// device or a changed gateway MAC rather than leaving it in a diff table
 	// the user has to read to notice.
+	// An open tab sees alerts in the page; a closed one has to be told another
+	// way. The watch loop's whole purpose is to survive a closed tab, so
+	// publishing to SSE alone meant the gateway-MAC canary — the highest
+	// severity rule there is — fired into nothing whenever nobody was looking.
+	unattended := s.bus.listeners() == 0
 	for _, a := range rec.Alerts {
 		s.bus.publish("alert", map[string]any{
 			"rule": a.Rule, "severity": a.Severity,
 			"title": a.Title, "body": a.Body, "subject": a.Subject,
 		})
+		if unattended {
+			// Best effort: a desktop that cannot show notifications must not
+			// fail the scan that produced them.
+			_ = notify.Send(notify.Notification{Title: a.Title, Message: a.Body})
+		}
 	}
 	for _, w := range rec.Warnings {
 		// A failed write is not fatal to this scan but silently disables change
