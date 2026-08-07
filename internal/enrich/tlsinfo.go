@@ -25,9 +25,6 @@ type TLSInfo struct {
 	CommonName   string
 	Issuer       string
 	NotAfter     time.Time
-	// Expiry is an alias of NotAfter retained for callers that prefer the
-	// product-facing term. Both fields always carry the same value.
-	Expiry time.Time
 }
 
 // TLSConfig bounds certificate identification. Endpoints must be host:port
@@ -159,7 +156,6 @@ func lookupOneTLS(ctx context.Context, endpoint string) (TLSInfo, bool) {
 		CommonName:   cleanCertificateText(leaf.Subject.CommonName),
 		Issuer:       cleanCertificateText(leaf.Issuer.CommonName),
 		NotAfter:     leaf.NotAfter,
-		Expiry:       leaf.NotAfter,
 	}, true
 }
 
