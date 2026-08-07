@@ -15,12 +15,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Emre-Diricanli/ndscan/internal/engine"
+	"github.com/Emre-Diricanli/ndscan/internal/netinfo"
 	"github.com/Emre-Diricanli/ndscan/internal/report"
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
 	"github.com/Emre-Diricanli/ndscan/internal/tui"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/update"
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
+	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 	"github.com/Emre-Diricanli/ndscan/internal/web"
 )
 
@@ -74,6 +76,7 @@ func main() {
 		discoverOnly   bool
 		fastDiscover   bool
 		mdns           bool
+		tlsID          bool
 		showMac        bool
 		showVendors    bool
 		rootScan       bool
@@ -193,7 +196,7 @@ Otherwise, nmap runs locally.`,
 				ShowMAC: showMac, ShowVendors: showVendors, RootScan: rootScan,
 				Concurrency: concurrency, HostTimeout: time.Duration(hostTimeoutSec) * time.Second,
 				Fast: fastDiscover, DiscoverOnly: discoverOnly, Hostnames: true,
-				Multicast: mdns,
+				Multicast: mdns, IdentifyTLS: tlsID,
 			}
 			sp := ui.StartSpinner(fmt.Sprintf("Discovering hosts on %s (%s)…", strings.Join(targets, ", "), where))
 			var progressMu sync.Mutex
@@ -232,7 +235,9 @@ Otherwise, nmap runs locally.`,
 					sp.Update(fmt.Sprintf("Scanning ports on %d host(s) (preset: %s)… %d/%d", ev.Total, preset, ev.Done, ev.Total))
 				}
 			}
-			outcome := engine.New().Run(ctx, plan, emit)
+			eng := engine.New()
+			scanStart := time.Now()
+			outcome := eng.Run(ctx, plan, emit)
 			if outcome.Status == engine.StatusFailed {
 				sp.Fail("Host discovery failed")
 				return outcome.Err
@@ -245,6 +250,24 @@ Otherwise, nmap runs locally.`,
 				sp.Fail("Port scan failed")
 				return outcome.FirstErr
 			}
+			// Record the run so `ndscan diff` has a baseline. The CLI is
+			// otherwise stateless, but a diff command that tells the user to
+			// run a scan, from a scan that records nothing, is advice that
+			// cannot be followed. Persist rejects untrustworthy runs itself.
+			// Vendors only matter when the user asked to see them; loading the
+			// ~39k-prefix OUI table otherwise is pure cost.
+			var oui vendor.DB
+			if showMac && showVendors {
+				oui = vendor.LoadDefault()
+			}
+			rec := eng.PersistWithGateway(outcome, plan, scanStart, oui, netinfo.DefaultGateway().IP)
+			for _, w := range rec.Warnings {
+				ui.Warnf("%s", w)
+			}
+			for _, a := range rec.Alerts {
+				ui.Warnf("%s: %s", a.Title, a.Body)
+			}
+
 			if len(outcome.Rows) == 0 {
 				sp.Fail("No live hosts found.")
 				return nil
@@ -346,6 +369,7 @@ Otherwise, nmap runs locally.`,
 	scanCmd.Flags().StringVarP(&jsonOut, "json", "j", "", "write JSON output to file")
 	scanCmd.Flags().StringVar(&reportOut, "report", "", "write a Markdown/HTML report (format inferred from .md/.html)")
 	scanCmd.Flags().BoolVar(&noOpen, "no-open", false, "don't open HTML reports in the browser")
+	scanCmd.Flags().BoolVar(&tlsID, "tls", false, "read certificates on open TLS ports to identify the product behind a host")
 	scanCmd.Flags().BoolVar(&mdns, "mdns", false, "ask the network for its own names via mDNS/SSDP (adds a few seconds)")
 	scanCmd.Flags().BoolVar(&fastDiscover, "fast", false, "native ARP+TCP host discovery (no nmap, no root) — much faster on a LAN")
 	scanCmd.Flags().BoolVar(&discoverOnly, "discover", false, "only list live hosts (skip the port scan) — fastest")
@@ -393,6 +417,7 @@ address on a network you trust, and never on an untrusted one.`,
 	root.AddCommand(scanCmd)
 	root.AddCommand(tuiCmd)
 	root.AddCommand(webCmd)
+	root.AddCommand(newDiffCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

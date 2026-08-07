@@ -569,6 +569,7 @@ func (s *Server) scanPlan(targets []string, preset string, fast bool) engine.Pla
 		Fast:         fast,
 		Hostnames:    true,
 		Multicast:    true,
+		IdentifyTLS:  true,
 	}
 }
 

@@ -61,6 +61,11 @@ type Plan struct {
 	// and it is the only pass that learns anything about devices which never
 	// answer a TCP probe. Bounded by its own timeouts.
 	Multicast bool
+	// IdentifyTLS reads the certificate on ports already proven open, which
+	// names the product behind a host — a certificate saying "GLKVM" identifies
+	// a device an OUI lookup could not, and OUI is unavailable across a router
+	// anyway. Unlike Multicast this opens connections, so it stays opt-in.
+	IdentifyTLS bool
 }
 
 // Status describes how a run ended. It exists so that "we looked and found
