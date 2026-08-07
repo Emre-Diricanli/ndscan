@@ -418,6 +418,7 @@ address on a network you trust, and never on an untrusted one.`,
 	root.AddCommand(tuiCmd)
 	root.AddCommand(webCmd)
 	root.AddCommand(newDiffCmd())
+	root.AddCommand(newDevicesCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

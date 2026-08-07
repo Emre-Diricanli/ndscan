@@ -45,6 +45,11 @@ type Record struct {
 	Warnings []string
 }
 
+// timelineRetention is how far back the event log is kept. Long enough that
+// "when did this first appear" stays answerable across a season, short enough
+// that an always-on watcher does not accumulate forever.
+const timelineRetention = 90 * 24 * time.Hour
+
 // Comparable reports whether this run updated the baseline.
 func (r Record) Comparable() bool { return r.Diff != nil }
 
@@ -104,6 +109,12 @@ func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vend
 	}
 
 	rec.Events = e.appendTimeline(rec, out, now, key.Scope())
+
+	// Retention. Nothing pruned the log before, so a watch-mode user accrued
+	// events indefinitely — the cost fell hardest on whoever adopted the
+	// feature most enthusiastically. Failure here is not worth reporting: the
+	// scan succeeded, and the next one tries again.
+	_ = timeline.Prune(now.Add(-timelineRetention))
 
 	// Alerting last: it reads the diff and the device set this run produced, so
 	// it has to come after both. The suppressor is per-Engine, which is what

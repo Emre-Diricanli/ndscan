@@ -236,9 +236,11 @@ func PortHistory(deviceKey string, port int) ([]Event, error) {
 	}), nil
 }
 
-// Recent returns events at or after since in timestamp order, across every
-// scan. Callers that mean "this network" want Select with a Scope instead.
-func Recent(since time.Time) ([]Event, error) {
+// recent returns events at or after since across every scan.
+//
+// Unexported: every caller wants a scope, and an unscoped read is the mistake
+// this package spent a wave fixing. Select is the supported entry point.
+func recent(since time.Time) ([]Event, error) {
 	return Select(Query{Since: since})
 }
 
@@ -335,6 +337,9 @@ func seenBound(deviceKey string, last bool) (time.Time, bool, error) {
 }
 
 // Devices returns every known opaque device key in lexical order.
+//
+// internal/device is the inventory of record; this answers the narrower
+// question of which devices the event log itself has heard of.
 func Devices() ([]string, error) {
 	events, err := allEvents()
 	if err != nil {
