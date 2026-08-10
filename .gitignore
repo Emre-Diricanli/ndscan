@@ -10,3 +10,9 @@
 *.swp
 .idea/
 .vscode/
+
+# local design specs — never publish these
+# Working notes from brainstorming sessions. They are drafts, not documentation,
+# and every push to main auto-publishes a release. Tracked here rather than in
+# .git/info/exclude so the rule survives a re-clone.
+/docs/superpowers/
