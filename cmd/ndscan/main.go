@@ -521,8 +521,10 @@ func ensureRoot() (bool, error) {
 	// discovery mode is part of the scan history key, so flipping it would file
 	// every future scan under a key that must never be compared against the
 	// baselines a user already has.
+	// os.Args[1:] already begins with the "scan" subcommand, so the suggestion
+	// interpolates the whole invocation and only adds the flag.
 	ui.Infof("nmap discovery needs root; sudo will prompt now.")
-	ui.Infof("For an unprivileged scan instead, use: ndscan scan --fast %s", strings.Join(os.Args[1:], " "))
+	ui.Infof("For an unprivileged scan instead, use: ndscan %s --fast", strings.Join(os.Args[1:], " "))
 	cmd := exec.Command("sudo", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
