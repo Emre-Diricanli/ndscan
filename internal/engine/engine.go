@@ -61,6 +61,18 @@ type Plan struct {
 	// and it is the only pass that learns anything about devices which never
 	// answer a TCP probe. Bounded by its own timeouts.
 	Multicast bool
+	// DeferMulticast keeps the multicast pass out of Run, leaving it for the
+	// caller to drive through ResolveNames once the results are on screen.
+	//
+	// The pass is a fixed multi-second listen window — the network is given
+	// time to answer — and it is the single largest cost in a fast scan: a
+	// local /24 goes from ~0.9s to ~5.5s, six times slower, for a column that
+	// arrives at the very end anyway. A front end that can update rows in place
+	// should not make the user wait for it.
+	//
+	// Ignored unless Multicast is also set: this changes *when* that pass runs,
+	// not whether.
+	DeferMulticast bool
 	// IdentifyTLS reads the certificate on ports already proven open, which
 	// names the product behind a host — a certificate saying "GLKVM" identifies
 	// a device an OUI lookup could not, and OUI is unavailable across a router

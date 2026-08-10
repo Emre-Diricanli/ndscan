@@ -217,9 +217,14 @@ func (e *Engine) enrich(ctx context.Context, p Plan, emit Emit, out *Outcome) {
 	// advertises itself as "Living-Room-TV" is telling us what it is; a PTR
 	// record, where one exists at all, usually just spells the address back.
 	//
+	// DeferMulticast moves that pass out of the scan entirely — see
+	// ResolveNames. The ordering argument above still holds; what changes is
+	// that the later pass is allowed to overwrite the reverse-DNS answer
+	// instead of losing to it.
+	//
 	// Both passes are opt-in per plan and strictly bounded, so a network where
 	// nothing answers costs their timeout and nothing else.
-	if p.Multicast {
+	if p.Multicast && !p.DeferMulticast {
 		ui.ApplyHostnames(out.Rows, e.multicastNames(ctx))
 	}
 	ui.ApplyHostnames(out.Rows, enrich.LookupPTR(ctx, ips, enrich.Config{}))
@@ -227,6 +232,48 @@ func (e *Engine) enrich(ctx context.Context, p Plan, emit Emit, out *Outcome) {
 	// in a column. Re-announcing them as arrivals would duplicate every host in
 	// a front end that appends.
 	emit.rowsUpdated(out.Rows)
+}
+
+// ResolveNames runs the multicast pass a DeferMulticast plan left undone, and
+// reports the rows whose names it improved.
+//
+// This is the second half of a scan that chose to show its results early. The
+// caller owns the timing: it hands back the rows it is displaying, gets them
+// back with better names, and refreshes whatever is on screen. Rows are copied
+// rather than mutated in place, because the caller's slice is very likely being
+// read by a renderer on another goroutine while this runs.
+//
+// The returned bool reports whether anything actually changed, so a caller can
+// skip a pointless re-render — the common case on a network with no mDNS
+// speakers at all.
+//
+// Cancelling ctx abandons the pass. A caller starting a new scan should do
+// exactly that: these names describe the host set of a scan that is no longer
+// on screen.
+func (e *Engine) ResolveNames(ctx context.Context, rows []ui.Row) ([]ui.Row, bool) {
+	if len(rows) == 0 {
+		return nil, false
+	}
+	names := e.multicastNames(ctx)
+	if len(names) == 0 || ctx.Err() != nil {
+		return nil, false
+	}
+
+	updated := make([]ui.Row, len(rows))
+	copy(updated, rows)
+	ui.ApplySelfReportedNames(updated, names)
+
+	changed := false
+	for i := range updated {
+		if updated[i].Host != rows[i].Host {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil, false
+	}
+	return updated, true
 }
 
 // multicastNames asks the network what it calls itself, reusing a recent answer

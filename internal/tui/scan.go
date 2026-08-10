@@ -43,6 +43,16 @@ type hostRowMsg struct {
 	rows []ui.Row
 }
 
+// namesMsg carries rows whose hostnames improved after the scan finished.
+//
+// The multicast pass is deferred out of the scan so results appear without
+// waiting on its listen window; this is that pass arriving. It only ever
+// changes the hostname column of rows already on screen, so the results view
+// replaces its row set rather than appending.
+type namesMsg struct {
+	rows []ui.Row
+}
+
 type doneMsg struct {
 	rows      []ui.Row
 	failed    int
@@ -134,6 +144,10 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			// Ask the network what it calls itself: the map is far more
 			// useful with "Living-Room-TV" than another bare address.
 			Multicast: true,
+			// But not while the user waits. That pass is a fixed multi-second
+			// listen window and the largest single cost in a fast scan; the
+			// results screen can fill the column once it is already drawn.
+			DeferMulticast: true,
 		}
 
 		emit := func(e engine.Event) {
@@ -196,6 +210,16 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 			fallbacks: out.Fallbacks,
 			alerts:    rec.Alerts,
 			warnings:  rec.Warnings,
+		}
+
+		// The naming pass the plan deferred, now that the results are drawn.
+		// A cancelled scan gets none: its rows are already gone from the
+		// screen, and asking the network to name them would spend five seconds
+		// on an answer nobody will see.
+		if out.Status != engine.StatusCancelled && len(out.Rows) > 0 {
+			if named, ok := eng.ResolveNames(ctx, out.Rows); ok {
+				ch <- namesMsg{rows: named}
+			}
 		}
 	}()
 

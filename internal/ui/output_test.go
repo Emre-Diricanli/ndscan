@@ -239,3 +239,33 @@ func TestPrintNextSteps_ShowsOnFirstScanWithNoDiffYet(t *testing.T) {
 		t.Fatalf("first scan must still advertise diff, got %q", got)
 	}
 }
+
+// Deferring the multicast pass inverted the order the two name sources run in,
+// so the rule that kept the better name — first writer wins — would now keep
+// the worse one. A device's own answer has to be able to replace a reverse-DNS
+// result that merely spells the address back.
+func TestApplySelfReportedNames_UpgradesAResolverName(t *testing.T) {
+	rows := []Row{{IP: "192.168.1.10", Host: "mac"}}
+	ApplySelfReportedNames(rows, map[string]string{"192.168.1.10": "Sarpers-MacBook-Pro"})
+	if rows[0].Host != "Sarpers-MacBook-Pro" {
+		t.Fatalf("Host = %q, want the self-reported name", rows[0].Host)
+	}
+}
+
+// A host the pass knows nothing about keeps whatever it already had.
+func TestApplySelfReportedNames_LeavesUnknownHostsAlone(t *testing.T) {
+	rows := []Row{{IP: "192.168.1.11", Host: "router.lan"}}
+	ApplySelfReportedNames(rows, map[string]string{"192.168.1.10": "Elsewhere"})
+	if rows[0].Host != "router.lan" {
+		t.Fatalf("Host = %q, want it untouched", rows[0].Host)
+	}
+}
+
+// An empty answer must not blank a name that a resolver did supply.
+func TestApplySelfReportedNames_EmptyNameNeverClears(t *testing.T) {
+	rows := []Row{{IP: "192.168.1.12", Host: "known.lan"}}
+	ApplySelfReportedNames(rows, map[string]string{"192.168.1.12": ""})
+	if rows[0].Host != "known.lan" {
+		t.Fatalf("Host = %q, want the existing name kept", rows[0].Host)
+	}
+}
