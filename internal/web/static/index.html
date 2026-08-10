@@ -436,6 +436,29 @@
   table.ports th, table.ports td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
   table.ports th { color: var(--muted); font-weight: 600; }
   .risk { color: var(--muted); font-size: 11px; }
+  /* Per-port evidence: product, certificate, page title. Dimmer than the
+     service name so the table still scans as a port list, but present, because
+     on a routed host this is the only identification there is. */
+  .port-meta { color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .port-meta.cert { color: var(--text); }
+  .port-meta.cpe { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.75; }
+  .tls-tag {
+    margin-left: 6px;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    color: var(--muted);
+    vertical-align: 1px;
+  }
+  /* One identity per line: the name reads first, the evidence behind it second,
+     so a claim about what a device is always shows where that came from. */
+  .ident { margin-bottom: 4px; }
+  .ident:last-child { margin-bottom: 0; }
+  .ident-name { display: block; }
+  .ident-src { display: block; color: var(--muted); font-size: 11px; }
 
   #table-card { grid-area: table; }
   #table-filter {
@@ -2316,6 +2339,51 @@ function selectNode(n) {
   }
 }
 
+// identifyHost derives what a host appears to be from evidence that survives a
+// router.
+//
+// A MAC address is a link-local property: hosts on a routed subnet never expose
+// one, so the vendor column is permanently blank for exactly the hosts a user
+// most wants named. Randomised MACs blank it on the local segment too — most
+// phones and laptops now invent a new address per network, so the OUI table has
+// nothing to match.
+//
+// Certificates, HTTP titles and service banners are application-layer, so they
+// cross a router and are unaffected by MAC privacy. A certificate saying
+// "Ubiquiti Inc" identifies a device that ARP cannot even see.
+//
+// Returns the distinct identities found, strongest evidence first.
+function identifyHost(h) {
+  const found = [];
+  const seen = new Set();
+  const add = (text, source) => {
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen.has(key)) return;
+    // nmap reads the product name off the same certificate, so "Ubiquiti Inc."
+    // and "Ubiquiti Inc. — exp 2027-10-01" are one fact stated twice. Listing
+    // both pads the panel and implies two independent sources of evidence.
+    for (const prior of seen) {
+      if (prior.startsWith(key) || key.startsWith(prior)) return;
+    }
+    seen.add(key);
+    found.push({ text, source });
+  };
+
+  for (const p of h.ports || []) {
+    // A certificate names the operator of the service, which for an appliance
+    // is the appliance itself. Strongest of the three.
+    if (p.cert) add(p.cert, "TLS certificate on port " + p.port);
+    // A product string comes from nmap matching a service banner.
+    if (p.product) add(p.product + (p.version ? " " + p.version : ""), "service on port " + p.port);
+    // A page title is the weakest of the three — it is whatever the device
+    // chose to call its own web UI — but for consumer hardware that is often
+    // exactly the model name.
+    if (p.httpTitle) add(p.httpTitle, "web page on port " + p.port);
+  }
+  return found;
+}
+
 function renderDetail(h, kind, node) {
   const sev = worstSeverity(h);
   const routedVia = node && node.routedVia;
@@ -2329,11 +2397,20 @@ function renderDetail(h, kind, node) {
       ? '<span class="muted-note">unavailable — routed via ' + esc(routedVia) +
         ' (ARP is link-local)</span>'
       : '<span class="muted-note">—</span>';
+  // Identity from certificates and banners, which reach across a router.
+  const identities = identifyHost(h);
+  const hasPorts = (h.ports || []).length > 0;
+
+  // A blank vendor is a dead end only if we stop at the MAC. Point at the
+  // evidence that does work rather than restating what does not — the vendor
+  // is unavailable, but the device may still be identifiable.
   const vendorCell = h.vendor
     ? esc(h.vendor)
-    : routedVia
-      ? '<span class="muted-note">needs a MAC; none on a routed subnet</span>'
-      : '<span class="muted-note">—</span>';
+    : identities.length
+      ? '<span class="muted-note">unavailable — see Identified as below</span>'
+      : routedVia
+        ? '<span class="muted-note">needs a MAC; none on a routed subnet — a deep scan can still identify it from its certificate</span>'
+        : '<span class="muted-note">—</span>';
 
   const rows = [
     ["IP", esc(h.ip)],
@@ -2345,6 +2422,21 @@ function renderDetail(h, kind, node) {
     ["Role", kind === "self" ? "this machine" : kind === "gateway" ? "gateway" : "host"],
     ["Severity", '<span class="pill ' + (sev || "none") + '">' + (sev || "none") + "</span>"]
   ];
+
+  // Placed directly after Vendor, because it is the answer to the question the
+  // blank vendor field just raised.
+  if (identities.length) {
+    const list = identities.map((id) =>
+      '<div class="ident"><span class="ident-name">' + esc(id.text) + '</span>' +
+      '<span class="ident-src">' + esc(id.source) + "</span></div>").join("");
+    rows.splice(4, 0, ["Identified as", list]);
+  } else if (hasPorts) {
+    // Ports are open but nothing identified them, which usually means the fast
+    // sweep never asked. Saying so distinguishes "we looked and found nothing"
+    // from "nobody looked" — the two are identical on screen otherwise.
+    rows.splice(4, 0, ["Identified as",
+      '<span class="muted-note">nothing yet — a deep scan reads certificates and service banners</span>']);
+  }
   // An orphan's detail must not imply a network: the host answered, but no
   // attached network or scan target contains it, and saying so is the point.
   if (node && node.orphan) {
@@ -2362,8 +2454,21 @@ function renderDetail(h, kind, node) {
   if (ports.length) {
     html += '<table class="ports"><thead><tr><th>Port</th><th>Service</th><th>Severity</th></tr></thead><tbody>';
     for (const p of ports) {
+      // The scan already collects the product, certificate and page title for
+      // every port and sent them here; the table used to render three columns
+      // and drop the rest. On a routed host those dropped fields were the only
+      // identification available.
+      let detail = "";
+      const version = [p.product, p.version].filter(Boolean).join(" ");
+      if (version) detail += '<div class="port-meta">' + esc(version) + "</div>";
+      if (p.cert) detail += '<div class="port-meta cert">cert: ' + esc(p.cert) + "</div>";
+      if (p.httpTitle) detail += '<div class="port-meta">title: ' + esc(p.httpTitle) + "</div>";
+      if (p.extraInfo) detail += '<div class="port-meta">' + esc(p.extraInfo) + "</div>";
+      if (p.cpe) detail += '<div class="port-meta cpe">' + esc(p.cpe) + "</div>";
+
       html += "<tr><td>" + esc(p.port) + "/" + esc(p.proto || "tcp") + "</td><td>" +
-        esc(p.service || "?") +
+        esc(p.service || "?") + (p.tls ? '<span class="tls-tag">TLS</span>' : "") +
+        detail +
         (p.risk ? '<div class="risk">' + esc(p.risk) + "</div>" : "") +
         '</td><td><span class="pill ' + (p.severity || "none") + '">' + (p.severity || "none") + "</span></td></tr>";
     }
