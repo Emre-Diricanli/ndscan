@@ -154,3 +154,36 @@ func TestFrontendSurfacesLayer7Identity(t *testing.T) {
 		})
 	}
 }
+
+// The Vendor column reads a MAC through the OUI table, so it is blank for every
+// host past a router and for anything using MAC randomisation. A scan of a
+// routed subnet was a wall of dashes even where certificates named the devices
+// outright — 49 hosts, zero vendors, seven identifiable.
+func TestFrontendVendorColumnFallsBackToCertificate(t *testing.T) {
+	body := servedFrontend(t)
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"maker helper", "function hostMaker("},
+		{"oui wins when present", "if (h.vendor) return { name: h.vendor, inferred: false }"},
+		// A self-signed appliance cert often carries its own hostname as the
+		// common name, so a UniFi gateway offers "unifi.local" on 443 and
+		// "Ubiquiti Inc." on 8443. Taking the first port picked the wrong one.
+		{"prefers an organisation over a hostname", "looksLikeHostname"},
+		{"hostname heuristic rejects bare IPs", `/^[0-9.]+$/.test(s)`},
+		// An inferred name must never be passed off as a hardware fact.
+		{"inferred is marked", `class="inferred-tag"`},
+		{"inferred names its evidence", "maker.source"},
+		// The column, its filter and its sort must agree on one value.
+		{"filter uses the shown name", "maker && maker.name"},
+		{"detail panel uses the same helper", "const maker = hostMaker(h)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if !strings.Contains(body, c.want) {
+				t.Errorf("served frontend missing %q", c.want)
+			}
+		})
+	}
+}
