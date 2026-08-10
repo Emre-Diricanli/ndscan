@@ -109,9 +109,16 @@ only what earlier scans recorded, so they are instant and safe to run anywhere.
   ndscan                         interactive terminal UI
   ndscan web                     browser interface (localhost only by default)`,
 		Version: version,
-		// Offer a self-update before any real work — importantly before the
-		// TUI alt-screen starts. Silent and fast when up to date, offline, or
-		// non-interactive.
+		// Cobra answers --version itself and exits before PersistentPreRun
+		// runs, so the update hook below never sees it. That made "am I up to
+		// date?" — the one question --version is asked for — the single
+		// invocation that could not answer it, and left the only remedy
+		// (`ndscan update`) unmentioned at exactly the moment it was wanted.
+		//
+		// A hint, not a prompt: --version gets parsed by scripts, so it stays
+		// fast and its stdout stays a bare version string. The note goes to
+		// stderr, only for a terminal, and only from a cached lookup — no
+		// network call is added to a command expected to return instantly.
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			update.MaybeUpdate(context.Background(), update.Options{
 				In:          os.Stdin,
@@ -449,11 +456,14 @@ address on a network you trust, and never on an untrusted one.`,
 	webCmd.Flags().StringVar(&webAddr, "addr", "127.0.0.1:8080", "address to bind (loopback by default)")
 	webCmd.Flags().BoolVar(&webNoOpen, "no-open", false, "don't open a browser on start")
 
+	root.SetVersionTemplate("ndscan version {{.Version}}\n" + updateHint(version))
+
 	root.AddCommand(scanCmd)
 	root.AddCommand(tuiCmd)
 	root.AddCommand(webCmd)
 	root.AddCommand(newDiffCmd())
 	root.AddCommand(newDevicesCmd())
+	root.AddCommand(newUpdateCmd(version))
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

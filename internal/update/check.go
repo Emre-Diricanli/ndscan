@@ -143,6 +143,26 @@ func (c *Checker) Check(ctx context.Context, current string) (latest string, ava
 	return ch.Latest, available, nil
 }
 
+// CachedLatest reports the newest release tag a previous check recorded,
+// without contacting the network.
+//
+// It exists for `ndscan --version`, which Cobra answers before the startup
+// update hook can run. That command must stay instant and script-safe, so it
+// cannot afford a lookup — but it can repeat what the last one found, which is
+// enough to point at `ndscan update`.
+//
+// ok is false when nothing has been cached yet, so a caller can stay silent
+// rather than imply the running version is current. Declined versions are
+// deliberately still reported: declining the startup prompt silences that
+// prompt, not the answer to a direct question.
+func CachedLatest() (string, bool) {
+	ch := NewChecker().readCache()
+	if ch.Latest == "" {
+		return "", false
+	}
+	return ch.Latest, true
+}
+
 // Decline records a version the user chose to skip; Check will not report it
 // as available again (a newer tag still will).
 func (c *Checker) Decline(tag string) error {
