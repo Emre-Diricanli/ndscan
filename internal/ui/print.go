@@ -429,6 +429,41 @@ func PrintSummary(hostsUp, openPorts int, elapsed time.Duration) {
 	)
 }
 
+// PrintNextSteps names what the scan just made possible.
+//
+// Every scan records a baseline, a device inventory and a timeline, and none of
+// that was ever mentioned at the one moment the user is certain to be paying
+// attention. The result was a product whose entire change-detection half went
+// unnoticed unless someone read `--help` for fun.
+//
+// recorded means this run was trustworthy enough to be written as a baseline —
+// the outcome's own judgement, not the diff's. A cancelled or partial scan
+// records nothing, and pointing that user at `ndscan diff` would be advice they
+// cannot act on.
+//
+// Deliberately not gated on a diff existing: the first scan of a network has
+// nothing to compare against and so produces no diff, and that is precisely the
+// run whose user has never heard of `ndscan diff`. Gating on the diff would
+// hide the hint from everyone except people who had already discovered the
+// feature.
+//
+// stderr, like the summary above it, so redirected stdout stays clean. One line
+// each, printed once: a scanner that lectures after every run is worse than one
+// that says nothing.
+func PrintNextSteps(recorded bool, targets []string) {
+	if !recorded {
+		return
+	}
+	target := strings.Join(targets, " ")
+	if target == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s\n",
+		cDim.Sprintf("  baseline saved · rerun later, then `ndscan diff %s` shows what changed", target))
+	fmt.Fprintf(os.Stderr, "%s\n",
+		cDim.Sprint("  `ndscan devices list` — every device seen so far"))
+}
+
 func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showMac, showVendors bool, macMap map[string]string) error {
 	rows := flatten(res)
 	if showMac && macMap != nil {

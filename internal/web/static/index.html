@@ -56,6 +56,17 @@
     padding: 2px 7px;
   }
   #demo-badge.on { display: inline-block; }
+  #demo-banner {
+    display: none;
+    padding: 9px 16px;
+    background: var(--sev-warn);
+    color: #1a1206;
+    border-bottom: 1px solid #d48608;
+    font-size: 13px;
+    font-weight: 700;
+    text-align: center;
+  }
+  #demo-banner.on { display: block; }
   .controls {
     display: flex;
     align-items: center;
@@ -156,6 +167,37 @@
   }
   #error-banner.on { display: block; }
   #error-banner button { float: right; background: none; color: var(--err); padding: 0 4px; font-weight: 400; }
+
+  #disconnected {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(11, 15, 20, 0.92);
+    z-index: 20;
+  }
+  #disconnected.on { display: flex; }
+  #disconnected-panel {
+    width: min(440px, 100%);
+    padding: 28px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  }
+  #disconnected-panel h2 { margin: 0 0 8px; font-size: 18px; }
+  #disconnected-panel p { margin: 0 0 18px; color: var(--muted); }
+  #disconnected-panel code {
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .disconnected-actions { display: flex; justify-content: center; gap: 8px; }
 
   main {
     display: grid;
@@ -481,6 +523,8 @@
   </div>
 </header>
 
+<div id="demo-banner" role="alert">Synthetic example data — this is not a real network scan.</div>
+
 <div id="suggest-bar"><span class="suggest-label">your networks:</span><span id="suggest-list"></span><span id="stale-note"></span></div>
 
 <div id="progress-wrap">
@@ -564,6 +608,17 @@
     </div>
   </section>
 </main>
+
+<div id="disconnected" role="dialog" aria-modal="true" aria-labelledby="disconnected-title">
+  <div id="disconnected-panel">
+    <h2 id="disconnected-title">Cannot reach the ndscan server.</h2>
+    <p>Start it with: <code>ndscan web</code></p>
+    <div class="disconnected-actions">
+      <button id="retry-btn">Retry</button>
+      <button id="view-demo-btn" class="ghost">View demo data</button>
+    </div>
+  </div>
+</div>
 
 <div id="sweep-modal">
   <div id="sweep-dialog" role="dialog" aria-modal="true" aria-labelledby="sweep-title">
@@ -712,7 +767,8 @@ const DEMO_DATA = {
  * App state                                                           *
  * ------------------------------------------------------------------ */
 const S = {
-  demo: false,          // true when the API is unreachable
+  demo: false,          // true only after the user chooses synthetic data
+  disconnected: false,
   scanning: false,
   topology: null,       // last known Topology object (or null)
   hosts: new Map(),     // ip -> Host, accumulates live `host` events
@@ -748,6 +804,27 @@ $("error-close").addEventListener("click", () => $("error-banner").classList.rem
 function setDemoMode(on) {
   S.demo = on;
   $("demo-badge").classList.toggle("on", on);
+  $("demo-banner").classList.toggle("on", on);
+  updateOperationControls();
+}
+
+function setDisconnectedMode(on) {
+  S.disconnected = on;
+  $("disconnected").classList.toggle("on", on);
+  updateOperationControls();
+}
+
+function updateOperationControls() {
+  const unavailable = S.disconnected;
+  $("scan-btn").disabled = unavailable || S.scanning;
+  $("scan-btn").textContent = S.demo ? "Simulate scan" : "Scan";
+  $("cancel-btn").disabled = unavailable || !S.scanning;
+  $("watch-toggle").disabled = unavailable || S.demo;
+  $("watch-interval").disabled = unavailable || S.demo || S.watch.enabled;
+  document.querySelectorAll(".export-btn").forEach((btn) => {
+    btn.disabled = unavailable || S.demo || !S.hasScan;
+  });
+  if (S.demo) $("watch-status").textContent = "unavailable in demo";
 }
 
 /* ------------------------------------------------------------------ *
@@ -775,17 +852,36 @@ async function apiPost(path, body) {
 }
 
 async function loadInitialState() {
+  let st;
   try {
-    const st = await apiGet("/api/state");
-    setDemoMode(false);
-    applyState(st);
-    // A reload after a scan should still show what changed.
-    fetchHistory();
+    st = await apiGet("/api/state");
   } catch (e) {
-    // No backend (file:// dev, or server down) — fall back to demo data.
-    setDemoMode(true);
-    applyState(DEMO_DATA);
+    // Synthetic hosts cannot safely stand in for observations when a security
+    // tool loses its backend; the developer file:// path remains one click away.
+    setDisconnectedMode(true);
+    return;
   }
+  setDisconnectedMode(false);
+  setDemoMode(false);
+  applyState(st);
+  // A reload after a scan should still show what changed.
+  fetchHistory();
+  connectEvents();
+}
+
+async function retryInitialState() {
+  const btn = $("retry-btn");
+  btn.disabled = true;
+  btn.textContent = "Retrying…";
+  await loadInitialState();
+  btn.disabled = false;
+  btn.textContent = "Retry";
+}
+
+function enterDemoMode() {
+  setDisconnectedMode(false);
+  setDemoMode(true);
+  applyState(DEMO_DATA);
 }
 
 function applyState(st) {
@@ -1063,8 +1159,7 @@ function scanSegment(n) {
 }
 
 function updateScanButtons() {
-  $("scan-btn").disabled = S.scanning;
-  $("cancel-btn").disabled = !S.scanning;
+  updateOperationControls();
   renderSweepButton();
   // Every scanning-state transition funnels through here; the scope line
   // depends on it (hidden mid-scan) and is cheap to re-render.
@@ -1171,7 +1266,8 @@ function stopWatchCountdown() {
 function renderWatchStatus() {
   const w = S.watch;
   $("watch-toggle").checked = w.enabled;
-  $("watch-interval").disabled = w.enabled;
+  $("watch-interval").disabled = S.disconnected || S.demo || w.enabled;
+  if (S.demo) { $("watch-status").textContent = "unavailable in demo"; return; }
   if (!w.enabled) { $("watch-status").textContent = ""; return; }
   if (w.rescanning) { $("watch-status").textContent = "rescanning…"; return; }
   if (!w.nextAt) { $("watch-status").textContent = "scheduled"; return; }
@@ -2297,6 +2393,8 @@ $("fit-btn").addEventListener("click", () => fitToNodes(G.nodes));
 $("sweep-btn").addEventListener("click", openSweepModal);
 $("sweep-cancel").addEventListener("click", closeSweepModal);
 $("sweep-confirm").addEventListener("click", startSweep);
+$("retry-btn").addEventListener("click", retryInitialState);
+$("view-demo-btn").addEventListener("click", enterDemoMode);
 // Backdrop click dismisses; a click inside the dialog must not bubble into one.
 $("sweep-modal").addEventListener("click", (ev) => { if (ev.target === $("sweep-modal")) closeSweepModal(); });
 $("changed-only").addEventListener("change", (ev) => { S.changedOnly = ev.target.checked; renderTable(); });
@@ -2347,7 +2445,7 @@ function renderAll() {
 }
 
 loadPrefs();
-loadInitialState().then(() => { if (!S.demo) connectEvents(); });
+loadInitialState();
 window.addEventListener("beforeunload", stopWatchCountdown);
 </script>
 </body>

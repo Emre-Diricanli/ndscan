@@ -52,6 +52,12 @@ type doneMsg struct {
 	timings   phaseTimings
 	firstErr  error
 	fallbacks int
+	// baselineSaved marks the run that recorded the first comparable snapshot
+	// for this scan configuration. Δ badges say nothing on a first scan —
+	// there is nothing yet to compare against — so without this the feature
+	// that makes the next scan interesting is invisible on the run that
+	// enables it.
+	baselineSaved bool
 	// alerts are the changes the user's rules said are worth interrupting for,
 	// already de-duplicated across watch intervals.
 	alerts []alert.Alert
@@ -172,12 +178,15 @@ func runScan(p scanParams) (<-chan tea.Msg, context.CancelFunc) {
 		}
 		rec := eng.PersistWithGateway(out, plan, scanStart, oui, netinfo.DefaultGateway().IP)
 		diff := rec.Diff
+		// A comparable run with no prior snapshot is the baseline-creating one.
+		baselineSaved := rec.Comparable() && len(rec.Previous) == 0
 		ch <- doneMsg{
-			rows:      out.Rows,
-			failed:    out.Failed,
-			elapsed:   out.Timings.Total,
-			cancelled: out.Status == engine.StatusCancelled,
-			diff:      diff,
+			rows:          out.Rows,
+			failed:        out.Failed,
+			elapsed:       out.Timings.Total,
+			cancelled:     out.Status == engine.StatusCancelled,
+			diff:          diff,
+			baselineSaved: baselineSaved,
 			timings: phaseTimings{
 				discovery:  out.Timings.Discovery,
 				enrichment: out.Timings.Enrichment,

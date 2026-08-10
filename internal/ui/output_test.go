@@ -2,9 +2,11 @@ package ui
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Emre-Diricanli/ndscan/internal/scan"
@@ -163,5 +165,77 @@ func TestWriteJSONWithMACMap_OmitsMACWhenNotRequested(t *testing.T) {
 	}
 	if got[0].MAC != "" {
 		t.Errorf("MAC = %q, want empty when --show-mac is off", got[0].MAC)
+	}
+}
+
+// captureStderr swaps os.Stderr for a pipe and returns what was written to it.
+//
+// PrintNextSteps writes there directly rather than to an injectable writer,
+// matching PrintSummary above it; the swap is what lets the gating be asserted
+// without restructuring both.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = orig
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return string(b)
+}
+
+// A run that did not become a baseline must not advertise `ndscan diff`.
+// Pointing a cancelled or partial scan at diff is advice that cannot be
+// followed: the run recorded nothing for diff to read.
+func TestPrintNextSteps_SilentWhenNoBaselineRecorded(t *testing.T) {
+	got := captureStderr(t, func() {
+		PrintNextSteps(false, []string{"192.168.1.0/24"})
+	})
+	if got != "" {
+		t.Fatalf("expected no output for a non-comparable run, got %q", got)
+	}
+}
+
+// Missing targets would render "ndscan diff " with a dangling command, so the
+// hint suppresses itself rather than printing something uncopyable.
+func TestPrintNextSteps_SilentWithoutTargets(t *testing.T) {
+	got := captureStderr(t, func() { PrintNextSteps(true, nil) })
+	if got != "" {
+		t.Fatalf("expected no output without targets, got %q", got)
+	}
+}
+
+// The recorded case names both follow-up commands and echoes the real target,
+// so the diff line can be copied as printed.
+func TestPrintNextSteps_NamesFollowUpCommandsWithTarget(t *testing.T) {
+	got := captureStderr(t, func() {
+		PrintNextSteps(true, []string{"192.168.1.0/24"})
+	})
+	for _, want := range []string{"ndscan diff 192.168.1.0/24", "ndscan devices list", "baseline saved"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected output to mention %q, got %q", want, got)
+		}
+	}
+}
+
+// The first scan of a network produces no diff — there is nothing yet to
+// compare against — and it is exactly the run whose user has never heard of
+// `ndscan diff`. Gating the hint on a diff existing would have hidden it from
+// everyone except people who had already found the feature.
+func TestPrintNextSteps_ShowsOnFirstScanWithNoDiffYet(t *testing.T) {
+	got := captureStderr(t, func() {
+		PrintNextSteps(true, []string{"10.0.0.0/24"})
+	})
+	if !strings.Contains(got, "ndscan diff 10.0.0.0/24") {
+		t.Fatalf("first scan must still advertise diff, got %q", got)
 	}
 }

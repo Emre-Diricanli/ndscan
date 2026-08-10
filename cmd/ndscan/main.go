@@ -88,8 +88,26 @@ func main() {
 	)
 
 	root := &cobra.Command{
-		Use:     "ndscan",
-		Short:   "ndscan — fast, modular network scan CLI/TUI (local or over SSH)",
+		Use:   "ndscan",
+		Short: "ndscan — fast, modular network scan CLI/TUI (local or over SSH)",
+		// The subcommands each document themselves well, but a list of commands
+		// does not tell you that they compose into a workflow: every scan quietly
+		// records a baseline, a device inventory, and a timeline, and three of the
+		// commands below exist only to read what the scans wrote. A user who never
+		// learns that treats ndscan as a one-shot scanner and never reaches the
+		// half of the product that watches a network over time.
+		Long: `ndscan scans a network, and remembers what it found.
+
+  ndscan scan 192.168.1.0/24     scan a network (records a baseline)
+  ndscan scan 192.168.1.0/24     ...run it again later
+  ndscan diff  192.168.1.0/24    what changed between those two scans
+  ndscan devices list            every device seen, with the names you gave them
+
+Scanning is the only command that touches the network. diff and devices read
+only what earlier scans recorded, so they are instant and safe to run anywhere.
+
+  ndscan                         interactive terminal UI
+  ndscan web                     browser interface (localhost only by default)`,
 		Version: version,
 		// Offer a self-update before any real work — importantly before the
 		// TUI alt-screen starts. Silent and fast when up to date, offline, or
@@ -359,6 +377,23 @@ Otherwise, nmap runs locally.`,
 			}
 			hostsUp, openPorts := ui.SummarizeRows(rows)
 			ui.PrintSummary(hostsUp, openPorts, time.Since(start))
+			// The end of a scan is the moment of highest intent — the user is
+			// looking straight at their network — and it was also the moment
+			// ndscan said nothing about the baseline it had just written. The
+			// whole change-detection half of the product stayed dormant until
+			// someone happened to read `--help`.
+			//
+			// Gated on the outcome rather than on rec.Comparable(): a diff only
+			// exists once there is an earlier snapshot to compare against, so
+			// Comparable() is false on the very first scan of a network — the
+			// one run whose user has certainly never heard of `ndscan diff`.
+			// outcome.Comparable() asks the question that actually matters here,
+			// "was this run trustworthy enough to save", which is the same test
+			// Persist uses before writing the baseline.
+			//
+			// Machine output never reaches here: the --json/--report path
+			// returns above.
+			ui.PrintNextSteps(outcome.Comparable(), targets)
 			return nil
 		},
 	}
@@ -482,6 +517,19 @@ func ensureRoot() (bool, error) {
 		exe,
 	}
 	args = append(args, os.Args[1:]...)
+	// Say why before sudo prompts. An unexplained password request is the first
+	// thing a new user meets, and the alternative that avoids it — native
+	// ARP+TCP discovery, no root, usually faster on a LAN — is buried in the
+	// flag list where nobody hits it before deciding the tool is invasive.
+	//
+	// Naming --fast here rather than switching the default deliberately: the
+	// discovery mode is part of the scan history key, so flipping it would file
+	// every future scan under a key that must never be compared against the
+	// baselines a user already has.
+	// os.Args[1:] already begins with the "scan" subcommand, so the suggestion
+	// interpolates the whole invocation and only adds the flag.
+	ui.Infof("nmap discovery needs root; sudo will prompt now.")
+	ui.Infof("For an unprivileged scan instead, use: ndscan %s --fast", strings.Join(os.Args[1:], " "))
 	cmd := exec.Command("sudo", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
