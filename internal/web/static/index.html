@@ -439,6 +439,21 @@
   /* Per-port evidence: product, certificate, page title. Dimmer than the
      service name so the table still scans as a port list, but present, because
      on a routed host this is the only identification there is. */
+  /* Marks a name that came from a service rather than from the hardware. The
+     column is called Vendor and has always meant "OUI said so"; a certificate
+     is good evidence but it is a different kind of claim, and flattening the
+     two would quietly turn an inference into a fact. */
+  .inferred-tag {
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--muted);
+    vertical-align: 1px;
+    cursor: help;
+  }
   .port-meta { color: var(--muted); font-size: 11px; line-height: 1.45; }
   .port-meta.cert { color: var(--text); }
   .port-meta.cpe { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.75; }
@@ -2384,6 +2399,56 @@ function identifyHost(h) {
   return found;
 }
 
+// hostMaker returns the best available answer to "who made this device", and
+// says which kind of evidence produced it.
+//
+// The Vendor column reads a MAC through the OUI table, which means it is blank
+// for every host past a router — ARP is link-local — and increasingly blank on
+// the local segment too, since current phones and laptops randomise their
+// hardware address per network. A scan of a routed subnet is therefore a wall
+// of dashes even when the devices are perfectly identifiable.
+//
+// A certificate or a service banner names the same thing by different means, so
+// when the OUI answer is missing this falls back to those. The distinction is
+// kept rather than flattened: an OUI vendor is a fact about the hardware, while
+// a certificate names whoever operates the service on it. Those usually agree,
+// and when they do not the difference is worth seeing — so the caller is told
+// which one it got.
+function hostMaker(h) {
+  if (h.vendor) return { name: h.vendor, inferred: false };
+
+  // A cert summary is "Name — exp DATE", where Name is the certificate's
+  // Organization when it has one and its Common Name otherwise. Only the first
+  // of those names a maker: a self-signed appliance cert often has no Org and a
+  // CN of its own hostname, so a UniFi gateway offers "unifi.local" on 443 and
+  // "Ubiquiti Inc." on 8443. Taking whichever port came first picked the
+  // hostname about as often as the manufacturer.
+  //
+  // The flattened summary is all the frontend receives, so the two cannot be
+  // told apart by structure — but a common name looks like a host and an
+  // organisation does not, which is enough to rank them.
+  const candidates = [];
+  for (const p of h.ports || []) {
+    if (p.cert) {
+      const name = p.cert.split(" — exp ")[0].trim();
+      if (name) candidates.push({ name, source: "certificate on port " + p.port });
+    }
+  }
+  for (const p of h.ports || []) {
+    if (p.product) candidates.push({ name: p.product, source: "service on port " + p.port });
+  }
+  if (!candidates.length) return null;
+
+  const looksLikeHostname = (s) =>
+    // A dotted label with no spaces: "unifi.local", "nas.lan", "*.example.com".
+    (/^[*a-z0-9][a-z0-9.*-]*\.[a-z]{2,}$/i.test(s) && !s.includes(" ")) ||
+    // A bare IP is never a maker.
+    /^[0-9.]+$/.test(s);
+
+  const best = candidates.find((c) => !looksLikeHostname(c.name)) || candidates[0];
+  return { name: best.name, inferred: true, source: best.source };
+}
+
 function renderDetail(h, kind, node) {
   const sev = worstSeverity(h);
   const routedVia = node && node.routedVia;
@@ -2404,13 +2469,16 @@ function renderDetail(h, kind, node) {
   // A blank vendor is a dead end only if we stop at the MAC. Point at the
   // evidence that does work rather than restating what does not — the vendor
   // is unavailable, but the device may still be identifiable.
-  const vendorCell = h.vendor
-    ? esc(h.vendor)
-    : identities.length
-      ? '<span class="muted-note">unavailable — see Identified as below</span>'
-      : routedVia
-        ? '<span class="muted-note">needs a MAC; none on a routed subnet — a deep scan can still identify it from its certificate</span>'
-        : '<span class="muted-note">—</span>';
+  // Same answer the table gives, so the two views never disagree about who
+  // made a device.
+  const maker = hostMaker(h);
+  const vendorCell = maker
+    ? esc(maker.name) + (maker.inferred
+      ? ' <span class="muted-note">(inferred from ' + esc(maker.source) + ')</span>'
+      : "")
+    : routedVia
+      ? '<span class="muted-note">needs a MAC; none on a routed subnet — a deep scan can still identify it from its certificate</span>'
+      : '<span class="muted-note">—</span>';
 
   const rows = [
     ["IP", esc(h.ip)],
@@ -2552,7 +2620,12 @@ function renderTable() {
   let rows = Array.from(S.hosts.values()).filter((h) => {
     if (S.changedOnly && !diffEntry(h.ip)) return false;
     if (!filter) return true;
-    return [h.ip, h.hostname, h.vendor, h.mac].some((v) => (v || "").toLowerCase().includes(filter));
+    // Filter on the name the column actually shows. Typing "ubiquiti" must
+    // match a host identified by its certificate, or the filter disagrees with
+    // the table in front of it.
+    const maker = hostMaker(h);
+    return [h.ip, h.hostname, h.vendor, h.mac, maker && maker.name]
+      .some((v) => (v || "").toLowerCase().includes(filter));
   });
 
   const { key, dir } = S.sort;
@@ -2561,7 +2634,14 @@ function renderTable() {
     switch (key) {
       case "ip": cmp = ipKey(a.ip) - ipKey(b.ip); break;
       case "hostname": cmp = (a.hostname || "").localeCompare(b.hostname || ""); break;
-      case "vendor": cmp = (a.vendor || "").localeCompare(b.vendor || ""); break;
+      case "vendor": {
+        // Sort by the displayed name too, so clicking the header groups hosts
+        // by who made them rather than stranding every inferred one together
+        // under a blank.
+        const am = hostMaker(a), bm = hostMaker(b);
+        cmp = ((am && am.name) || "").localeCompare((bm && bm.name) || "");
+        break;
+      }
       case "severity": cmp = (SEV_ORDER[hostSeverity(a.ip)] || 0) - (SEV_ORDER[hostSeverity(b.ip)] || 0); break;
       case "ports": cmp = (a.ports || []).length - (b.ports || []).length; break;
       case "rtt": cmp = rttKey(a.rtt) - rttKey(b.rtt); break;
@@ -2575,10 +2655,19 @@ function renderTable() {
     if (h.ip === S.selectedIp) tr.className = "selected";
     const ports = (h.ports || []).map((p) => p.port + "/" + (p.service || p.proto || "tcp")).join(", ");
     const d = diffEntry(h.ip);
+    // A dash here used to mean "no MAC", which on a routed subnet is every row.
+    // An inferred name is marked so the column never passes off a guess from a
+    // service as a hardware fact.
+    const maker = hostMaker(h);
+    const makerCell = maker
+      ? esc(maker.name) + (maker.inferred
+        ? ' <span class="inferred-tag" title="' + esc(maker.source) + '">inferred</span>'
+        : "")
+      : "—";
     tr.innerHTML =
       "<td>" + esc(h.ip) + (d && d.new ? '<span class="chg new">new</span>' : "") + "</td>" +
       "<td>" + (esc(h.hostname) || "—") + "</td>" +
-      "<td>" + (esc(h.vendor) || "—") + "</td>" +
+      "<td>" + makerCell + "</td>" +
       '<td><span class="sev-dot" style="background:' + (SEV_COLOR[sev] || "var(--sev-none)") + '"></span>' + (sev || "none") + "</td>" +
       "<td>" + (esc(ports) || "—") + (d ? portChangeHtml(d) : "") + "</td>" +
       "<td>" + (esc(h.rtt) || "—") + "</td>";
