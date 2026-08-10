@@ -380,6 +380,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case namesMsg:
+		// Better hostnames, arriving after the results were drawn. Only applied
+		// while those results are still what is on screen: a new scan started
+		// in the meantime has its own host set, and these names describe the
+		// previous one.
+		if m.screen == screenResults && m.cancel == nil && len(msg.rows) > 0 {
+			m.rows = msg.rows
+			m.derived = nil
+			m.rebuildTable()
+			m.refreshActiveView()
+		}
+		return m, nil
+
 	case doneMsg:
 		m.screen = screenResults
 		m.cancel = nil

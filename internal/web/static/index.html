@@ -1076,8 +1076,17 @@ function connectEvents() {
     try {
       const h = JSON.parse(ev.data);
       if (h && h.ip) {
+        const prev = S.hosts.get(h.ip);
         S.hosts.set(h.ip, h);
         renderTable();
+        // A host can arrive twice: once when its ports resolve, and again when
+        // the deferred multicast pass learns what the device calls itself. The
+        // graph reads its labels from the topology snapshot rather than from
+        // S.hosts, so a name that changed after the fact has to be written
+        // there too or the table and the map disagree.
+        if (prev && prev.hostname !== h.hostname && applyHostnameToTopology(h)) {
+          renderGraph();
+        }
       }
     } catch (_) {}
   });
@@ -2067,6 +2076,28 @@ function nodeLabel(n, kidCount) {
 function applyView() {
   $("viewport").setAttribute("transform",
     "translate(" + G.view.x + "," + G.view.y + ") scale(" + G.view.k + ")");
+}
+
+// applyHostnameToTopology writes a late-arriving hostname into the topology
+// snapshot, and reports whether it found the host to write it to.
+//
+// The graph builds its labels from S.topology, which is fetched once when the
+// scan ends. Names learned afterwards — the deferred multicast pass — reach the
+// table through S.hosts but would never reach the map, leaving the same device
+// shown under two different names in two panels of the same page.
+function applyHostnameToTopology(h) {
+  const t = S.topology;
+  if (!t || !h || !h.ip) return false;
+  let found = false;
+  const visit = (n) => {
+    if (n && n.host && n.host.ip === h.ip) {
+      n.host.hostname = h.hostname;
+      found = true;
+    }
+  };
+  for (const seg of t.segments || []) for (const n of seg.nodes || []) visit(n);
+  for (const n of t.orphans || []) visit(n);
+  return found;
 }
 
 function renderGraph() {

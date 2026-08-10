@@ -228,6 +228,33 @@ func ApplyHostnames(rows []Row, names map[string]string) {
 	}
 }
 
+// ApplySelfReportedNames fills in names a device announced about itself,
+// replacing a weaker one where it finds it.
+//
+// Multicast used to run before the reverse lookup, so "first writer wins" was
+// enough to keep the better name. Deferring it — so a scan can show results
+// without waiting on a multi-second listen — inverts that order, and under the
+// old rule the deferred pass could never improve anything: PTR would already
+// have filled every field it was going to fill.
+//
+// So this one may overwrite, but only a name that came from a resolver, and
+// only when the device's own answer is genuinely different. A device calling
+// itself "Sarpers-MacBook-Pro" outranks a reverse zone that spells the address
+// back as "mac"; it does not outrank a name the user set, which is applied
+// elsewhere and never reaches this function.
+func ApplySelfReportedNames(rows []Row, names map[string]string) {
+	if len(names) == 0 {
+		return
+	}
+	for i := range rows {
+		name := stripControls(names[rows[i].IP])
+		if name == "" || name == rows[i].Host {
+			continue
+		}
+		rows[i].Host = name
+	}
+}
+
 // hostnames is consulted by BuildRows so every CLI renderer — table, tree,
 // report, JSON — shows the same names without each of the four having to
 // thread an extra parameter through. A nil map (the default) leaves behaviour

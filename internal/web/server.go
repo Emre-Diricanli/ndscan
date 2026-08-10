@@ -46,6 +46,10 @@ type Server struct {
 	diff        map[string]config.HostDiff
 	hasPrevious bool
 	cancel      context.CancelFunc
+	// namesCancel stops an in-flight deferred naming pass. It is separate from
+	// cancel because that one belongs to the scan, which has already finished
+	// by the time this pass is running.
+	namesCancel context.CancelFunc
 	watch       watchState
 	oui         vendor.DB
 	// eng is held rather than constructed per scan so its multicast name cache
@@ -374,6 +378,12 @@ func (s *Server) startScanDone(targets []string, preset string, fast bool) (<-ch
 	s.scanning = true
 	s.targets = targets
 	s.cancel = cancel
+	// The previous scan's naming pass, if still listening, is now describing a
+	// host set that is about to be replaced.
+	if s.namesCancel != nil {
+		s.namesCancel()
+		s.namesCancel = nil
+	}
 	s.mu.Unlock()
 
 	done := make(chan struct{})
@@ -456,6 +466,61 @@ func (s *Server) runScan(ctx context.Context, cancel context.CancelFunc, targets
 		return
 	}
 	s.finishScan(out, plan, start, netSnapshot{locals: locals, gateway: gateway})
+	s.resolveNamesInBackground(out.Rows)
+}
+
+// resolveNamesInBackground finishes the naming work the scan skipped.
+//
+// The scan deferred its multicast pass so the table could appear in about a
+// second instead of six; this is the other half, arriving while the user reads
+// the results. Rows that gain a better name are republished over SSE as
+// updates, which the frontend reconciles by IP.
+//
+// It deliberately runs after finishScan: the scan is already recorded and the
+// UI already says it finished. Names are an improvement to what is on screen,
+// not part of the result, and a network with no mDNS speakers must not leave a
+// scan looking unfinished for five seconds.
+func (s *Server) resolveNamesInBackground(rows []ui.Row) {
+	if len(rows) == 0 {
+		return
+	}
+	// A fresh context: runScan's deferred cancel has already fired by the time
+	// this matters, and this pass is not part of that scan's lifetime.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	s.mu.Lock()
+	// One naming pass at a time. A second scan's results supersede this one's,
+	// and names computed for a host set that is no longer displayed would
+	// relabel rows the user is not looking at.
+	if s.namesCancel != nil {
+		s.namesCancel()
+	}
+	s.namesCancel = cancel
+	s.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		updated, ok := s.eng.ResolveNames(ctx, rows)
+		if !ok || ctx.Err() != nil {
+			return
+		}
+
+		s.mu.Lock()
+		// Drop the result if another scan has started: these names describe a
+		// host set that is no longer on screen.
+		superseded := s.scanning
+		if !superseded {
+			s.rows = append([]ui.Row(nil), updated...)
+		}
+		s.mu.Unlock()
+		if superseded {
+			return
+		}
+
+		for _, row := range updated {
+			s.bus.publish("host", toHostDTO(row))
+		}
+	}()
 }
 
 // rowIPs collects the addresses from a row set, for lookups keyed by IP.
@@ -580,7 +645,12 @@ func (s *Server) scanPlan(targets []string, preset string, fast bool) engine.Pla
 		Fast:         fast,
 		Hostnames:    true,
 		Multicast:    true,
-		IdentifyTLS:  true,
+		// The browser can fill a column after the fact, so it does not wait on
+		// the multicast listen window — the single largest cost in a fast scan.
+		// Results appear as soon as the ports are known and the better names
+		// arrive a few seconds later. See runScan's deferred pass.
+		DeferMulticast: true,
+		IdentifyTLS:    true,
 	}
 }
 
