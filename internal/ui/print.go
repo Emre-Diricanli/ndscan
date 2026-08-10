@@ -436,9 +436,16 @@ func PrintSummary(hostsUp, openPorts int, elapsed time.Duration) {
 // attention. The result was a product whose entire change-detection half went
 // unnoticed unless someone read `--help` for fun.
 //
-// recorded comes from the engine's own judgement about whether this run became
-// a baseline; a cancelled or partial scan records nothing, and pointing that
-// user at `ndscan diff` would be advice they cannot act on.
+// recorded means this run was trustworthy enough to be written as a baseline —
+// the outcome's own judgement, not the diff's. A cancelled or partial scan
+// records nothing, and pointing that user at `ndscan diff` would be advice they
+// cannot act on.
+//
+// Deliberately not gated on a diff existing: the first scan of a network has
+// nothing to compare against and so produces no diff, and that is precisely the
+// run whose user has never heard of `ndscan diff`. Gating on the diff would
+// hide the hint from everyone except people who had already discovered the
+// feature.
 //
 // stderr, like the summary above it, so redirected stdout stays clean. One line
 // each, printed once: a scanner that lectures after every run is worse than one

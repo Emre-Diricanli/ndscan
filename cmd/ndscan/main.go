@@ -383,12 +383,17 @@ Otherwise, nmap runs locally.`,
 			// whole change-detection half of the product stayed dormant until
 			// someone happened to read `--help`.
 			//
-			// Gated on rec.Comparable() because that is the engine's own answer
-			// to "did this run become a baseline?". A cancelled or partial scan
-			// records nothing, and telling that user to run `diff` is advice
-			// that cannot be followed. Machine output never reaches here: the
-			// --json/--report path returns above.
-			ui.PrintNextSteps(rec.Comparable(), targets)
+			// Gated on the outcome rather than on rec.Comparable(): a diff only
+			// exists once there is an earlier snapshot to compare against, so
+			// Comparable() is false on the very first scan of a network — the
+			// one run whose user has certainly never heard of `ndscan diff`.
+			// outcome.Comparable() asks the question that actually matters here,
+			// "was this run trustworthy enough to save", which is the same test
+			// Persist uses before writing the baseline.
+			//
+			// Machine output never reaches here: the --json/--report path
+			// returns above.
+			ui.PrintNextSteps(outcome.Comparable(), targets)
 			return nil
 		},
 	}

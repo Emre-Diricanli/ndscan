@@ -226,3 +226,16 @@ func TestPrintNextSteps_NamesFollowUpCommandsWithTarget(t *testing.T) {
 		}
 	}
 }
+
+// The first scan of a network produces no diff — there is nothing yet to
+// compare against — and it is exactly the run whose user has never heard of
+// `ndscan diff`. Gating the hint on a diff existing would have hidden it from
+// everyone except people who had already found the feature.
+func TestPrintNextSteps_ShowsOnFirstScanWithNoDiffYet(t *testing.T) {
+	got := captureStderr(t, func() {
+		PrintNextSteps(true, []string{"10.0.0.0/24"})
+	})
+	if !strings.Contains(got, "ndscan diff 10.0.0.0/24") {
+		t.Fatalf("first scan must still advertise diff, got %q", got)
+	}
+}
