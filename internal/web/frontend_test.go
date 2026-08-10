@@ -115,3 +115,42 @@ func TestFrontendDialogsManageFocus(t *testing.T) {
 		})
 	}
 }
+
+// Every one of these fields was already collected, serialized into the port
+// DTO, and sent to the browser — and then dropped, because the detail panel
+// rendered three columns and ignored the rest. On a routed host those dropped
+// fields are the only identification available: a MAC is link-local, so ARP
+// never crosses the gateway, and MAC randomisation blanks the vendor even on
+// the local segment.
+func TestFrontendSurfacesLayer7Identity(t *testing.T) {
+	body := servedFrontend(t)
+	cases := []struct {
+		name string
+		want string
+	}{
+		// Identity is derived from evidence that survives a router.
+		{"identity helper", "function identifyHost("},
+		{"certificate evidence", `add(p.cert, "TLS certificate on port "`},
+		{"service product evidence", `add(p.product +`},
+		{"page title evidence", `add(p.httpTitle, "web page on port "`},
+		{"identity row", `"Identified as"`},
+
+		// Per-port evidence in the ports table.
+		{"port certificate", `p.cert) + "</div>"`},
+		{"port title", `p.httpTitle) + "</div>"`},
+		{"port cpe", "p.cpe"},
+		{"tls tag", `p.tls ? '<span class="tls-tag">TLS</span>'`},
+
+		// A blank vendor must point at what does work rather than dead-ending.
+		{"vendor points onward", "a deep scan can still identify it from its certificate"},
+		// "nobody looked" and "we looked and found nothing" must not read alike.
+		{"unidentified explains why", "a deep scan reads certificates and service banners"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if !strings.Contains(body, c.want) {
+				t.Errorf("served frontend missing %q", c.want)
+			}
+		})
+	}
+}
