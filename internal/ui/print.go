@@ -429,6 +429,34 @@ func PrintSummary(hostsUp, openPorts int, elapsed time.Duration) {
 	)
 }
 
+// PrintNextSteps names what the scan just made possible.
+//
+// Every scan records a baseline, a device inventory and a timeline, and none of
+// that was ever mentioned at the one moment the user is certain to be paying
+// attention. The result was a product whose entire change-detection half went
+// unnoticed unless someone read `--help` for fun.
+//
+// recorded comes from the engine's own judgement about whether this run became
+// a baseline; a cancelled or partial scan records nothing, and pointing that
+// user at `ndscan diff` would be advice they cannot act on.
+//
+// stderr, like the summary above it, so redirected stdout stays clean. One line
+// each, printed once: a scanner that lectures after every run is worse than one
+// that says nothing.
+func PrintNextSteps(recorded bool, targets []string) {
+	if !recorded {
+		return
+	}
+	target := strings.Join(targets, " ")
+	if target == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s\n",
+		cDim.Sprintf("  baseline saved · rerun later, then `ndscan diff %s` shows what changed", target))
+	fmt.Fprintf(os.Stderr, "%s\n",
+		cDim.Sprint("  `ndscan devices list` — every device seen so far"))
+}
+
 func WriteJSONWithMACMap(res []scan.HostResult, db vendor.DB, path string, showMac, showVendors bool, macMap map[string]string) error {
 	rows := flatten(res)
 	if showMac && macMap != nil {

@@ -422,6 +422,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.fallbacks > 0 {
 			m.notice = fmt.Sprintf("SYN unavailable for %d host(s); used TCP connect fallback", msg.fallbacks)
+		} else if msg.baselineSaved {
+			// Only when nothing more urgent is competing for the line: a
+			// fallback warning is about this scan, and outranks a pointer at
+			// the next one.
+			m.notice = "baseline saved — the next scan will mark what changed with Δ"
 		}
 		m.rebuildTable()
 		m.refreshActiveView()
