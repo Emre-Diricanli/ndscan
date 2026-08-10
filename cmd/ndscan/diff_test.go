@@ -22,10 +22,15 @@ func diffTestOpts() diffOptions {
 
 func seedHistory(t *testing.T) {
 	t.Helper()
+	seedHistoryKey(t, diffTestKey)
+}
+
+func seedHistoryKey(t *testing.T, key config.ScanKey) {
+	t.Helper()
 	snaps := []config.HostSnapshot{
 		{IP: "192.0.2.10", Up: true, Ports: []string{"22/tcp ssh"}},
 	}
-	if err := config.SaveHistory(diffTestKey, snaps); err != nil {
+	if err := config.SaveHistory(key, snaps); err != nil {
 		t.Fatalf("SaveHistory: %v", err)
 	}
 }
@@ -70,17 +75,51 @@ func TestRunDiff(t *testing.T) {
 		wantNotContains []string
 	}{
 		{
-			name:         "no history says to run a scan first",
-			seed:         func(t *testing.T) {},
-			wantCode:     diffExitUnchanged,
-			wantContains: []string{"no previous scan recorded", "run a scan first"},
+			name:            "no history says to run a scan first",
+			seed:            func(t *testing.T) {},
+			wantCode:        diffExitUnchanged,
+			wantContains:    []string{"no previous scan recorded", "run a scan first"},
+			wantNotContains: []string{"recorded scans exist"},
 		},
 		{
 			name:            "identical state reports no changes",
 			seed:            func(t *testing.T) { seedHistory(t) },
 			wantCode:        diffExitUnchanged,
 			wantContains:    []string{"no changes"},
-			wantNotContains: []string{"appeared", "left"},
+			wantNotContains: []string{"appeared", "left", "no baseline"},
+		},
+		{
+			// The exact key misses, but baselines exist for the same targets
+			// under sibling signatures: a --fast sweep and a web UI scan (which
+			// files under ports "preset:<name>"). Claiming "no previous scan
+			// recorded" would be a lie — the message must name what exists and
+			// how to select it, without diffing against either.
+			name: "sibling configurations are listed, not diffed",
+			seed: func(t *testing.T) {
+				seedHistoryKey(t, config.ScanKey{Targets: []string{"192.0.2.0/24"}, Preset: "quick", Fast: true})
+				seedHistoryKey(t, config.ScanKey{Targets: []string{"192.0.2.0/24"}, Ports: "preset:default", Preset: "default"})
+			},
+			wantCode: diffExitUnchanged,
+			wantContains: []string{
+				"no baseline for this scan configuration",
+				"recorded scans exist for 192.0.2.0/24",
+				"preset=quick · fast discovery",
+				"preset=default · ports preset:default · nmap discovery",
+				"--fast",
+				"-P default",
+			},
+			wantNotContains: []string{"no previous scan recorded", "appeared", "left"},
+		},
+		{
+			// History for *other* targets is not a sibling: the diff is scoped
+			// to the exact target set, so the original message stays correct.
+			name: "history for another target still says run a scan first",
+			seed: func(t *testing.T) {
+				seedHistoryKey(t, config.ScanKey{Targets: []string{"198.51.100.0/24"}, Preset: "quick", Fast: true})
+			},
+			wantCode:        diffExitUnchanged,
+			wantContains:    []string{"no previous scan recorded", "run a scan first"},
+			wantNotContains: []string{"recorded scans exist"},
 		},
 		{
 			name: "changes render with device labels",

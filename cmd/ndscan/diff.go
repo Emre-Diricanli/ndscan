@@ -223,7 +223,17 @@ func runDiff(w io.Writer, o diffOptions) (int, error) {
 	out.Changed = len(events) > 0
 	out.Changes = changeEntries(events, device.Load())
 
-	if err := printDiff(w, o, out); err != nil {
+	// When the exact key misses, look for baselines recorded for the same
+	// targets under a different signature — only so the empty state can point
+	// at them. They are never diffed against: a fast sweep and an nmap scan
+	// probe different port universes, and comparing across them reads every
+	// host as added or removed.
+	var siblings []historySibling
+	if !out.Baseline && out.Mode == "last-scan" {
+		siblings = siblingHistory(key)
+	}
+
+	if err := printDiff(w, o, out, siblings); err != nil {
 		return diffExitUnchanged, err
 	}
 	if out.Changed {
@@ -265,7 +275,7 @@ func changeEntries(events []timeline.Event, devices map[string]device.Record) []
 // printDiff renders the result: JSON when asked, otherwise a short human
 // summary. Every empty state is stated explicitly — a blank screen in cron
 // output reads as a bug, not as "nothing happened".
-func printDiff(w io.Writer, o diffOptions, out diffOutput) error {
+func printDiff(w io.Writer, o diffOptions, out diffOutput, siblings []historySibling) error {
 	if o.json {
 		b, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {
@@ -277,7 +287,7 @@ func printDiff(w io.Writer, o diffOptions, out diffOutput) error {
 	targets := strings.Join(out.Targets, " ")
 	switch {
 	case !out.Baseline && out.Mode == "last-scan":
-		fmt.Fprintf(w, "no previous scan recorded for %s — run a scan first:\n  ndscan scan %s\n", targets, targets)
+		printNoBaseline(w, out, siblings)
 	case !out.Changed && out.Mode == "since":
 		fmt.Fprintf(w, "no changes recorded in the last %s\n", out.Since)
 	case !out.Changed:
@@ -291,6 +301,157 @@ func printDiff(w io.Writer, o diffOptions, out diffOutput) error {
 		printChangeTable(w, out.Mode == "since", out.Changes)
 	}
 	return nil
+}
+
+// historySibling is a baseline recorded for the same targets under a
+// different scan signature, surfaced when the exact signature the user asked
+// for has no history.
+type historySibling struct {
+	key      config.ScanKey
+	modified time.Time
+}
+
+// printNoBaseline renders the empty state for "the exact key has no history".
+// Two situations share that condition and must read differently, because the
+// original message asserts a fact that only one of them satisfies:
+//
+//   - nothing was ever recorded for these targets — "no previous scan
+//     recorded" is true, and it stays;
+//   - baselines exist under sibling signatures (a --fast sweep, a web UI scan
+//     filed under ports "preset:<name>", another preset) — then that message
+//     is a falsehood that reads as "your scan was not saved", so instead the
+//     output names what does exist and how to select it.
+//
+// What this never does is diff against a sibling: the separation is
+// deliberate and test-enforced (engine's TestScanKeyCarriesActualDiscoveryMode
+// and the web server's history-split test pin it), because different
+// signatures probe incomparable port universes. Pointing at a sibling helps;
+// silently comparing across signatures manufactures phantom changes.
+func printNoBaseline(w io.Writer, out diffOutput, siblings []historySibling) {
+	targets := strings.Join(out.Targets, " ")
+	if len(siblings) == 0 {
+		fmt.Fprintf(w, "no previous scan recorded for %s — run a scan first:\n  ndscan scan %s\n", targets, targets)
+		return
+	}
+	cur := config.ScanKey{Targets: out.Targets, Ports: out.Ports, Preset: out.Preset, Fast: out.Fast}
+	fmt.Fprintf(w, "no baseline for this scan configuration (%s).\n", describeScanKey(cur, ", "))
+	fmt.Fprintf(w, "recorded scans exist for %s:\n", targets)
+	// Cap the listing: a long-accrued history is better summarised by its
+	// most recent entries than scrolled off the screen.
+	listed := siblings
+	if len(listed) > 5 {
+		listed = listed[:5]
+	}
+	for _, s := range listed {
+		fmt.Fprintf(w, "  %s · %s\n", describeScanKey(s.key, " · "), ago(s.modified))
+	}
+	fmt.Fprintf(w, "re-run with %s to compare against one of these.\n", selectHints(cur, listed))
+}
+
+// siblingHistory finds baselines recorded for the same targets under a
+// different signature, most recent first.
+//
+// History filenames are one-way hashes of the key, so the store cannot be
+// enumerated back into signatures — the only way to find neighbours is to
+// probe the signatures scans are actually filed under. That space is small
+// and known: every preset, each with no ports override (CLI scans) or the web
+// UI's "preset:<name>" convention (web scans pair the two), in both discovery
+// modes. A scan recorded under a hand-typed -p port list cannot be guessed
+// and still reports "no previous scan recorded" — an acceptable miss next to
+// the alternative of claiming knowledge the store does not have.
+func siblingHistory(key config.ScanKey) []historySibling {
+	var out []historySibling
+	for _, preset := range validPresets {
+		for _, fast := range []bool{false, true} {
+			for _, ports := range []string{"", "preset:" + preset} {
+				k := config.ScanKey{Targets: key.Targets, Ports: ports, Preset: preset, Fast: fast}
+				if k.Scope() == key.Scope() {
+					continue // the exact key already missed; don't list it as a sibling
+				}
+				if mod, ok := config.HistoryModTime(k); ok {
+					out = append(out, historySibling{key: k, modified: mod})
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].modified.After(out[j].modified) })
+	return out
+}
+
+// describeScanKey words a signature the way the flags name it, so the user
+// can recognise which of their scans a baseline belongs to.
+func describeScanKey(k config.ScanKey, sep string) string {
+	parts := []string{"preset=" + k.Preset}
+	if k.Ports != "" {
+		parts = append(parts, "ports "+k.Ports)
+	}
+	if k.Fast {
+		parts = append(parts, "fast discovery")
+	} else {
+		parts = append(parts, "nmap discovery")
+	}
+	return strings.Join(parts, sep)
+}
+
+// selectHints turns the listed siblings into the flags that would select
+// them, relative to what the user just ran — "--fast", "-P default", or
+// "-P quick -p preset:quick". Two hints are enough to convey the pattern;
+// more reads as noise.
+func selectHints(cur config.ScanKey, siblings []historySibling) string {
+	var hints []string
+	seen := map[string]bool{}
+	for _, s := range siblings {
+		var parts []string
+		if s.key.Fast != cur.Fast {
+			if s.key.Fast {
+				parts = append(parts, "--fast")
+			} else {
+				parts = append(parts, "without --fast")
+			}
+		}
+		if s.key.Preset != cur.Preset {
+			parts = append(parts, "-P "+s.key.Preset)
+		}
+		if s.key.Ports != cur.Ports {
+			parts = append(parts, "-p "+s.key.Ports)
+		}
+		h := strings.Join(parts, " ")
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		hints = append(hints, h)
+		if len(hints) == 2 {
+			break
+		}
+	}
+	return strings.Join(hints, ", or ")
+}
+
+// ago words a timestamp relative to now for the sibling listing, where "18
+// minutes ago" orients the user faster than a wall-clock time they must
+// subtract themselves.
+func ago(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return pluralAgo(int(d.Minutes()), "minute")
+	case d < 24*time.Hour:
+		return pluralAgo(int(d.Hours()), "hour")
+	case d < 48*time.Hour:
+		return "yesterday"
+	default:
+		return pluralAgo(int(d.Hours()/24), "day")
+	}
+}
+
+func pluralAgo(n int, unit string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s ago", unit)
+	}
+	return fmt.Sprintf("%d %ss ago", n, unit)
 }
 
 // printChangeTable renders the change set in the same rounded-table style the
