@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/userenv"
 )
@@ -202,6 +203,24 @@ func LoadHistory(k ScanKey) []HostSnapshot {
 		return nil
 	}
 	return snaps
+}
+
+// HistoryModTime reports when the baseline for this scan signature was last
+// written, without loading it.
+//
+// History filenames are one-way hashes of the key, so the store cannot be
+// enumerated back into keys. A caller that wants to point the user at history
+// filed under a *neighbouring* key — ndscan diff, when the exact key it was
+// asked for has no baseline — can therefore only probe candidate signatures,
+// and this is the read-only primitive for that probe. LoadHistory would answer
+// the same question, but at the cost of reading and parsing every candidate
+// file when all the caller needs is "does this exist, and how old is it".
+func HistoryModTime(k ScanKey) (time.Time, bool) {
+	fi, err := os.Stat(historyPath(k))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
 }
 
 // SaveHistory stores the snapshot for this scan signature.
