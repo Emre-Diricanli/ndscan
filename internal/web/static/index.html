@@ -2036,14 +2036,26 @@ function paintGraph() {
 // since one kind of node starts a network scan.
 function nodeLabel(n, kidCount) {
   const parts = [];
-  if (n.kind === "self") parts.push("this machine");
-  else if (n.kind === "gateway") parts.push("gateway");
-  else if (n.kind === "segment") parts.push("network segment");
-  else if (n.kind === "orphans") parts.push("hosts on no known network");
-  else if (n.kind === "unknown") parts.push("inferred host");
-  else parts.push("host");
+  let kind;
+  if (n.kind === "self") kind = "this machine";
+  else if (n.kind === "gateway") kind = "gateway";
+  else if (n.kind === "segment") kind = "network segment";
+  else if (n.kind === "orphans") kind = "hosts on no known network";
+  else if (n.kind === "unknown") kind = "inferred host";
+  else kind = "host";
+  parts.push(kind);
 
-  if (n.label) parts.push(n.label);
+  // Some node kinds already carry the kind as their visible label — the self
+  // node's label is literally "this machine" — and repeating it produced
+  // "this machine, this machine". Say each thing once.
+  //
+  // The visible label also spells its affordance in mouse terms ("· click to
+  // scan"), which is right on screen and wrong out loud, where it collided
+  // with the "press Enter" phrasing below. Drop it from the spoken version
+  // only; the rendered text is untouched.
+  if (n.label && n.label.toLowerCase() !== kind.toLowerCase()) {
+    parts.push(n.label.replace(/\s*·\s*click to scan\s*$/i, ""));
+  }
   if (n.sub) parts.push(n.sub);
   // Said last so it is the freshest thing in the listener's ear before they
   // decide whether to press Enter — this one sends traffic.
