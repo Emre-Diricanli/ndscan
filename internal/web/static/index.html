@@ -304,7 +304,30 @@
   .edge-label { fill: var(--muted); font-size: 10px; text-anchor: middle; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; }
 
   #graph { user-select: none; -webkit-user-select: none; }
+  /* Visually hidden, still announced. Not display:none or visibility:hidden —
+     both remove the element from the accessibility tree, which is the one
+     thing this element exists for. */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
   .node { cursor: pointer; }
+  /* Keyboard users need to see where they are. The default outline is drawn
+     round the <g>'s bounding box, which on a wrapped label sits far from the
+     shape it belongs to, so the ring goes on the shape itself. Mouse clicks
+     move focus too, hence :focus-visible — a clicked node must not light up as
+     though it were being navigated. */
+  .node:focus { outline: none; }
+  .node:focus-visible circle, .node:focus-visible .chip {
+    stroke: var(--accent);
+    stroke-width: 3;
+  }
+  .node:focus-visible text { fill: var(--text); }
   .node.hl circle, .node.hl .chip { stroke: var(--accent); stroke-width: 2.5; }
   .node .chip { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
   /* A dashed chip border reuses the graph's existing "not directly observed"
@@ -529,11 +552,18 @@
 
 <div id="progress-wrap">
   <span id="progress-label">scanning…</span>
-  <div id="progress-bar"><div id="progress-fill"></div></div>
+  <div id="progress-bar" role="progressbar" aria-labelledby="progress-label"><div id="progress-fill"></div></div>
   <span id="progress-pct"></span>
 </div>
 
-<div id="error-banner"><span id="error-text"></span><button id="error-close" title="dismiss">✕</button></div>
+<!-- Scan progress is conveyed by a moving bar and a changing percentage, both
+     invisible to a screen reader. This says the same thing out loud. It is
+     polite, not assertive: a scan is long-running background work, and
+     interrupting whatever the user is reading on every tick would be worse
+     than silence. Announcements are throttled in setProgress. -->
+<div id="scan-status" class="sr-only" role="status" aria-live="polite"></div>
+
+<div id="error-banner" role="alert"><span id="error-text"></span><button id="error-close" title="dismiss">✕</button></div>
 
 <div id="scope-line"></div>
 
@@ -811,6 +841,12 @@ function setDemoMode(on) {
 function setDisconnectedMode(on) {
   S.disconnected = on;
   $("disconnected").classList.toggle("on", on);
+  // Same promise as the sweep dialog, and a stronger need: this one covers the
+  // whole page, so untrapped focus would wander a UI the user cannot see and
+  // cannot use. Retry is first in the DOM and so takes focus — the action that
+  // gets them working again, not the one that shows fabricated data.
+  if (on) trapFocus($("disconnected-panel"));
+  else releaseFocus();
   updateOperationControls();
 }
 
@@ -1093,6 +1129,13 @@ function onScanDone(d) {
   const n = d && typeof d.hosts === "number" ? d.hosts : S.hosts.size;
   const ms = d && typeof d.elapsedMs === "number" ? d.elapsedMs : 0;
   setProgress(cancelled ? "cancelled" : "done — " + n + " hosts, " + (ms / 1000).toFixed(1) + "s", 100);
+  // The outcome always speaks, bypassing the decile throttle: a scan that has
+  // been sitting at 100% while results settle would otherwise finish in
+  // silence, and "it ended" is the announcement that matters most. The bar
+  // hides itself two seconds later, so this is the last chance to say it.
+  announce(cancelled
+    ? "Scan cancelled."
+    : "Scan complete. " + n + " host" + (n === 1 ? "" : "s") + " found in " + (ms / 1000).toFixed(1) + " seconds.");
   setTimeout(() => showProgress(false), 2500);
   renderScopeLine();
   // Pull the fresh topology now that the scan finished.
@@ -1197,10 +1240,70 @@ function openSweepModal() {
     list.appendChild(row);
   }
   $("sweep-modal").classList.add("on");
+  trapFocus($("sweep-dialog"));
 }
 
 function closeSweepModal() {
   $("sweep-modal").classList.remove("on");
+  releaseFocus();
+}
+
+/* ------------------------------------------------------------------ *
+ * Modal focus management                                             *
+ * ------------------------------------------------------------------ */
+
+// A dialog that says aria-modal="true" is promising that focus is contained.
+// Ours said it without doing it: focus stayed wherever it was, Tab walked off
+// into the page behind the overlay, and a keyboard user could be "inside" a
+// confirmation they could neither read nor reach. That matters more here than
+// in most dialogs — this is the one asking whether to scan subnets that may
+// not be yours.
+
+let focusTrap = null;
+
+function trapFocus(dialog) {
+  const restoreTo = document.activeElement;
+
+  const focusables = () => Array.from(dialog.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter((el) => !el.disabled && el.offsetParent !== null);
+
+  const onKeydown = (ev) => {
+    if (ev.key !== "Tab") return;
+    const items = focusables();
+    if (!items.length) { ev.preventDefault(); return; }
+    const first = items[0], last = items[items.length - 1];
+    // Wrap at both ends. Without this the browser's own order takes over at
+    // the boundary and walks straight out of the dialog.
+    if (ev.shiftKey && document.activeElement === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && document.activeElement === last) {
+      ev.preventDefault();
+      first.focus();
+    }
+  };
+
+  // Capture phase: the dialog must win the Tab key before anything else on the
+  // page can act on it.
+  document.addEventListener("keydown", onKeydown, true);
+  focusTrap = { onKeydown, restoreTo };
+
+  // Land on the first control rather than leaving focus behind the overlay.
+  // Cancel is deliberately first in the DOM, so the default landing spot is
+  // the safe one for a dialog whose other button sends traffic.
+  const items = focusables();
+  if (items.length) items[0].focus();
+}
+
+function releaseFocus() {
+  if (!focusTrap) return;
+  document.removeEventListener("keydown", focusTrap.onKeydown, true);
+  // Put focus back where it came from. Dropping it on <body> would send a
+  // keyboard user to the top of the page to navigate back to where they were.
+  const back = focusTrap.restoreTo;
+  focusTrap = null;
+  if (back && typeof back.focus === "function" && document.contains(back)) back.focus();
 }
 
 async function startSweep() {
@@ -1360,12 +1463,48 @@ function setProgress(label, pct) {
   fill.classList.remove("indeterminate");
   fill.style.width = pct + "%";
   $("progress-pct").textContent = pct + "%";
+  const bar = $("progress-bar");
+  bar.setAttribute("aria-valuenow", String(pct));
+  bar.setAttribute("aria-valuemin", "0");
+  bar.setAttribute("aria-valuemax", "100");
+  announceProgress(label, pct);
 }
 function setProgressIndeterminate(label) {
   setProgressLabel(label);
   const fill = $("progress-fill");
   fill.classList.add("indeterminate");
   $("progress-pct").textContent = "";
+  // No value to report while indeterminate; leaving a stale one would have the
+  // bar claim a percentage it is no longer tracking.
+  $("progress-bar").removeAttribute("aria-valuenow");
+  announce(label);
+}
+
+// lastAnnouncedPct throttles the live region. Progress events arrive from
+// thousands of hosts, and a screen reader given every one of them would talk
+// continuously and never finish a sentence.
+let lastAnnouncedPct = -1;
+let lastAnnouncedLabel = "";
+
+// announceProgress speaks a scan's progress at decile boundaries.
+//
+// Every tick is far too many and only the final number is too few — a long
+// scan would sit in total silence. Deciles are frequent enough to convey
+// movement and sparse enough to stay out of the way. A changed phase always
+// speaks, because "discovering" becoming "scanning ports" is news regardless
+// of where the percentage happens to sit.
+function announceProgress(label, pct) {
+  const decile = Math.floor(pct / 10);
+  if (label === lastAnnouncedLabel && decile === lastAnnouncedPct) return;
+  lastAnnouncedLabel = label;
+  lastAnnouncedPct = decile;
+  announce(label + " " + pct + "%");
+}
+
+// announce writes a message to the polite live region.
+function announce(msg) {
+  const el = $("scan-status");
+  if (el) el.textContent = msg;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1846,13 +1985,38 @@ function paintGraph() {
       g.appendChild(tip);
     }
 
-    g.addEventListener("click", (ev) => {
+    // The node is a control, so it has to be reachable the way controls are.
+    // It carried a click handler and nothing else: no tab stop, no role, no key
+    // binding — so the whole topology, including "scan this segment", was
+    // mouse-only. A screen reader announced an unlabelled group.
+    g.setAttribute("tabindex", "0");
+    g.setAttribute("role", "button");
+    g.setAttribute("aria-label", nodeLabel(n, kids.length));
+    if (kids.length) g.setAttribute("aria-expanded", collapsed ? "false" : "true");
+
+    const activate = (ev) => {
       ev.stopPropagation();
       // An attached-but-unscanned segment is an action, not dead text: clicking
       // it targets and scans that CIDR — parity with the TUI's 's' key.
       if (n.scanCidr) { scanSegment(n); return; }
       if (kids.length) toggleCollapse(n);
       selectNode(n);
+    };
+    g.addEventListener("click", activate);
+    g.addEventListener("keydown", (ev) => {
+      // Enter and Space are what a role="button" promises. Space also scrolls
+      // the page by default, which would yank the graph out from under the
+      // node the user just acted on.
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        activate(ev);
+        return;
+      }
+      // Double-click zooms a subtree; the keyboard needs its own way in.
+      if (ev.key === "z") {
+        ev.stopPropagation();
+        zoomToSubtree(n);
+      }
     });
     g.addEventListener("dblclick", (ev) => {
       ev.stopPropagation();
@@ -1861,6 +2025,31 @@ function paintGraph() {
     nodesG.appendChild(g);
   }
   applyView();
+}
+
+// nodeLabel describes a graph node for assistive technology.
+//
+// The visual node carries its meaning in position, colour and two lines of
+// text; none of that survives into an accessibility tree, which saw an
+// unlabelled <g>. This states the same things in words: what the node is, what
+// it is called, and — the part that matters most — what activating it will do,
+// since one kind of node starts a network scan.
+function nodeLabel(n, kidCount) {
+  const parts = [];
+  if (n.kind === "self") parts.push("this machine");
+  else if (n.kind === "gateway") parts.push("gateway");
+  else if (n.kind === "segment") parts.push("network segment");
+  else if (n.kind === "orphans") parts.push("hosts on no known network");
+  else if (n.kind === "unknown") parts.push("inferred host");
+  else parts.push("host");
+
+  if (n.label) parts.push(n.label);
+  if (n.sub) parts.push(n.sub);
+  // Said last so it is the freshest thing in the listener's ear before they
+  // decide whether to press Enter — this one sends traffic.
+  if (n.scanCidr) parts.push("press Enter to scan " + n.scanCidr);
+  else if (kidCount) parts.push(kidCount + " child node" + (kidCount === 1 ? "" : "s") + ", press Enter to expand or collapse");
+  return parts.join(", ");
 }
 
 function applyView() {
