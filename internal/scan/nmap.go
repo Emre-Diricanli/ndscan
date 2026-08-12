@@ -143,6 +143,9 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 	var wg sync.WaitGroup
 	res := make([]HostResult, len(batches))
 	var done int32
+	// Serialises progress delivery so the reported count only ever climbs; see
+	// the callback below.
+	var progressMu sync.Mutex
 
 	for i, hosts := range batches {
 		wg.Add(1)
@@ -169,7 +172,16 @@ func ScanHosts(ctx context.Context, live []string, cfg Config, runner Runner) ([
 				cfg.OnResult(result)
 			}
 			if cfg.Progress != nil {
+				// The counter is atomic, but the callbacks were not ordered
+				// against each other: two goroutines could take 32 and 40, and
+				// the one holding 32 could still deliver last, so a caller
+				// watching progress saw it run backwards and settle below the
+				// total. Holding the lock across the callback makes the
+				// sequence monotonic, which is the only thing a progress
+				// reporter is really promising.
+				progressMu.Lock()
 				cfg.Progress(int(atomic.AddInt32(&done, int32(len(hosts)))), len(live))
+				progressMu.Unlock()
 			}
 		}(i, hosts)
 	}
