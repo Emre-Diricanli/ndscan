@@ -136,7 +136,7 @@ func BenchmarkStagedSweep_Bookkeeping(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		stagedSweep(ctx, addrs, cfg)
+		stagedSweep(ctx, addrs, nil, cfg)
 	}
 }
 

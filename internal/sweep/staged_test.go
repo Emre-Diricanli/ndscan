@@ -60,7 +60,7 @@ func TestStagedSweep_StopsProbingAfterFirstAnswer(t *testing.T) {
 		t.Fatal("test setup no longer exceeds the staging threshold")
 	}
 
-	hits := stagedSweep(context.Background(), []string{"127.0.0.1"}, cfg)
+	hits := stagedSweep(context.Background(), []string{"127.0.0.1"}, nil, cfg)
 	if len(hits) != 1 {
 		t.Fatalf("hits = %d, want 1", len(hits))
 	}
@@ -101,7 +101,7 @@ func TestStagedSweep_SkipsStagingWhenWorkFitsInOneWave(t *testing.T) {
 		t.Fatal("test setup no longer sits below the staging threshold")
 	}
 
-	stagedSweep(context.Background(), addrs, cfg)
+	stagedSweep(context.Background(), addrs, nil, cfg)
 
 	// Unstaged: every port probed in one wave, so one progress call per probe
 	// plus the forced terminal call. Staging would short-circuit after round 1
@@ -131,7 +131,7 @@ func TestStagedSweep_ProgressReachesTotal(t *testing.T) {
 		},
 	})
 
-	stagedSweep(context.Background(), []string{"127.0.0.1"}, cfg)
+	stagedSweep(context.Background(), []string{"127.0.0.1"}, nil, cfg)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -147,7 +147,7 @@ func TestStagedSweep_RefusalCountsOnlyWhenAttached(t *testing.T) {
 	dead := deadPort(t)
 	ports := []int{dead}
 
-	attached := stagedSweep(context.Background(), []string{"127.0.0.1"},
+	attached := stagedSweep(context.Background(), []string{"127.0.0.1"}, nil,
 		withDefaults(Config{Ports: ports, Attached: true, Timeout: time.Second}))
 	if len(attached) != 1 {
 		t.Fatalf("attached: hits = %d, want 1 (a refusal proves liveness on-segment)", len(attached))
@@ -159,7 +159,7 @@ func TestStagedSweep_RefusalCountsOnlyWhenAttached(t *testing.T) {
 		t.Errorf("attached: port = %d, want 0 — a refusal means nothing is listening", attached[0].port)
 	}
 
-	routed := stagedSweep(context.Background(), []string{"127.0.0.1"},
+	routed := stagedSweep(context.Background(), []string{"127.0.0.1"}, nil,
 		withDefaults(Config{Ports: ports, Attached: false, Timeout: time.Second}))
 	if len(routed) != 0 {
 		t.Errorf("routed: hits = %d, want 0 — a reset off-segment may be a middlebox", len(routed))
@@ -239,7 +239,7 @@ func deadPort(t *testing.T) int {
 // dialer expects; a mismatch here would silently probe the wrong address.
 func TestStagedSweep_DialsTheRequestedPort(t *testing.T) {
 	open := listenerOn(t)
-	hits := stagedSweep(context.Background(), []string{"127.0.0.1"},
+	hits := stagedSweep(context.Background(), []string{"127.0.0.1"}, nil,
 		withDefaults(Config{Ports: []int{open}, Timeout: time.Second}))
 	if len(hits) != 1 {
 		t.Fatalf("hits = %d, want 1", len(hits))
