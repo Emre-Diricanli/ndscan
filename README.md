@@ -144,10 +144,19 @@ JSONL), so you can read it, back it up, or delete it by hand:
 - `timeline/` — one append-only JSONL file per day recording observed changes
   (`host_seen`, `host_gone`, `port_opened`, `port_closed`).
 - `update-check.json` — the cached result of the hourly update check.
+- `ndscan.lock` — an empty file used to serialise writes between processes. It
+  is never deleted; the lock lives on the open file, not on its contents.
 
 Writes go through a temp file and a rename, so an interrupted write cannot
 leave truncated JSON behind, and a file whose contents have not changed is not
 rewritten — watch mode would otherwise churn the disk every interval.
+
+Only one ndscan records at a time. Recording a scan reads the current state and
+writes it back, so two processes finishing together could otherwise lose one of
+their updates; a lock file in the same directory serialises them. A scan that
+finds another process mid-write keeps its results and says plainly that it was
+not recorded, rather than silently dropping the update — change detection picks
+up again on the next scan.
 
 What you can expect across upgrades: the formats evolve by adding optional
 fields, and readers ignore fields they don't know, so state written by an
