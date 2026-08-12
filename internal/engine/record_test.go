@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Emre-Diricanli/ndscan/internal/config"
+	"github.com/Emre-Diricanli/ndscan/internal/lockfile"
 	"github.com/Emre-Diricanli/ndscan/internal/timeline"
 	"github.com/Emre-Diricanli/ndscan/internal/ui"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
@@ -199,5 +201,66 @@ func TestSplitPort(t *testing.T) {
 				t.Errorf("splitPort(%q) = (%d, %q), want (%d, %q)", tc.in, p, proto, tc.wantPort, tc.wantProto)
 			}
 		})
+	}
+}
+
+// A scan that cannot get the write lock keeps its results and says so.
+//
+// The scan itself already succeeded and its rows are on screen; only the
+// recording is dropped. Reporting that plainly matters because a silently
+// skipped write is indistinguishable from "nothing changed", and only one of
+// those is good news.
+func TestPersistSkipsWhenAnotherProcessHoldsTheLock(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NDSCAN_CONFIG_DIR", dir)
+
+	// Hold the lock the way a competing ndscan process would.
+	release, ok, err := lockfile.Acquire(dir, time.Second)
+	if err != nil || !ok {
+		t.Skipf("cannot hold the lock on this platform: ok=%v err=%v", ok, err)
+	}
+
+	e := New()
+	rec := e.Persist(complete(
+		ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"},
+	), recordPlan(), time.Now(), vendor.DB{})
+	release()
+
+	if len(rec.Warnings) == 0 {
+		t.Fatal("a skipped recording must be reported, not silent")
+	}
+	if !strings.Contains(rec.Warnings[0], "not recorded") {
+		t.Errorf("warning should say the scan was not recorded, got %q", rec.Warnings[0])
+	}
+	// Nothing may have been written under contention.
+	if rec.Comparable() {
+		t.Error("a skipped persist must not report a usable diff")
+	}
+	if len(rec.Devices) != 0 {
+		t.Errorf("devices = %d, want none written while the lock was held", len(rec.Devices))
+	}
+}
+
+// Once the other writer releases, the next scan records normally — the skip is
+// transient, not a latch.
+func TestPersistRecoversAfterTheLockIsReleased(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NDSCAN_CONFIG_DIR", dir)
+
+	release, ok, err := lockfile.Acquire(dir, time.Second)
+	if err != nil || !ok {
+		t.Skipf("cannot hold the lock on this platform: ok=%v err=%v", ok, err)
+	}
+	e := New()
+	rows := complete(ui.Row{IP: "192.0.2.1", Up: true, MAC: "3c:22:fb:11:22:33"})
+	_ = e.Persist(rows, recordPlan(), time.Now(), vendor.DB{})
+	release()
+
+	rec := e.Persist(rows, recordPlan(), time.Now(), vendor.DB{})
+	if len(rec.Warnings) != 0 {
+		t.Errorf("second scan should record cleanly, got warnings: %v", rec.Warnings)
+	}
+	if len(rec.Devices) == 0 {
+		t.Error("second scan should have learned the device")
 	}
 }

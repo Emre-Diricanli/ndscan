@@ -1,9 +1,11 @@
 name: Auto Version & Release
 
-# On every push to main: bump the patch version, tag the commit, and publish
-# a GitHub Release. Tags pushed by GITHUB_TOKEN do NOT trigger other
-# workflows, so GoReleaser runs here directly — release.yml only serves
-# human-pushed tags (minor/major bumps).
+# On every push to main: verify the commit, bump the patch version, tag it,
+# and publish a GitHub Release. The checks run here because the push CI
+# workflow is concurrent and cannot protect users from a broken release.
+# Tags pushed by GITHUB_TOKEN do NOT trigger other workflows, so GoReleaser
+# runs here directly — release.yml only serves human-pushed tags
+# (minor/major bumps).
 #
 # Opt out for a single commit by including "[skip release]" in its message.
 on:
@@ -52,7 +54,14 @@ jobs:
           echo "Bumping ${latest} -> ${next}"
           echo "next=${next}" >> "$GITHUB_OUTPUT"
 
+      # A release must be gated by the exact commit being published, not a
+      # concurrent CI run that may finish after users see the new version.
+      - name: Check
+        if: steps.version.outputs.skip != 'true'
+        run: make check
+
       - name: Tag
+        id: tag
         if: steps.version.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
@@ -68,3 +77,11 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # GoReleaser requires a public tag, so remove it if publication fails
+      # rather than leaving an installable-looking version without artifacts.
+      - name: Remove tag after failed publication
+        if: failure() && steps.tag.outcome == 'success'
+        run: |
+          git push --delete origin "${{ steps.version.outputs.next }}"
+          git tag --delete "${{ steps.version.outputs.next }}"
