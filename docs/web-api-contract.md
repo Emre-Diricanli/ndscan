@@ -18,10 +18,24 @@ Current known state. Returns immediately; never scans.
   "scanning": false,
   "targets": ["192.168.2.0/24"],
   "lastScan": "2026-08-05T19:54:21Z",
-  "topology": { /* see Topology below */ }
+  "topology": { /* see Topology below */ },
+  "watch": { "enabled": true, "intervalSec": 300, "nextAt": "2026-08-05T20:04:21Z" },
+  "suggested": [
+    { "cidr": "192.168.2.0/24", "interface": "en0", "addr": "192.168.2.157" }
+  ],
+  "siblings": ["192.168.1.0/24", "10.0.0.0/24"]
 }
 ```
 `topology` is `null` before the first scan. `lastScan` is `null` likewise.
+
+`watch` mirrors the current watch-mode state (see `POST /api/watch`); `nextAt`
+is present only while the loop is enabled. `suggested` lists the networks this
+machine is attached to, so the UI can offer a target instead of an empty box —
+the scanner already knows the answer to "what should I scan?". Only physical
+interfaces qualify: tunnels and link-local networks would bury the one network
+the user actually means. `siblings` holds the routed /24 candidates
+`POST /api/scan/sweep` would probe, derived passively from the interface table,
+so showing the choice never probes the network. Both are omitted when empty.
 
 ### `POST /api/scan`
 Starts a scan. Returns `202 Accepted` immediately; progress arrives on
@@ -32,7 +46,7 @@ Request:
 { "targets": ["192.168.2.0/24"], "fast": true, "preset": "quick" }
 ```
 `targets` required, non-empty. `fast` defaults true (native scanner).
-`preset` one of `quick|default|udp|deep`, defaults `quick`.
+`preset` one of `quick|smart|default|udp|deep`, defaults `quick`.
 
 Response `202`:
 ```json
@@ -40,8 +54,58 @@ Response `202`:
 ```
 Error responses use `{"error": "message"}` with 4xx/5xx.
 
+### `POST /api/scan/sweep`
+Starts a routed sweep: every attached IPv4 network plus the sibling /24
+candidates derived from the interface table (the same list `/api/state` shows
+as `siblings`). Always runs with the `quick` preset and the native scanner —
+a sweep exists to be fast, so neither is configurable here. Returns
+`202 Accepted` immediately; progress arrives on `/api/events`.
+
+Request (an empty body is allowed):
+```json
+{ "extra": ["10.0.7.0/24"] }
+```
+`extra` adds candidate subnets of your own — a bare IP is normalised to the
+/24 around it — and is validated exactly like `scan` targets.
+
+Response `202`:
+```json
+{ "started": true, "targets": ["192.168.2.0/24", "192.168.1.0/24"], "count": 1 }
+```
+`targets` is the full list the scan will cover; `count` is how many sibling
+candidates were found beyond the attached networks. Returns `400 Bad Request`
+when there are no sibling subnets to probe (no attached IPv4 /24 to derive
+from, and nothing usable in `extra`) and `409 Conflict` if a scan is already
+running.
+
 ### `POST /api/cancel`
 Cancels the running scan. `200` with `{"cancelled": true}`, or `409` if idle.
+
+### `POST /api/watch`
+Turns watch mode on or off. Watch mode re-runs the scan on an interval and
+reports what changed. The loop lives on the server deliberately: it survives a
+closed tab, a reload, or a laptop lid, and every connected client sees the
+same schedule instead of each keeping its own timer.
+
+Request:
+```json
+{ "enabled": true, "intervalSec": 300, "targets": ["192.168.2.0/24"], "fast": true, "preset": "quick" }
+```
+`enabled: false` stops the loop; the other fields are then ignored. When
+enabling, `targets` defaults to the last scan's targets, `preset` to `quick`,
+and `fast` to true — targets and preset get the same validation a manual scan
+gets, because watch mode is just a scan on a timer and a bad target must not
+be accepted here only to fail silently every interval. An `intervalSec` below
+15 is clamped to 15: watch mode exists to notice changes, not to hammer the
+network.
+
+Response `200`:
+```json
+{ "enabled": true, "intervalSec": 300, "nextAt": "2026-08-05T20:04:21Z" }
+```
+`intervalSec` reflects the clamped value; `nextAt` is the next scheduled
+rescan and is omitted when disabling. The current state is also reported on
+`/api/state`, and changes are broadcast as `watch` events on `/api/events`.
 
 ### `GET /api/events` (Server-Sent Events)
 Live scan progress. Event types:
@@ -58,7 +122,14 @@ data: {"hosts":11,"openPorts":16,"elapsedMs":1683,"cancelled":false}
 
 event: error
 data: {"error":"message"}
+
+event: watch
+data: {"enabled":true,"nextAt":"2026-08-05T20:04:21Z"}
 ```
+`watch` reports watch-mode changes even when no scan is running:
+`{"enabled":false}` when the loop stops, `{"enabled":true,"rescanning":true}`
+when a scheduled rescan starts, and `nextAt` after each tick.
+
 Clients should reconnect on disconnect. The server sends a `: keepalive`
 comment every 15s so proxies don't time the stream out.
 

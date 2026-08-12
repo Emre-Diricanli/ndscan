@@ -127,6 +127,39 @@ export NDSCAN_NO_UPDATE_CHECK=1
 
 ---
 
+## State on Disk
+
+ndscan keeps everything it remembers in one directory: your OS user-config
+directory — `~/.config/ndscan` on Linux, `~/Library/Application Support/ndscan`
+on macOS — overridable with `NDSCAN_CONFIG_DIR`. It is all plain JSON (or
+JSONL), so you can read it, back it up, or delete it by hand:
+
+- `config.json` — last-used TUI settings and your saved scan profiles.
+- `history/` — the previous snapshot of each scan signature (targets, ports,
+  preset, fast path). This is the baseline the `Δ` column and `ndscan diff`
+  compare against. Filenames are one-way hashes of the signature, so the
+  directory can't be read back into a list of your targets.
+- `devices.json` — the device inventory: MAC/vendor identity, first and last
+  seen, and any names you assigned.
+- `timeline/` — one append-only JSONL file per day recording observed changes
+  (`host_seen`, `host_gone`, `port_opened`, `port_closed`).
+- `update-check.json` — the cached result of the hourly update check.
+
+Writes go through a temp file and a rename, so an interrupted write cannot
+leave truncated JSON behind, and a file whose contents have not changed is not
+rewritten — watch mode would otherwise churn the disk every interval.
+
+What you can expect across upgrades: the formats evolve by adding optional
+fields, and readers ignore fields they don't know, so state written by an
+older ndscan keeps working. That is as far as the guarantee goes — there is
+no versioned schema and no migration machinery. If a file ever does become
+unreadable, the fallback is to delete it: every store treats a missing file
+as a fresh start. One file is protected from even that accident — ndscan
+refuses to overwrite a corrupt `devices.json` and tells you to fix or delete
+it, because your assigned names are the one state that cannot be re-measured.
+
+---
+
 ## Quick Start
 
 Launch the beautiful interactive TUI:
@@ -307,6 +340,7 @@ Reports include:
 | `-tr`               | Shortcut for `--view tree`                                       |
 | `-P, --preset`      | Scan preset: `quick` (default), `smart`, `default`, `udp`, `deep`|
 | `--discover`        | Only list live hosts (skip the port scan) — fastest             |
+| `--fast`            | Built-in ARP+TCP scanner (no nmap, no root) — the fast path for LAN sweeps |
 | `-p, --ports`       | Custom ports (e.g. `22,80,443` or `1-1024`)                      |
 | `--view`            | Force view: `table` or `tree`                                    |
 | `--show-mac`        | Include MAC addresses (L2 only)                                  |
@@ -372,7 +406,6 @@ Format (tab or space separated):
 ## Roadmap
 
 - `--ssh-sudo` flag for automatic sudo on jump hosts
-- Lightweight built-in port scanner for ultra-fast sweeps (no nmap dependency)
 - Service banner grabbing (SSH/HTTP)
 - More export templates and theming for HTML reports
 
