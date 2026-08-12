@@ -125,6 +125,45 @@ func LookupMDNS(ctx context.Context, cfg MDNSConfig) map[string]string {
 	return results
 }
 
+// LookupMulticast overlaps the fixed listen windows while keeping precedence
+// independent of response timing. mDNS labels are generally chosen by the
+// device owner; SSDP's protocol-oriented labels are useful only for gaps.
+func LookupMulticast(ctx context.Context, mdnsCfg MDNSConfig, ssdpCfg SSDPConfig) map[string]string {
+	return lookupMulticast(ctx,
+		func(ctx context.Context) map[string]string { return LookupMDNS(ctx, mdnsCfg) },
+		func(ctx context.Context) map[string]string { return LookupSSDP(ctx, ssdpCfg) },
+	)
+}
+
+func lookupMulticast(
+	ctx context.Context,
+	lookupMDNS func(context.Context) map[string]string,
+	lookupSSDP func(context.Context) map[string]string,
+) map[string]string {
+	var mdnsNames, ssdpNames map[string]string
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mdnsNames = lookupMDNS(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		ssdpNames = lookupSSDP(ctx)
+	}()
+	wg.Wait()
+
+	if mdnsNames == nil {
+		mdnsNames = map[string]string{}
+	}
+	for ip, label := range ssdpNames {
+		if _, ok := mdnsNames[ip]; !ok {
+			mdnsNames[ip] = label
+		}
+	}
+	return mdnsNames
+}
+
 // runMDNS sends one query burst to dst and absorbs answers until ctx expires.
 // It is split from LookupMDNS so tests can aim it at a loopback responder.
 func runMDNS(ctx context.Context, cfg MDNSConfig, conn *net.UDPConn, dst *net.UDPAddr) map[string]string {

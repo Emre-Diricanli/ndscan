@@ -224,10 +224,29 @@ func (e *Engine) enrich(ctx context.Context, p Plan, emit Emit, out *Outcome) {
 	//
 	// Both passes are opt-in per plan and strictly bounded, so a network where
 	// nothing answers costs their timeout and nothing else.
+	var multicast, ptr map[string]string
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ptr = enrich.LookupPTR(ctx, ips, enrich.Config{})
+	}()
 	if p.Multicast && !p.DeferMulticast {
-		ui.ApplyHostnames(out.Rows, e.multicastNames(ctx))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// multicastNames owns the cache and the mDNS-over-SSDP precedence,
+			// and runs the two listen windows concurrently itself. Reproducing
+			// any of that here would leave two copies of the rule that a pass
+			// finding nothing must not be cached.
+			multicast = e.multicastNames(ctx)
+		}()
 	}
-	ui.ApplyHostnames(out.Rows, enrich.LookupPTR(ctx, ips, enrich.Config{}))
+	wg.Wait()
+	// Completion order cannot decide precedence: self-reported multicast names
+	// remain more useful than reverse DNS even though both passes overlap.
+	ui.ApplyHostnames(out.Rows, multicast)
+	ui.ApplyHostnames(out.Rows, ptr)
 	// These rows were already delivered by the port scan; enrichment only filled
 	// in a column. Re-announcing them as arrivals would duplicate every host in
 	// a front end that appends.
@@ -290,12 +309,12 @@ func (e *Engine) multicastNames(ctx context.Context) map[string]string {
 	if e.mcNames != nil && e.now().Sub(e.mcAt) < multicastTTL {
 		return e.mcNames
 	}
-	names := enrich.LookupMDNS(ctx, enrich.MDNSConfig{})
-	for ip, label := range enrich.LookupSSDP(ctx, enrich.SSDPConfig{}) {
-		if _, ok := names[ip]; !ok {
-			names[ip] = label // mDNS names are friendlier; SSDP fills gaps
-		}
-	}
+	// Both passes are fixed listen windows — a query burst, then a wait for
+	// answers — so running them together costs the longer of the two rather
+	// than their sum. Precedence stays with mDNS regardless of which finishes
+	// first: its names are chosen by the device's owner, where SSDP's describe
+	// a protocol role and are only worth having where mDNS said nothing.
+	names := enrich.LookupMulticast(ctx, enrich.MDNSConfig{}, enrich.SSDPConfig{})
 	// A pass that found nothing is not cached: the usual cause is a transient
 	// network condition, and remembering the emptiness would extend a momentary
 	// failure into minutes of blank names.
