@@ -82,6 +82,17 @@ type Config struct {
 	// OnResult, if set, is called with each host as it is discovered rather than
 	// only at the end. Called from multiple goroutines.
 	OnResult func(Result)
+	// NoEarlyAbandon disables the multi-target early-abandon optimisation (see
+	// stagedSweep). When a sweep covers several targets and one of them shows
+	// zero signs of life in the first probe round, the remaining ports are
+	// skipped for that target's addresses: an empty subnet is a far likelier
+	// explanation than a subnet where nothing answers any of the first few
+	// probe ports, and probing the rest is the bulk of a multi-subnet sweep's
+	// wall-clock. The accepted cost is missing a host that answers only on a
+	// later port in an otherwise silent subnet. Set this when missing such a
+	// host is worse than the wait. A single-target scan is never abandoned —
+	// naming one target is an explicit request for a thorough scan.
+	NoEarlyAbandon bool
 }
 
 // Result is one discovered host.
@@ -121,6 +132,13 @@ const (
 	// dominates and staging cuts it by roughly the port-list length. A /24 with
 	// the default settings sits well under; a /16 sits far above.
 	stagingThreshold = 4
+	// abandonRound1Ports is how wide round 1 is allowed to be when early
+	// abandonment is in play. Pronouncing a subnet dead on a single silent port
+	// would miss every host that answers only on 80 or 443, so the verdict waits
+	// for a few high-yield ports. On a genuinely empty subnet that is two extra
+	// probes per address, against the ~13 per address that abandoning round 2
+	// then saves.
+	abandonRound1Ports = 3
 )
 
 // Run discovers live hosts across the given CIDR targets.
@@ -167,9 +185,12 @@ func Run(ctx context.Context, targets []string, cfg Config) []Result {
 		}
 	}
 
-	// 2. Staged TCP connect sweep over the remaining space.
+	// 2. Staged TCP connect sweep over the remaining space. The per-target
+	// grouping travels with the flat list so the sweep can tell which addresses
+	// belong to which target — early abandonment is decided per target, and a
+	// hit in one subnet must never keep a sibling subnet alive.
 	if !cfg.SkipTCP && len(addrs) > 0 {
-		for _, hit := range stagedSweep(ctx, addrs, cfg) {
+		for _, hit := range stagedSweep(ctx, addrs, expandTargetGroups(targets), cfg) {
 			r := get(hit.ip)
 			r.ViaTCP = true
 			if r.RTT == 0 {
@@ -239,7 +260,17 @@ type hit struct {
 // answer are done. Only the still-silent remainder pays for the rest of the port
 // list. On a quiet network this collapses the probe count from
 // addresses x ports to roughly one per address.
-func stagedSweep(ctx context.Context, addrs []string, cfg Config) []hit {
+//
+// groups carries the addresses of each requested target, for early
+// abandonment: when the sweep covers several targets, a target whose every
+// address stays silent through round 1 is abandoned — round 2 is skipped for
+// its addresses. Sibling-subnet sweeps generate speculative targets that often
+// don't exist, and a dead /24 would otherwise eat the full port list against
+// all 254 addresses. The verdict is only ever pronounced on a COMPLETED round 1
+// with zero hits — a slow subnet answers eventually and is kept, and a
+// cancelled context abandons nothing. Nil or a single group disables
+// abandonment entirely.
+func stagedSweep(ctx context.Context, addrs []string, groups [][]string, cfg Config) []hit {
 	s := &sweepState{
 		cfg:      cfg,
 		answered: make(map[string]bool, len(addrs)),
@@ -273,9 +304,22 @@ func stagedSweep(ctx context.Context, addrs []string, cfg Config) []hit {
 		// full timeout of its slowest member, and sixteen of them floored
 		// discovery at 4.94s in testing. The survivors go through the rest
 		// concurrently, so the tail costs one timeout rather than fifteen.
-		pending = s.probe(ctx, pending, cfg.Ports[:1])
-		if len(cfg.Ports) > 1 && len(pending) > 0 && ctx.Err() == nil {
-			pending = s.probe(ctx, pending, cfg.Ports[1:])
+		//
+		// With several targets in play, round 1 widens from one port to a few:
+		// it doubles as the census that decides whether a whole target is
+		// abandoned, and a single port is too narrow a jury for that verdict
+		// (see abandonRound1Ports).
+		abandon := len(groups) > 1 && !cfg.NoEarlyAbandon
+		round1 := cfg.Ports[:1]
+		if abandon && len(cfg.Ports) > abandonRound1Ports {
+			round1 = cfg.Ports[:abandonRound1Ports]
+		}
+		pending = s.probe(ctx, pending, round1)
+		if abandon && ctx.Err() == nil {
+			pending = s.dropSilentGroups(pending, groups)
+		}
+		if len(cfg.Ports) > len(round1) && len(pending) > 0 && ctx.Err() == nil {
+			pending = s.probe(ctx, pending, cfg.Ports[len(round1):])
 		}
 	}
 
@@ -284,21 +328,32 @@ func stagedSweep(ctx context.Context, addrs []string, cfg Config) []hit {
 	// than it was at the start of the scan, and re-reading it is free — no
 	// packets, microseconds. This is the only way we see a host that ignored
 	// every port we tried but did reply at L2.
-	if cfg.Attached && cfg.ARP != nil && ctx.Err() == nil && len(pending) > 0 {
-		still := make(map[string]bool, len(pending))
-		for _, ip := range pending {
-			still[ip] = true
-		}
-		for ip := range cfg.ARP(ctx) {
-			if !still[ip] {
-				continue
-			}
-			s.mu.Lock()
+	//
+	// The still-silent set is rebuilt from `answered` rather than taken from
+	// pending: early-abandoned addresses are out of pending, but their round-1
+	// probes warmed the cache all the same, and dropping them here would take
+	// away this safety net exactly where abandonment needs it most.
+	if cfg.Attached && cfg.ARP != nil && ctx.Err() == nil {
+		s.mu.Lock()
+		still := make(map[string]bool, len(addrs))
+		for _, ip := range addrs {
 			if !s.answered[ip] {
-				s.answered[ip] = true
-				s.hits = append(s.hits, hit{ip: ip})
+				still[ip] = true
 			}
-			s.mu.Unlock()
+		}
+		s.mu.Unlock()
+		if len(still) > 0 {
+			for ip := range cfg.ARP(ctx) {
+				if !still[ip] {
+					continue
+				}
+				s.mu.Lock()
+				if !s.answered[ip] {
+					s.answered[ip] = true
+					s.hits = append(s.hits, hit{ip: ip})
+				}
+				s.mu.Unlock()
+			}
 		}
 	}
 
@@ -360,6 +415,46 @@ func (s *sweepState) probe(ctx context.Context, addrs []string, ports []int) []s
 		}
 	}
 	return remaining
+}
+
+// dropSilentGroups filters pending down to the addresses whose target group
+// produced at least one round-1 hit. A group with zero hits is abandoned: the
+// expected finding there is an empty subnet, and sweeping the remaining ports
+// across it is what made a 10-subnet sweep take 6s while only 3 subnets had
+// anything on them. Only round 2 is skipped — the group has already been
+// probed on round 1's ports, and the post-sweep ARP re-read still covers it.
+//
+// An address shared by several targets is kept if ANY of its groups showed
+// life: overlapping targets must not condemn each other.
+func (s *sweepState) dropSilentGroups(pending []string, groups [][]string) []string {
+	s.mu.Lock()
+	alive := make([]bool, len(groups))
+	for i, g := range groups {
+		for _, ip := range g {
+			if s.answered[ip] {
+				alive[i] = true
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	keep := make(map[string]bool, len(pending))
+	for i, g := range groups {
+		if !alive[i] {
+			continue
+		}
+		for _, ip := range g {
+			keep[ip] = true
+		}
+	}
+	out := pending[:0]
+	for _, ip := range pending {
+		if keep[ip] {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // dial performs one probe and records what it proved.
@@ -427,40 +522,57 @@ func isRefused(err error) bool {
 func expandTargets(targets []string) []string {
 	seen := make(map[string]bool)
 	var out []string
-	add := func(a netip.Addr) {
-		s := a.String()
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
+	for _, t := range targets {
+		for _, s := range expandOne(t) {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
 		}
 	}
+	return out
+}
 
+// expandTargetGroups expands each target separately, preserving which
+// addresses belong to which target; early abandonment is decided per group.
+// Targets that expand to nothing are dropped so an unparseable or refused
+// target can't count as a group of its own.
+func expandTargetGroups(targets []string) [][]string {
+	var groups [][]string
 	for _, t := range targets {
-		if a, err := netip.ParseAddr(t); err == nil {
-			add(a)
-			continue
+		if g := expandOne(t); len(g) > 0 {
+			groups = append(groups, g)
 		}
-		p, err := netip.ParsePrefix(t)
-		if err != nil || !p.Addr().Is4() {
-			continue
+	}
+	return groups
+}
+
+// expandOne expands a single CIDR or bare address. Nothing is deduplicated
+// here — that is the caller's job when several targets are combined.
+func expandOne(t string) []string {
+	if a, err := netip.ParseAddr(t); err == nil {
+		return []string{a.String()}
+	}
+	p, err := netip.ParsePrefix(t)
+	if err != nil || !p.Addr().Is4() {
+		return nil
+	}
+	p = p.Masked()
+	if p.Bits() < 16 {
+		return nil // too broad to expand; caller should narrow it
+	}
+	if p.Bits() == 32 {
+		return []string{p.Addr().String()}
+	}
+	// Walk the prefix, skipping network and broadcast addresses.
+	var out []string
+	first := p.Addr().Next()
+	for a := first; p.Contains(a); a = a.Next() {
+		next := a.Next()
+		if !p.Contains(next) {
+			break // a is the broadcast address
 		}
-		p = p.Masked()
-		if p.Bits() < 16 {
-			continue // too broad to expand; caller should narrow it
-		}
-		if p.Bits() == 32 {
-			add(p.Addr())
-			continue
-		}
-		// Walk the prefix, skipping network and broadcast addresses.
-		first := p.Addr().Next()
-		for a := first; p.Contains(a); a = a.Next() {
-			next := a.Next()
-			if !p.Contains(next) {
-				break // a is the broadcast address
-			}
-			add(a)
-		}
+		out = append(out, a.String())
 	}
 	return out
 }
