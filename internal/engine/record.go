@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/Emre-Diricanli/ndscan/internal/alert"
 	"github.com/Emre-Diricanli/ndscan/internal/config"
 	"github.com/Emre-Diricanli/ndscan/internal/device"
+	"github.com/Emre-Diricanli/ndscan/internal/lockfile"
 	"github.com/Emre-Diricanli/ndscan/internal/timeline"
 	"github.com/Emre-Diricanli/ndscan/internal/vendor"
 )
@@ -50,6 +52,18 @@ type Record struct {
 // that an always-on watcher does not accumulate forever.
 const timelineRetention = 90 * 24 * time.Hour
 
+// persistLockTimeout bounds how long a scan waits for another process to finish
+// writing before giving up and skipping its own recording.
+//
+// The critical section is a handful of small file writes and normally completes
+// in milliseconds, so this is reached only when the other writer is unusually
+// slow — a loaded machine, a network-mounted home directory. A second is long
+// enough to absorb that without a spurious skip, and short enough that a user
+// who does hit it does not experience the tool as hung. If persisting routinely
+// takes longer than this, the fix is to narrow the section, not to widen the
+// wait.
+const persistLockTimeout = time.Second
+
 // Comparable reports whether this run updated the baseline.
 func (r Record) Comparable() bool { return r.Diff != nil }
 
@@ -74,15 +88,61 @@ func (e *Engine) Persist(out Outcome, p Plan, now time.Time, oui vendor.DB) Reco
 func (e *Engine) PersistWithGateway(out Outcome, p Plan, now time.Time, oui vendor.DB, gatewayIP string) Record {
 	rec := Record{}
 	key := out.ScanKey(p)
-	prev := config.LoadHistory(key)
-	rec.Previous = prev
 
 	// An incomplete run looks exactly like a network where everything
 	// disappeared. Recording it would report the whole network as gone now and
 	// as new next time — one interruption corrupting change detection twice.
+	//
+	// Checked before the lock, not after: this run writes nothing, so making it
+	// queue for a write lock would delay a cancelled scan's output and — worse —
+	// let it report "not recorded because another process was writing" about a
+	// scan that was never going to be recorded. Ctrl-C is the most common way a
+	// scan ends early, so that warning would be seen often and be wrong.
+	//
+	// The unlocked read is safe: every write in this package goes through a
+	// temp-file rename, so a reader sees the old file or the new one, never a
+	// half-written one.
 	if !out.Comparable() {
+		rec.Previous = config.LoadHistory(key)
 		return rec
 	}
+
+	// One writer at a time, across processes. Everything below is a
+	// read-modify-write of shared state — history, the device store, the
+	// timeline, and the gateway canary — and two ndscan processes finishing
+	// together can otherwise interleave those steps and lose one scan entirely.
+	unlock, ok, err := lockfile.Acquire(config.Dir(), persistLockTimeout)
+	switch {
+	case errors.Is(err, lockfile.ErrUnsupported):
+		// This platform has no advisory locking at all. Record anyway, and stay
+		// quiet: the condition is permanent and nothing the user can act on, so
+		// warning would print on every scan forever — the alert fatigue this
+		// project already had to design out of its scan alerts. The behaviour
+		// here is exactly what every release before this one did everywhere.
+
+	case err != nil:
+		// Locking failed for a reason that might be fixable — an unwritable
+		// directory, a filesystem that refuses locks. Record anyway and say so.
+		// Refusing to write would turn a machine that cannot lock into a machine
+		// that never records, which is worse than the unlocked behaviour that
+		// shipped until now, and it would never recover on its own.
+		rec.Warnings = append(rec.Warnings,
+			"could not lock the state directory, so this scan was recorded without protection against a concurrent ndscan: "+err.Error())
+	case !ok:
+		// Another ndscan is mid-write. Skipping is the same class of event as
+		// the write failures below, and is reported the same way: the scan
+		// itself succeeded and its results are on screen, only the recording
+		// was dropped. Change detection resumes on the next scan.
+		rec.Previous = config.LoadHistory(key)
+		rec.Warnings = append(rec.Warnings,
+			"another ndscan process was writing state, so this scan was not recorded; change detection resumes on the next scan")
+		return rec
+	default:
+		defer unlock()
+	}
+
+	prev := config.LoadHistory(key)
+	rec.Previous = prev
 
 	cur := out.Snapshots()
 	rec.Diff = config.Diff(prev, cur)
